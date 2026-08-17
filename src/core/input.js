@@ -77,7 +77,10 @@ var Input = (function () {
   }
 
   var players = [];
-  for (var p = 0; p < MAX_PLAYERS; p++) players.push(newSlot());
+  /* NB: not `p` — that is the name of the per-player accessor below, and a
+   * `var p` loop counter would hoist over the function declaration and
+   * silently replace it with a number. */
+  for (var slotInit = 0; slotInit < MAX_PLAYERS; slotInit++) players.push(newSlot());
   /* Player 1 always exists: keyboard is the floor. */
   players[0].active = true;
 

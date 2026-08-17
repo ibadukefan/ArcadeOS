@@ -35,6 +35,7 @@ const GAMES = [
   'games/climb.js',
   'games/pulse.js',
   'games/drop.js',
+  'games/versus.js',
 ];
 
 const CORE_POST = [
