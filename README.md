@@ -1,1 +1,653 @@
 # ArcadeOS
+
+A boot-to-arcade console front end for a Raspberry Pi 4 driving a monitor
+mounted in portrait orientation. Power on the Pi and a few seconds later you
+are at a game dashboard, fully controllable with a gamepad. No desktop, no
+cursor, no keyboard.
+
+Nine games, all natively vertical. Fully offline — the cabinet never needs a
+network again after setup. The whole front end is one self-contained HTML
+file with no dependencies of any kind.
+
+```
+black screen  →  ARCADE wordmark  →  dashboard
+```
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Full Pi install](#full-pi-install)
+- [Controls](#controls)
+- [The games](#the-games)
+- [Settings](#settings)
+- [Adding a game](#adding-a-game)
+- [Wiring arcade buttons to a USB encoder](#wiring-arcade-buttons-to-a-usb-encoder)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [How it works](#how-it-works)
+
+---
+
+## Quick start
+
+You do not need a Pi to try it.
+
+```bash
+git clone <this repo>
+cd ArcadeOS
+npm run build          # writes dist/arcade.html
+```
+
+Then double-click `dist/arcade.html`. It opens in any modern browser, works
+offline, and plays on the keyboard (arrows, Enter, Escape). Plug in a gamepad
+and it will be picked up immediately.
+
+There is nothing to install. `npm run build` is plain Node with zero
+dependencies, and `dist/arcade.html` is committed to the repository, so you
+can skip the build entirely if you just want to look.
+
+---
+
+## Full Pi install
+
+### What you need
+
+| | |
+|---|---|
+| Board | Raspberry Pi 4 Model B (2GB is enough) |
+| OS | Raspberry Pi OS **Lite**, 64-bit, Bookworm |
+| Display | A 1080p monitor rotated 90° — the cabinet runs at 1080×1920 |
+| Input | Any Xbox / PlayStation / Nintendo pad over USB or Bluetooth, or a USB arcade encoder |
+| Storage | 4GB card or larger |
+
+Use Raspberry Pi Imager to write **Raspberry Pi OS Lite (64-bit)**. In the
+imager's settings, set a username and enable SSH — you will want it, because
+once ArcadeOS is running there is no console on the screen.
+
+### Install
+
+SSH in, then:
+
+```bash
+sudo apt-get install -y git
+git clone <this repo>
+cd ArcadeOS
+sudo ./setup-arcade.sh
+sudo reboot
+```
+
+That is the whole install. It takes about ten minutes on a fresh card, mostly
+`apt`. On reboot the Pi goes straight to the dashboard.
+
+The script is safe to re-run — it is idempotent, and re-running is how you
+update the cabinet after pulling changes.
+
+### What it changes
+
+| Path | Purpose |
+|---|---|
+| `/opt/arcadeos/` | `arcade.html`, the kiosk launcher, the helper scripts |
+| `/var/lib/arcadeos/chromium` | Chromium profile — this is where high scores live |
+| `/etc/systemd/system/arcadeos.service` | The kiosk: `cage` + Chromium |
+| `/etc/systemd/system/arcadeos-agent.service` | Loopback control agent (shutdown / restart / pairing) |
+| `/etc/systemd/system/arcadeos-gpio.service` | GPIO shutdown button watcher |
+| `/usr/share/plymouth/themes/arcadeos/` | Boot splash |
+| `config.txt`, `cmdline.txt`, `fstab` | Marker-fenced blocks only, backed up before editing |
+
+### Options
+
+```bash
+sudo ./setup-arcade.sh --help
+```
+
+| Flag | Effect |
+|---|---|
+| `--uninstall` | Remove everything. Keeps high scores unless you add `--purge`. |
+| `--rotate 0\|90\|180\|270` | Panel rotation. Default `90`. |
+| `--gpio-pin N` | BCM pin for the shutdown button. Default `3`. |
+| `--gpio-overlay` | Use the kernel's `gpio-shutdown` instead of the systemd service. |
+| `--no-gpio` | Skip the shutdown button entirely. |
+| `--readonly` | Enable the read-only overlay filesystem (see below). |
+| `--writable` | Turn the overlay back off. |
+| `--skip-apt` | Do not touch apt. Useful for quick re-runs. |
+
+### Rotation
+
+The rotation is applied by `cage`, the Wayland compositor, not by the
+firmware. Chromium therefore sees a genuine 1080×1920 portrait viewport and
+the front end never has to know it is running sideways.
+
+If your monitor is physically rotated the other way, use `--rotate 270`.
+
+### Shutting down properly
+
+**Yanking the power lead is the main cause of SD card corruption.** There are
+three ways to shut down cleanly, and the cabinet offers all of them:
+
+1. **SETTINGS → SHUT DOWN** on the dashboard, reachable on the d-pad alone.
+2. **The GPIO button.** Wire a momentary push button between BCM pin 3 and any
+   ground pin — no resistor needed, the internal pull-up is enabled. Hold it
+   for about a second. The hold is deliberate: a knocked cabinet button should
+   not end someone's game.
+3. `sudo poweroff` over SSH.
+
+### Read-only filesystem (optional)
+
+For a cabinet that lives in a hallway and gets switched off at the wall, you
+can make the root filesystem read-only so the card cannot be corrupted at all.
+
+High scores then need somewhere writable to live. ArcadeOS keeps them on a
+partition labelled `ARCADEDATA`, mounted at `/var/lib/arcadeos`.
+
+**The setup script will not repartition your card.** Make the partition
+yourself, with the card in another machine:
+
+```bash
+# Create a partition of 128MB or more in free space, then:
+sudo mkfs.ext4 -L ARCADEDATA /dev/sdXN
+```
+
+Put the card back and run:
+
+```bash
+sudo ./setup-arcade.sh --readonly
+sudo reboot
+```
+
+Afterwards, remember that system changes will not persist. Run
+`sudo ./setup-arcade.sh --writable && sudo reboot` before updating anything.
+
+---
+
+## Controls
+
+Every function is reachable with a **d-pad and two buttons**. Nothing —
+including settings and shutdown — needs a keyboard.
+
+### Menus
+
+| Action | Gamepad | Keyboard |
+|---|---|---|
+| Move | D-pad or left stick | Arrows / WASD |
+| Select | A / ✕ | Enter, Space, Z, Ctrl |
+| Back | B / ○ | Escape, Backspace, X, Alt |
+| Pause | Start | P, Tab, 1 |
+| Join as player 2 | Start on a second pad | — |
+
+### The face-button swap
+
+Xbox and PlayStation confirm with the **bottom** face button. Nintendo pads
+confirm with the **right** one, because their A and B are physically mirrored.
+ArcadeOS detects this from the controller and swaps automatically, and the
+on-screen prompts always show the button that is physically in front of you —
+`A`/`B` for Xbox and Nintendo, `✕`/`○` for PlayStation.
+
+If you have an unrecognised pad and the buttons feel backwards, set
+**SETTINGS → CONTROLLER** to the layout that matches your hardware.
+
+Controllers can be plugged and unplugged at any time. The on-screen prompts
+update immediately.
+
+---
+
+## The games
+
+| Game | Accent | What it is |
+|---|---|---|
+| **TETRIS** | violet | 10×20 well, 7-bag randomiser, ghost piece, hold, lock delay |
+| **ASCENT** | teal | Vertical shoot-'em-up. Waves descend, you climb |
+| **STACK** | pink | Time the drop, build the tower, keep what overlaps |
+| **SNAKE** | green | A tall 19×30 field, so vertical runs are long and corners are tight |
+| **BREAKOUT** | amber | A deliberately tall well — angle choice matters more than reflexes |
+| **CLIMB** | blue | Endless hopper. The camera only ever goes up |
+| **PULSE** | cyan | Rhythm highway. Four lanes are the four d-pad directions |
+| **DROP** | red | Columns-style match-3, including diagonals, with cascades |
+| **VERSUS** | purple | Head-to-head Tetris with garbage lines. Needs two pads |
+
+### Per-game controls
+
+Every game is playable with the d-pad plus **A**. Extra buttons are
+conveniences, never requirements.
+
+| Game | Controls |
+|---|---|
+| TETRIS | ◀▶ move · ▼ soft drop · ▲ rotate · **A** hard drop · **X** hold |
+| ASCENT | D-pad fly · **A** fire (hold for auto) |
+| STACK | **A** drop. That is the entire game |
+| SNAKE | D-pad turn |
+| BREAKOUT | ◀▶ paddle · **A** launch |
+| CLIMB | ◀▶ steer. Bouncing is automatic |
+| PULSE | ◀▼▲▶ hit the four lanes |
+| DROP | ◀▶ move · ▼ soft drop · **A** cycle gems · **X** hard drop |
+| VERSUS | As Tetris, per player |
+
+### High scores
+
+Beat a top-five score and you get the classic three-letter initials entry,
+driven entirely by the d-pad: up/down changes the letter, left/right changes
+the slot, **A** confirms. Tables are per game and viewable from **HIGH
+SCORES** on the dashboard.
+
+Scores and settings survive reboots. They live in Chromium's local storage
+under `/var/lib/arcadeos/chromium`.
+
+### Attract mode
+
+Leave the dashboard alone for sixty seconds and the cabinet starts cycling
+demos behind the wordmark, with the top scores for whatever is on screen. Any
+input at all returns instantly.
+
+---
+
+## Settings
+
+Reachable from the dashboard with the d-pad.
+
+| Setting | |
+|---|---|
+| **VOLUME** | Left/right in 5% steps |
+| **MUTE** | |
+| **CONTROLLER** | `AUTO`, or force Xbox / PlayStation / Nintendo button layout |
+| **CRT VEIL** | The subtle scanline overlay |
+| **REDUCED MOTION** | Stills the drifting aurora and disables rumble |
+| **FRAME TIMER** | On-screen fps, mean/worst frame time, and a 16.7ms reference line |
+| **PAIR BLUETOOTH PAD** | Opens a two-minute pairing window |
+| **RESET HIGH SCORES** | Asks first |
+| **RESTART** / **SHUT DOWN** | Ask first, then do it properly |
+
+### Pairing a Bluetooth controller
+
+1. **SETTINGS → PAIR BLUETOOTH PAD**
+2. Put the controller into pairing mode:
+   - **Xbox** — hold the small sync button on the top edge until the logo flashes fast
+   - **PlayStation** — hold **Share** and **PS** together until the light bar flashes
+   - **Switch Pro** — hold the sync button next to the USB-C port
+3. Wait. The cabinet shows `CONTROLLER … READY` when it connects.
+
+The pairing window stays open for two minutes. It will reconnect automatically
+on every subsequent boot.
+
+---
+
+## Adding a game
+
+A game is one file in `src/games/` exporting an object with a fixed shape.
+There is no framework, no registration boilerplate beyond one call, and no
+build configuration beyond adding the filename to a list.
+
+### 1. Write the module
+
+```js
+// src/games/mygame.js
+var MYGAME = (function () {
+  var score = 0;
+  var x = GW / 2;
+
+  function start() {            // reset ALL state; called on every new game
+    score = 0;
+    x = GW / 2;
+  }
+
+  function update(dt) {         // dt in milliseconds — never assume 16.67
+    if (Input.down('left'))  x -= 0.3 * dt;
+    if (Input.down('right')) x += 0.3 * dt;
+    x = clamp(x, 0, GW);
+    if (Input.hit('confirm')) score += 10;
+    // when it's over:  Shell.gameOver(score);
+  }
+
+  function draw() {             // draw into gx, a 600x1000 portrait space
+    gBackdrop(ACCENT.snake);
+    gHud(ACCENT.snake, [{ label: 'SCORE', value: fmtScore(score) }]);
+    tile(gx, x, 500, 40, '#46CE7A', '#8AE4AB', 'glow');
+  }
+
+  function preview(c, w, h, t) { // animated loop for the dashboard card
+    tile(c, w / 2 + Math.sin(t * 0.003) * w * 0.3, h / 2, h * 0.2,
+         '#46CE7A', '#8AE4AB', 'solid');
+  }
+
+  return registerGame({
+    id: 'mygame',
+    title: 'MY GAME',
+    tag: 'One line, shown on the card',
+    accent: '#46CE7A',
+    start: start, update: update, draw: draw, preview: preview,
+  });
+})();
+```
+
+### 2. Add it to the build
+
+```js
+// build.js
+const GAMES = [
+  'games/tetris.js',
+  ...
+  'games/mygame.js',
+];
+```
+
+### 3. Build and test
+
+```bash
+npm run build && npm test
+```
+
+The test suite discovers games from the registry, so yours automatically gets
+the contract check, the boot → play → pause → quit walk, and 1500 randomised
+input frames at varying frame rates. You do not need to write a test to get
+that coverage — but do write one for any interesting rule of your own.
+
+### House rules
+
+- **The 600×1000 space is logical.** Never read real pixel sizes. The shell
+  scales and letterboxes for you.
+- **`dt` is milliseconds and it varies.** Never count frames. If you need
+  auto-repeat, use `makeRepeater(delay, rate)`.
+- **Use the palette.** `COL`, `ACCENT` and `PIECE_COL` in `src/core/util.js`
+  are the whole design system. Do not invent a colour.
+- **Use `tile()` and `slab()`.** They are what make nine games look like one
+  machine.
+- **Do not allocate in `update`/`draw`.** Use `makePool()` and
+  `makeParticles()`. GC pauses are visible as dropped frames on a Pi.
+- **No `shadowBlur`.** Use `Render.glow()`, which blits a cached sprite. There
+  is a test that fails the build if `shadowBlur` reappears.
+- **Playable on a d-pad and one button.** Extra buttons are conveniences.
+
+### What is available to a game
+
+| | |
+|---|---|
+| `GW`, `GH` | 600, 1000 — the logical game space |
+| `gx` | The 2D context to draw into |
+| `Input.down(a)` / `Input.hit(a)` / `Input.rep(a)` | Actions: `up down left right confirm back alt pause` |
+| `Input.p(n)` | Per-player input, for two-player modes |
+| `Input.rumble(strong, weak, ms)` | Ignored when reduced motion is on |
+| `Shell.gameOver(score)` | Ends the run. Never call from `draw()` |
+| `gBackdrop(accent)`, `gHud(accent, fields)` | Shared game chrome |
+| `tile(ctx,x,y,size,base,top,mode)` | `solid` \| `ghost` \| `glow` \| `flash` |
+| `slab(ctx,x,y,w,h,base,top,mode)` | The non-square version |
+| `panel`, `text`, `dataText`, `roundRect` | Shared drawing |
+| `Render.glow(ctx,x,y,size,color,alpha)` | Cached glow sprite |
+| `Audio2.sfx(name)`, `Audio2.tone()`, `Audio2.noise()` | Synthesised, no samples |
+| `makePool`, `makeParticles`, `makeRepeater` | |
+| `rnd()`, `rndInt(a,b)`, `rndRange(a,b)`, `pick(arr)` | Seedable, so tests reproduce |
+| `clamp`, `lerp`, `approach`, `num`, `fmtScore`, `pad`, `rgba`, `shade` | |
+
+---
+
+## Wiring arcade buttons to a USB encoder
+
+A "zero delay" USB encoder turns real arcade buttons and a joystick into
+something the Pi treats as a controller. They cost a few pounds and are the
+single biggest upgrade to how a cabinet feels.
+
+### Which mode
+
+These encoders enumerate in one of two ways, sometimes switchable:
+
+- **As a gamepad** — ArcadeOS treats it like any other pad. Preferred.
+- **As a keyboard**, emitting arrow keys plus a scattering of letters.
+  ArcadeOS accepts the common encoder mappings, so this works too.
+
+You do not need to configure anything either way. If the buttons feel wrong in
+gamepad mode, set **SETTINGS → CONTROLLER** to `XBOX`.
+
+### Wiring
+
+Every arcade button and every joystick microswitch has two terminals and no
+polarity — you cannot wire one backwards.
+
+```
+            ┌─────────────────────────┐
+            │      USB ENCODER        │
+            │  UP DN LT RT  1 2 3 4   │
+            └───┬──┬──┬──┬───┬─┬─┬─┬──┘
+                │  │  │  │   │ │ │ │
+   joystick ────┴──┴──┴──┘   │ │ │ │
+   microswitches             │ │ │ │
+                             │ │ │ │
+   buttons ──────────────────┴─┴─┴─┘
+
+   every switch also connects to the shared GROUND chain
+```
+
+1. Connect each joystick microswitch to `UP`, `DOWN`, `LEFT`, `RIGHT`.
+2. Connect each button to a numbered input.
+3. Daisy-chain the second terminal of **every** switch and button along the
+   ground wire — encoders ship with a pre-made ground harness for this.
+4. Plug the encoder into the Pi.
+
+### Which buttons matter
+
+ArcadeOS needs three inputs plus the stick:
+
+| Encoder input | Becomes | Used for |
+|---|---|---|
+| Button 1 | `confirm` | Select, fire, hard drop |
+| Button 2 | `back` | Cancel, back |
+| Button 3 | `alt` | Hold, secondary |
+| Start | `pause` | Pause, and player 2 joining |
+
+Wire a Start button. It is how player 2 joins, and how anyone pauses.
+
+### Two-player cabinets
+
+Use **two encoders**. Each enumerates separately, and ArcadeOS assigns them to
+player slots on its own. Player 1 is whichever appears first; the second joins
+by pressing its Start button.
+
+### A shutdown button
+
+Wire one more momentary button between **BCM pin 3** and **any ground pin**,
+directly on the Pi's GPIO header — not through the encoder. Hold it for a
+second to power down cleanly. Change the pin with
+`sudo ./setup-arcade.sh --gpio-pin N`.
+
+---
+
+## Development
+
+```bash
+npm run build      # -> dist/arcade.html
+npm run build:min  # minified
+npm test           # headless suite, no browser needed
+npm run check      # build then test
+```
+
+### Layout
+
+```
+src/
+  index.html          shell markup (one canvas)
+  styles.css
+  core/
+    util.js           design tokens, seeded RNG, pools, repeaters
+    storage.js        guarded persistence, settings, high scores
+    audio.js          WebAudio synthesis
+    input.js          gamepad + keyboard -> semantic actions
+    render.js         logical-space canvas, tile/slab/glow/text primitives
+    system.js         loopback client for shutdown/restart/pairing
+    shell.js          the state machine
+    boot.js           entry point and the single rAF loop
+  games/              one file per game
+build.js              concatenates -> dist/arcade.html
+pi/                   agent, GPIO watcher, splash generator, Plymouth theme
+test/                 harness + suites
+setup-arcade.sh
+```
+
+### Testing
+
+There is no browser in CI, so everything runs headlessly. The harness mocks
+`document`, `window`, `navigator.getGamepads` and the canvas 2D context, then
+drives the real frame loop directly with explicit `dt` values.
+
+**The mock context asserts on every draw call.** It rejects colour strings
+containing `NaN` or `undefined`, non-finite coordinates, `globalAlpha` outside
+0–1, negative radii and unbalanced `save`/`restore`. This is not decoration —
+it exists because of two real bugs:
+
+- An `rgb()` string was fed back into a hex parser, producing `NaN` colour
+  stops that threw inside `addColorStop`.
+- A menu auto-repeat driven by frame counters scrolled at different speeds on
+  60Hz and 144Hz panels.
+
+Both classes are now caught the moment they are drawn.
+
+Current coverage: 176 tests. Boot → dashboard → each game → pause → quit for
+all nine games; 1500+ randomised frames per game with varied `dt`; controller
+detection for Xbox, PlayStation, Nintendo and unknown pads; storage fresh,
+populated, corrupt and unavailable; per-frame draw budgets; and the Pi assets.
+
+Failures reproduce: every random source is seeded.
+
+### Debugging on the cabinet
+
+The bundle publishes a handle for the Chromium console:
+
+```js
+ArcadeOS.Shell.state()
+ArcadeOS.Scores.table('tetris')
+ArcadeOS.Settings.all()
+ArcadeOS.Input.players()
+```
+
+---
+
+## Troubleshooting
+
+**Black screen after boot**
+
+```bash
+systemctl status arcadeos
+journalctl -u arcadeos -n 100 --no-pager
+```
+
+Usually the user is not in the `video`/`input` groups, or `seatd` is not
+running. Re-running `sudo ./setup-arcade.sh` fixes both.
+
+**Display is sideways, or letterboxed with black bars**
+
+```bash
+sudo ./setup-arcade.sh --rotate 270 && sudo reboot
+```
+
+The bars mean the panel is not 9:16; the front end letterboxes rather than
+distorting. That is intentional.
+
+**Controller does nothing**
+
+Check it enumerates at all: `ls /dev/input/js*`. Bluetooth pads must be paired
+first — use **SETTINGS → PAIR BLUETOOTH PAD**. If the pad works but the
+buttons are swapped, set **SETTINGS → CONTROLLER** to match your hardware.
+
+**Buttons are backwards on a Switch Pro pad**
+
+That is what the automatic swap exists to prevent, so it means the pad was not
+recognised. Set **SETTINGS → CONTROLLER → NINTENDO** and file the controller's
+`id` string as an issue — `ArcadeOS.Input.players()` in the console shows it.
+
+**No sound**
+
+Check volume and mute in settings first. Then check the Pi is outputting to
+the right device: `sudo raspi-config` → System → Audio. HDMI monitors with no
+speakers are the usual answer.
+
+**High scores are not saving**
+
+Settings shows `STORAGE UNAVAILABLE` at the bottom when this happens. It means
+Chromium could not write its profile — usually a full or read-only card:
+
+```bash
+df -h /var/lib/arcadeos
+ls -la /var/lib/arcadeos/chromium
+```
+
+On a read-only install, check the data partition is mounted:
+`mountpoint /var/lib/arcadeos`.
+
+**Shutdown from the menu does nothing**
+
+The agent is not running:
+
+```bash
+systemctl status arcadeos-agent
+curl http://127.0.0.1:8127/       # should answer {"ok": true, ...}
+```
+
+**GPIO button does nothing**
+
+```bash
+journalctl -u arcadeos-gpio -n 50 --no-pager
+```
+
+Confirm the button is between the configured BCM pin and **ground**, and that
+you are holding it for a full second. Or switch to the kernel implementation,
+which is more robust: `sudo ./setup-arcade.sh --gpio-overlay && sudo reboot`.
+
+**Frame rate feels low**
+
+Turn on **SETTINGS → FRAME TIMER**. If the mean is above 16.7ms, try disabling
+**CRT VEIL** and enabling **REDUCED MOTION**, which are the two most expensive
+optional effects. Check nothing else is competing: `top`.
+
+**I need a console back**
+
+```bash
+sudo systemctl stop arcadeos
+```
+
+or over SSH at any time. To remove ArcadeOS entirely:
+
+```bash
+sudo ./setup-arcade.sh --uninstall && sudo reboot
+```
+
+---
+
+## How it works
+
+**One canvas.** The entire front end — dashboard, cards, animated previews,
+aurora, games — renders into a single `<canvas>`. A Pi 4 compositing a dozen
+small canvases behind a CSS-blurred background cannot hold 60fps at 1080×1920;
+one layer comfortably can. It also means there is no cursor and no DOM to
+reflow.
+
+**Two logical spaces.** Menus are laid out in 1080×1920, games in 600×1000.
+Both are letterboxed onto whatever the real display is, so no code anywhere
+deals with resolution or DPI.
+
+**Glow is pre-rendered.** `shadowBlur` per tile in a hot draw loop is the
+single most expensive thing you can do on a Pi. Glow comes from sprites
+rasterised once and cached by colour and size. Static text is cached the same
+way, which took the dashboard from 362 `fillText` calls per frame to 4.
+
+**Time, never frames.** Every timer in the machine is milliseconds. Menu
+auto-repeat is 360ms then 120ms; Tetris DAS is 170ms then 50ms; the rhythm
+game accumulates song position from `dt` rather than reading the audio clock,
+so it stays correct even when the audio context never starts.
+
+**Storage never breaks a game.** Every read and write goes through one wrapper
+with a try/catch and an in-memory fallback. A corrupt record costs you one row,
+not the leaderboard.
+
+**Nothing leaves the machine.** No CDN, no fonts, no telemetry, no network
+calls of any kind. The build fails if a URL appears in the output. The one
+exception is the loopback agent on `127.0.0.1`, which exists so the settings
+screen can power the cabinet down — it binds nowhere else and accepts exactly
+three fixed commands.
+
+---
+
+## Out of scope
+
+Emulators and ROMs (Batocera already solves that), online leaderboards,
+accounts, telemetry, and any runtime network dependency.
+
+## Licence
+
+MIT.
