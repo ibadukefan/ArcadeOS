@@ -49,6 +49,15 @@ var Shell = (function () {
   var toast = null;           /* {text, life} */
   var lastPadsVersion = -1;
 
+  /* Rolling frame-time window for the on-cabinet timer. Fixed-size and
+   * written in place — a perf overlay that allocates every frame would be
+   * measuring itself. */
+  var FT_N = 60;
+  var frameTimes = new Array(FT_N);
+  for (var ftI = 0; ftI < FT_N; ftI++) frameTimes[ftI] = 16.667;
+  var frameAt = 0;
+  var worstFrame = 0;
+
   var ATTRACT_AFTER = 60000;
   var attract = { game: null, timer: 0, index: 0 };
 
@@ -313,6 +322,7 @@ var Shell = (function () {
         value: layoutLabel(s.layout) },
       { id: 'crt', label: 'CRT VEIL', type: 'toggle', on: s.crt },
       { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
+      { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
@@ -487,6 +497,9 @@ var Shell = (function () {
   function update(dt) {
     t += dt;
     stateT += dt;
+    frameTimes[frameAt] = dt;
+    frameAt = (frameAt + 1) % FT_N;
+    if (dt > worstFrame) worstFrame = dt;
     if (fade > 0) fade = Math.max(0, fade - dt / 260);
 
     if (toast) {
@@ -556,6 +569,7 @@ var Shell = (function () {
       case 'attract': drawAttract(c); break;
     }
 
+    drawFrameTimer(c);
     drawToast(c);
 
     if (fade > 0) {
@@ -573,11 +587,11 @@ var Shell = (function () {
 
   function wordmark(c, cx, cy, size) {
     var w = text(c, 'ARCADE', cx, cy, {
-      size: size, weight: '700', track: size * 0.19, aurora: true,
+      size: size, weight: '700', track: size * 0.19, aurora: true, cache: true,
       align: 'center', baseline: 'middle',
     });
     text(c, 'OS', cx + w / 2 + size * 0.34, cy, {
-      size: size * 0.42, weight: '600', track: size * 0.10,
+      size: size * 0.42, weight: '600', track: size * 0.10, cache: true,
       color: COL.dim, align: 'left', baseline: 'middle',
     });
   }
@@ -607,12 +621,14 @@ var Shell = (function () {
     wordmark(c, SW / 2, 120, 68);
     text(c, 'SELECT A GAME', SW / 2, 196, {
       size: 18, weight: '500', track: 6, color: COL.text2, align: 'center',
+      cache: true,
     });
 
     var n = Input.playerCount();
     var label = n > 1 ? n + ' PLAYERS READY' : 'PRESS START TO JOIN P2';
     text(c, label, SW / 2, 232, {
       size: 15, weight: '500', track: 3, color: COL.dim, align: 'center',
+      cache: true,
     });
 
     /* Hairline under the header. */
@@ -657,12 +673,13 @@ var Shell = (function () {
       });
     }
 
+    /* Titles and tags never change; rasterise once, blit thereafter. */
     text(c, g.title, rect.x + 20, rect.y + rect.h - 74, {
-      size: 30, weight: '700', track: 4.5,
+      size: 30, weight: '700', track: 4.5, cache: true,
       color: selected ? COL.text : '#CFCBEC',
     });
     text(c, g.tag, rect.x + 20, rect.y + rect.h - 40, {
-      size: 16, weight: '400', track: 0.4, color: COL.text2,
+      size: 16, weight: '400', track: 0.4, color: COL.text2, cache: true,
     });
 
     var best = Scores.best(g.id);
@@ -687,7 +704,7 @@ var Shell = (function () {
       baseline: 'middle',
     });
     text(c, e.label, rect.x + 74, rect.y + rect.h / 2 + 1, {
-      size: 22, weight: '600', track: 3.5,
+      size: 22, weight: '600', track: 3.5, cache: true,
       color: selected ? COL.text : COL.text2, baseline: 'middle',
     });
   }
@@ -758,10 +775,12 @@ var Shell = (function () {
         fill: 'rgba(30,24,62,.7)', stroke: 'rgba(140,150,255,.18)', radius: 9,
       });
       text(c, h.g, x + gw / 2, y - 4, {
-        size: 14, weight: '700', color: COL.text, align: 'center',
+        size: 14, weight: '700', color: COL.text, align: 'center', cache: true,
       });
       x += gw + 10;
-      text(c, h.l, x, y - 4, { size: 14, weight: '500', track: 2, color: COL.dim });
+      text(c, h.l, x, y - 4, {
+        size: 14, weight: '500', track: 2, color: COL.dim, cache: true,
+      });
       x += measure(c, h.l, 2) + 30;
     }
   }
@@ -1120,6 +1139,55 @@ var Shell = (function () {
     }
   }
 
+  /* ----------------------------------------------------- frame timer --- */
+
+  /**
+   * On-cabinet frame timer. This exists because the 60fps target has to be
+   * verifiable on the actual Pi, in the actual kiosk, with no debugger
+   * attached and no keyboard plugged in. Shows the mean, the worst frame in
+   * the last window, and a bar that turns amber past 16.7ms.
+   */
+  function drawFrameTimer(c) {
+    var on = false;
+    try { on = !!Settings.get('showFps'); } catch (e) { on = false; }
+    if (!on) return;
+    Render.enterShell();
+
+    var sum = 0, worst = 0;
+    for (var i = 0; i < FT_N; i++) {
+      sum += frameTimes[i];
+      if (frameTimes[i] > worst) worst = frameTimes[i];
+    }
+    var mean = sum / FT_N;
+    var fps = mean > 0 ? 1000 / mean : 0;
+    var bad = mean > 17.5;
+
+    panel(c, 16, SH - 96, 300, 64, {
+      fill: 'rgba(7,5,14,.86)', stroke: bad ? rgba(COL.warn, 0.6) : COL.cardLine,
+      radius: 10,
+    });
+    dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 68, {
+      size: 20, color: bad ? COL.warn : COL.a1,
+    });
+    dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) + 'ms',
+      32, SH - 46, { size: 14, color: COL.dim });
+
+    /* A 16.7ms reference line, so "over budget" is visible not calculated. */
+    var bx = 176, bw = 124, by = SH - 78;
+    c.fillStyle = 'rgba(110,106,160,.22)';
+    c.fillRect(bx, by, bw, 26);
+    for (var k = 0; k < FT_N; k++) {
+      var ft = frameTimes[(frameAt + k) % FT_N];
+      var hgt = clamp(ft / 33.4, 0, 1) * 26;
+      c.fillStyle = ft > 17.5 ? COL.warn : COL.a1;
+      c.fillRect(bx + k * (bw / FT_N), by + 26 - hgt, Math.max(1, bw / FT_N - 0.5), hgt);
+    }
+    c.globalAlpha = 0.6;
+    c.fillStyle = COL.text2;
+    c.fillRect(bx, by + 26 - (16.667 / 33.4) * 26, bw, 1);
+    c.globalAlpha = 1;
+  }
+
   /* ----------------------------------------------------------- toast --- */
 
   function drawToast(c) {
@@ -1172,6 +1240,14 @@ var Shell = (function () {
     _setCursor: function (i) { setCursor = i; },
     _settingsItems: settingsItems,
     _idle: function () { return idleT; },
+    _frameStats: function () {
+      var sum = 0, worst = 0;
+      for (var i = 0; i < FT_N; i++) {
+        sum += frameTimes[i];
+        if (frameTimes[i] > worst) worst = frameTimes[i];
+      }
+      return { mean: sum / FT_N, worst: worst, sessionWorst: worstFrame };
+    },
     _forceIdle: function (ms) { idleT = ms; },
     _reset: function () {
       state = 'boot'; prevState = 'boot';

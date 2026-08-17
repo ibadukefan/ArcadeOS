@@ -311,6 +311,9 @@ var Render = (function () {
     size: function () { return { w: W, h: H, scale: scale, ox: ox, oy: oy }; },
     gameRect: function () { return { x: gox, y: goy, w: GW * gScale, h: GH * gScale, s: gScale }; },
     _clearGlow: function () { glowCache = Object.create(null); glowKeys = []; },
+    _cacheSizes: function () {
+      return { glow: glowKeys.length, text: textKeys.length };
+    },
   };
 })();
 
@@ -442,14 +445,122 @@ function panel(c, x, y, w, h, opts) {
   c.stroke();
 }
 
+/* ------------------------------------------------------ text sprites --- */
+
+/*
+ * Letter-spaced text is drawn one glyph at a time, which is fine for a
+ * heading and ruinous for a dashboard: nine cards with tracked titles and
+ * tags cost several hundred fillText calls per frame, and fillText is one of
+ * the more expensive things a Pi 4 can do at 1080x1920.
+ *
+ * Static strings are therefore rasterised once into an offscreen canvas and
+ * blitted thereafter. Anything that changes every frame (scores, timers)
+ * skips the cache — a sprite per value would be worse than no cache at all.
+ */
+var textCache = Object.create(null);
+var textKeys = [];
+var TEXT_CAP = 192;
+var measureCtx = null;
+
+function measuringContext() {
+  if (measureCtx) return measureCtx;
+  if (typeof document === 'undefined' || !document.createElement) return null;
+  var c = document.createElement('canvas');
+  c.width = 8; c.height = 8;
+  measureCtx = c.getContext('2d');
+  return measureCtx;
+}
+
+function textSprite(s, o) {
+  var size = num(o.size, 24);
+  var weight = o.weight || '600';
+  var track = num(o.track, 0);
+  var key = s + '' + size + '|' + weight + '|' + track + '|' +
+    (o.aurora ? 'aurora' : (o.color || COL.text)) + '|' + (o.mono ? 'm' : 's');
+
+  var hit = textCache[key];
+  if (hit) return hit;
+
+  var mc = measuringContext();
+  if (!mc) return null;
+  var family = o.mono ? FONT_MONO : FONT_SANS;
+  mc.font = weight + ' ' + size + 'px ' + family;
+  var w = measure(mc, s, track);
+  if (!(w > 0)) return null;
+
+  /* Generous padding: descenders, and the odd glyph that overhangs. */
+  var padX = Math.ceil(size * 0.35);
+  var padY = Math.ceil(size * 0.45);
+  var cw = Math.ceil(w) + padX * 2;
+  var ch = Math.ceil(size * 1.6) + padY;
+  var baseline = Math.round(size * 1.15) + padY / 2;
+
+  var canvas = (typeof document !== 'undefined' && document.createElement)
+    ? document.createElement('canvas') : null;
+  if (!canvas) return null;
+  canvas.width = Math.max(1, cw);
+  canvas.height = Math.max(1, ch);
+  var g2 = canvas.getContext('2d');
+  if (!g2) return null;
+
+  g2.font = weight + ' ' + size + 'px ' + family;
+  g2.textBaseline = 'alphabetic';
+  g2.textAlign = 'left';
+
+  var fill = o.color || COL.text;
+  if (o.aurora) {
+    var grad = g2.createLinearGradient(padX, 0, padX + Math.max(1, w), 0);
+    grad.addColorStop(0, COL.a1);
+    grad.addColorStop(0.5, COL.a2);
+    grad.addColorStop(1, COL.a3);
+    fill = grad;
+  }
+  g2.fillStyle = fill;
+
+  if (track === 0) {
+    g2.fillText(s, padX, baseline);
+  } else {
+    var cx = padX;
+    for (var i = 0; i < s.length; i++) {
+      var ch2 = s.charAt(i);
+      g2.fillText(ch2, cx, baseline);
+      cx += textWidth(g2, ch2) + track;
+    }
+  }
+
+  var sprite = { canvas: canvas, w: w, padX: padX, baseline: baseline };
+  if (textKeys.length >= TEXT_CAP) delete textCache[textKeys.shift()];
+  textKeys.push(key);
+  textCache[key] = sprite;
+  return sprite;
+}
+
 /**
  * Text with optional letter-spacing. Tracking is applied by drawing glyph by
  * glyph: ctx.letterSpacing exists in modern Chromium but not in the harness,
- * and headings are short enough that the loop costs nothing.
+ * and doing it by hand keeps the two identical.
+ *
+ * Pass `cache: true` for strings that do not change from frame to frame; they
+ * are rasterised once and blitted from then on.
  */
 function text(c, str, x, y, opts) {
   var o = opts || {};
   var s = String(str == null ? '' : str);
+
+  if (o.cache && s) {
+    var spr = textSprite(s, o);
+    if (spr) {
+      var sx0 = num(x, 0);
+      var align0 = o.align || 'left';
+      if (align0 === 'center') sx0 -= spr.w / 2;
+      else if (align0 === 'right') sx0 -= spr.w;
+      var sy0 = num(y, 0);
+      if (o.baseline === 'middle') sy0 += num(o.size, 24) * 0.36;
+      c.drawImage(spr.canvas, sx0 - spr.padX, sy0 - spr.baseline,
+        spr.canvas.width, spr.canvas.height);
+      return spr.w;
+    }
+  }
   var size = num(o.size, 24);
   var weight = o.weight || '600';
   var family = o.mono ? FONT_MONO : FONT_SANS;

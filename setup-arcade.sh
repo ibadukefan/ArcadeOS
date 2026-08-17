@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+#
+# setup-arcade.sh — take a clean Raspberry Pi OS Lite (Bookworm, 64-bit)
+# install to a booting ArcadeOS cabinet in one command.
+#
+#   sudo ./setup-arcade.sh                 install / update
+#   sudo ./setup-arcade.sh --uninstall     put the machine back
+#   sudo ./setup-arcade.sh --help          everything else
+#
+# Design rules for this script:
+#
+#  * Idempotent. Every run must be safe. Config files are written whole rather
+#    than appended to, edits to shared files are fenced between markers and
+#    rewritten in place, and services are re-enabled rather than assumed.
+#  * Never destructive without an explicit flag. It will tell you how to make
+#    a data partition; it will not repartition your card because you passed
+#    --readonly.
+#  * Loud about what it changed, so an install can be audited afterwards.
+
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+MARKER_BEGIN="# >>> arcadeos >>>"
+MARKER_END="# <<< arcadeos <<<"
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="/opt/arcadeos"
+DATA_DIR="/var/lib/arcadeos"
+THEME_DIR="/usr/share/plymouth/themes/arcadeos"
+DATA_LABEL="ARCADEDATA"
+
+ARCADE_USER="${SUDO_USER:-${ARCADE_USER:-pi}}"
+
+# Flags
+DO_UNINSTALL=0
+DO_READONLY=0
+DO_UNREADONLY=0
+DO_GPIO=1
+DO_GPIO_OVERLAY=0
+GPIO_PIN="${ARCADEOS_GPIO_PIN:-3}"
+SKIP_APT=0
+ROTATE="${ARCADEOS_ROTATE:-90}"
+ASSUME_YES=0
+
+# ---------------------------------------------------------------- output ---
+
+if [[ -t 1 ]]; then
+  C_OK=$'\033[38;5;79m'; C_WARN=$'\033[38;5;215m'; C_ERR=$'\033[38;5;203m'
+  C_DIM=$'\033[38;5;103m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_OFF=""
+fi
+
+step()  { printf '%s==>%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+info()  { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+warn()  { printf '%s !! %s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
+die()   { printf '%serror:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+
+trap 'die "failed on line $LINENO. Nothing further was changed."' ERR
+
+usage() {
+  cat <<EOF
+ArcadeOS setup ${VERSION}
+
+  sudo ./setup-arcade.sh [options]
+
+Options
+  --uninstall           Remove ArcadeOS: services, kiosk, splash, app files.
+                        Leaves high scores in ${DATA_DIR} unless --purge.
+  --purge               With --uninstall, also delete saved scores/settings.
+  --readonly            Enable the read-only overlay filesystem. Requires a
+                        partition labelled ${DATA_LABEL} for scores; the
+                        script tells you how to make one if it is missing.
+  --writable            Turn the read-only overlay back off.
+  --no-gpio             Do not install the GPIO shutdown-button service.
+  --gpio-pin N          BCM pin for the shutdown button (default ${GPIO_PIN}).
+  --gpio-overlay        Use the kernel's dtoverlay=gpio-shutdown instead of
+                        the systemd service. More robust, less configurable.
+  --rotate DEG          Display rotation: 0, 90, 180, 270 (default ${ROTATE}).
+  --skip-apt            Do not touch apt. For re-runs and for testing.
+  --yes                 Do not prompt for confirmation.
+  --help                This.
+
+Afterwards
+  systemctl status arcadeos          the kiosk itself
+  journalctl -u arcadeos -f          watch it run
+  sudo ./setup-arcade.sh --uninstall undo everything
+EOF
+}
+
+confirm() {
+  [[ $ASSUME_YES -eq 1 ]] && return 0
+  local reply
+  read -r -p "    $1 [y/N] " reply || true
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# ----------------------------------------------------------------- parse ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --uninstall) DO_UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
+    --readonly) DO_READONLY=1 ;;
+    --writable) DO_UNREADONLY=1 ;;
+    --no-gpio) DO_GPIO=0 ;;
+    --gpio-overlay) DO_GPIO_OVERLAY=1 ;;
+    --gpio-pin) GPIO_PIN="${2:?--gpio-pin needs a number}"; shift ;;
+    --rotate) ROTATE="${2:?--rotate needs degrees}"; shift ;;
+    --skip-apt) SKIP_APT=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+PURGE="${PURGE:-0}"
+
+[[ "$ROTATE" =~ ^(0|90|180|270)$ ]] || die "--rotate must be 0, 90, 180 or 270"
+[[ "$GPIO_PIN" =~ ^[0-9]+$ ]] || die "--gpio-pin must be a number"
+[[ $EUID -eq 0 ]] || die "run with sudo"
+
+# ------------------------------------------------------------- utilities ---
+
+# Rewrite a marker-fenced block in a file. Idempotent by construction: the old
+# block is removed whole and the new one appended, so re-running never stacks
+# duplicate entries the way `>>` does.
+write_block() {
+  local file="$1" content="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -f "$file" ]]; then
+    awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
+      $0 == b { skip = 1 }
+      skip != 1 { print }
+      $0 == e { skip = 0 }
+    ' "$file" > "$tmp"
+  fi
+  {
+    printf '%s\n' "$MARKER_BEGIN"
+    printf '%s\n' "$content"
+    printf '%s\n' "$MARKER_END"
+  } >> "$tmp"
+  install -m 0644 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+remove_block() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
+    $0 == b { skip = 1 }
+    skip != 1 { print }
+    $0 == e { skip = 0 }
+  ' "$file" > "$tmp"
+  install -m 0644 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+boot_config() {
+  # Bookworm moved the boot partition. Support both so this works on images
+  # of either vintage.
+  if [[ -f /boot/firmware/config.txt ]]; then echo /boot/firmware/config.txt
+  elif [[ -f /boot/config.txt ]]; then echo /boot/config.txt
+  else echo ""; fi
+}
+
+boot_cmdline() {
+  if [[ -f /boot/firmware/cmdline.txt ]]; then echo /boot/firmware/cmdline.txt
+  elif [[ -f /boot/cmdline.txt ]]; then echo /boot/cmdline.txt
+  else echo ""; fi
+}
+
+svc_disable() {
+  local unit="$1"
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${unit}"
+}
+
+# --------------------------------------------------------------- install ---
+
+install_packages() {
+  [[ $SKIP_APT -eq 1 ]] && { info "skipping apt (--skip-apt)"; return 0; }
+  step "Updating the system and installing packages"
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get -y -qq upgrade
+
+  # cage is the Wayland kiosk compositor; seatd gives it seat access without
+  # a full login manager. The rest is Bluetooth pads, GPIO and fonts.
+  local packages=(
+    cage
+    seatd
+    chromium-browser
+    plymouth
+    plymouth-themes
+    bluez
+    python3
+    python3-gpiozero
+    python3-lgpio
+    fonts-dejavu-core
+    libgl1-mesa-dri
+  )
+
+  # chromium-browser is a transitional package on some images; fall back.
+  if ! apt-cache show chromium-browser >/dev/null 2>&1; then
+    packages=("${packages[@]/chromium-browser/chromium}")
+  fi
+
+  local missing=()
+  for p in "${packages[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+
+  if ((${#missing[@]})); then
+    info "installing: ${missing[*]}"
+    apt-get -y -qq install "${missing[@]}"
+  else
+    info "all packages already present"
+  fi
+
+  systemctl enable --now seatd >/dev/null 2>&1 || true
+  usermod -aG video,input,render,seat "$ARCADE_USER" 2>/dev/null || true
+}
+
+find_chromium() {
+  for c in chromium-browser chromium /usr/lib/chromium/chromium; do
+    if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+    [[ -x "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+install_app() {
+  step "Installing ArcadeOS to ${APP_DIR}"
+
+  # Prefer a freshly built bundle; fall back to the committed one so the Pi
+  # never needs Node installed.
+  if command -v node >/dev/null 2>&1 && [[ -f "$SRC_DIR/build.js" ]]; then
+    info "building from source"
+    ( cd "$SRC_DIR" && node build.js >/dev/null )
+  fi
+  [[ -f "$SRC_DIR/dist/arcade.html" ]] || die "dist/arcade.html missing — run 'npm run build' first"
+
+  install -d -m 0755 "$APP_DIR"
+  install -m 0644 "$SRC_DIR/dist/arcade.html" "$APP_DIR/arcade.html"
+  install -d -m 0755 "$DATA_DIR"
+  chown -R "$ARCADE_USER":"$ARCADE_USER" "$DATA_DIR"
+
+  local chromium
+  chromium="$(find_chromium)" || die "chromium not found; install it or drop --skip-apt"
+  info "chromium: $chromium"
+
+  # The kiosk launcher. Written as a file rather than a long ExecStart so it
+  # can be read, edited and run by hand while debugging a cabinet.
+  cat > "$APP_DIR/launch.sh" <<LAUNCH
+#!/usr/bin/env bash
+# ArcadeOS kiosk launcher. Managed by setup-arcade.sh — edits will be replaced.
+set -Eeuo pipefail
+
+CHROMIUM="${chromium}"
+PROFILE="${DATA_DIR}/chromium"
+PAGE="file://${APP_DIR}/arcade.html"
+
+mkdir -p "\$PROFILE"
+
+# Chromium flags, and why each one is here:
+#   --kiosk                     no chrome, no tabs, no way out
+#   --app                       no omnibox even in kiosk edge cases
+#   --user-data-dir             profile on the writable data partition, so
+#                               localStorage survives a read-only root
+#   --autoplay-policy           WebAudio without waiting for a click; there is
+#                               no pointer on a cabinet
+#   --disable-pinch/--overscroll no accidental zoom from an arcade encoder
+#   --ozone-platform=wayland    cage is a Wayland compositor
+#   --enable-features=...       keep GPU rasterisation on for canvas
+#   --disable-features=Translate,...  no dialogs, ever
+#   --check-for-update-interval large: an offline cabinet must never nag
+exec "\$CHROMIUM" \\
+  --kiosk \\
+  --app="\$PAGE" \\
+  --user-data-dir="\$PROFILE" \\
+  --ozone-platform=wayland \\
+  --enable-features=VaapiVideoDecoder \\
+  --autoplay-policy=no-user-gesture-required \\
+  --disable-pinch \\
+  --overscroll-history-navigation=0 \\
+  --disable-features=Translate,TranslateUI,AutofillServerCommunication,OptimizationHints \\
+  --disable-component-update \\
+  --disable-background-networking \\
+  --disable-sync \\
+  --no-first-run \\
+  --no-default-browser-check \\
+  --disable-infobars \\
+  --disable-session-crashed-bubble \\
+  --hide-scrollbars \\
+  --check-for-update-interval=31536000 \\
+  --password-store=basic \\
+  --use-gl=egl
+LAUNCH
+  chmod 0755 "$APP_DIR/launch.sh"
+
+  install -m 0755 "$SRC_DIR/pi/arcadeos-agent.py" "$APP_DIR/arcadeos-agent.py"
+  install -m 0755 "$SRC_DIR/pi/arcadeos-gpio.py" "$APP_DIR/arcadeos-gpio.py"
+  install -m 0755 "$SRC_DIR/pi/make-splash.py" "$APP_DIR/make-splash.py"
+}
+
+install_services() {
+  step "Installing systemd services"
+
+  cat > /etc/systemd/system/arcadeos.service <<UNIT
+[Unit]
+Description=ArcadeOS kiosk
+After=systemd-user-sessions.service seatd.service arcadeos-agent.service
+Wants=arcadeos-agent.service
+
+[Service]
+Type=simple
+User=${ARCADE_USER}
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+# Panel rotation. cage rotates the whole output, so the front end never has to
+# know it is running sideways.
+Environment=ARCADEOS_ROTATE=${ROTATE}
+ExecStart=/usr/bin/cage -d -r ${ROTATE} -- ${APP_DIR}/launch.sh
+Restart=always
+RestartSec=2
+# A cabinet should come back from a crash, not sit on a black screen.
+StartLimitBurst=0
+
+[Install]
+WantedBy=graphical.target
+UNIT
+
+  cat > /etc/systemd/system/arcadeos-agent.service <<UNIT
+[Unit]
+Description=ArcadeOS local control agent (shutdown, restart, Bluetooth pairing)
+Documentation=file://${APP_DIR}/arcadeos-agent.py
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${APP_DIR}/arcadeos-agent.py
+Restart=always
+RestartSec=2
+# Binds 127.0.0.1 only and runs a fixed three-command table, but there is no
+# reason to give it more of the filesystem than it needs.
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable arcadeos-agent.service >/dev/null
+  systemctl restart arcadeos-agent.service
+  systemctl set-default graphical.target >/dev/null
+  systemctl enable arcadeos.service >/dev/null
+  info "kiosk service enabled (starts on next boot; 'systemctl start arcadeos' to test now)"
+}
+
+install_gpio() {
+  local cfg; cfg="$(boot_config)"
+
+  if [[ $DO_GPIO_OVERLAY -eq 1 ]]; then
+    step "Enabling kernel gpio-shutdown on BCM${GPIO_PIN}"
+    [[ -n "$cfg" ]] || die "cannot find config.txt"
+    svc_disable arcadeos-gpio.service
+    write_block "$cfg" "$(cat <<CFG
+# ArcadeOS: shutdown button on BCM${GPIO_PIN} to ground, handled in-kernel.
+dtoverlay=gpio-shutdown,gpio_pin=${GPIO_PIN},active_low=1,gpio_pull=up
+# Portrait panel: rotation is applied by cage, not the firmware, so that
+# Chromium still reports a 1080x1920 viewport.
+disable_splash=1
+CFG
+)"
+    info "takes effect on reboot"
+    return 0
+  fi
+
+  if [[ $DO_GPIO -eq 0 ]]; then
+    info "skipping GPIO shutdown button (--no-gpio)"
+    svc_disable arcadeos-gpio.service
+    systemctl daemon-reload
+    return 0
+  fi
+
+  step "Installing GPIO shutdown button on BCM${GPIO_PIN}"
+  cat > /etc/systemd/system/arcadeos-gpio.service <<UNIT
+[Unit]
+Description=ArcadeOS GPIO shutdown button
+
+[Service]
+Type=simple
+Environment=ARCADEOS_GPIO_PIN=${GPIO_PIN}
+Environment=ARCADEOS_GPIO_HOLD=1.2
+Environment=ARCADEOS_GPIO_ACTION=poweroff
+ExecStart=/usr/bin/python3 ${APP_DIR}/arcadeos-gpio.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable arcadeos-gpio.service >/dev/null
+  systemctl restart arcadeos-gpio.service || warn "GPIO service did not start; check 'journalctl -u arcadeos-gpio'"
+  info "wire a momentary button between BCM${GPIO_PIN} and any GND pin"
+
+  if [[ -n "$cfg" ]]; then
+    write_block "$cfg" "disable_splash=1"
+  fi
+}
+
+install_splash() {
+  step "Installing the Plymouth boot splash"
+
+  if ! command -v plymouth-set-default-theme >/dev/null 2>&1; then
+    warn "plymouth not installed; skipping the splash"
+    return 0
+  fi
+
+  install -d -m 0755 "$THEME_DIR"
+  install -m 0644 "$SRC_DIR/pi/plymouth/arcadeos.plymouth" "$THEME_DIR/arcadeos.plymouth"
+  install -m 0644 "$SRC_DIR/pi/plymouth/arcadeos.script" "$THEME_DIR/arcadeos.script"
+
+  # Generated at install time so the wordmark matches the panel width, and so
+  # the repository carries no binary blobs.
+  python3 "$SRC_DIR/pi/make-splash.py" "$THEME_DIR/arcadeos-logo.png" --width 900 >/dev/null
+  info "wordmark generated at $THEME_DIR/arcadeos-logo.png"
+
+  plymouth-set-default-theme arcadeos >/dev/null 2>&1 || warn "could not set the plymouth theme"
+  if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u >/dev/null 2>&1 || true
+  fi
+
+  # Quiet the kernel so boot is genuinely black -> wordmark -> dashboard.
+  local cmdline; cmdline="$(boot_cmdline)"
+  if [[ -n "$cmdline" ]]; then
+    local current; current="$(cat "$cmdline")"
+    local wanted="$current"
+    for opt in quiet splash plymouth.ignore-serial-consoles logo.nologo vt.global_cursor_default=0; do
+      grep -qw -- "$opt" <<<"$wanted" || wanted="$wanted $opt"
+    done
+    wanted="$(tr -s ' ' <<<"$wanted" | sed 's/^ *//; s/ *$//')"
+    if [[ "$wanted" != "$current" ]]; then
+      cp -a "$cmdline" "${cmdline}.arcadeos.bak"
+      printf '%s\n' "$wanted" > "$cmdline"
+      info "updated $(basename "$cmdline") (backup at ${cmdline}.arcadeos.bak)"
+    else
+      info "$(basename "$cmdline") already configured"
+    fi
+  fi
+}
+
+# --------------------------------------------------- read-only overlay fs ---
+
+data_partition() {
+  blkid -L "$DATA_LABEL" 2>/dev/null || true
+}
+
+explain_data_partition() {
+  cat <<EXPLAIN
+
+    A read-only root protects the SD card from corruption, but high scores
+    then have nowhere to live. ArcadeOS keeps them on a small partition
+    labelled ${DATA_LABEL}, mounted at ${DATA_DIR}.
+
+    No such partition was found, and this script will not repartition your
+    card for you. To make one, with the card in another machine:
+
+      1. Shrink the root partition, or use free space at the end of the card.
+      2. Create a partition of 128MB or more.
+      3. Format and label it:
+             sudo mkfs.ext4 -L ${DATA_LABEL} /dev/sdXN
+      4. Put the card back and re-run:
+             sudo ./setup-arcade.sh --readonly
+
+    Alternatively, run without --readonly. The cabinet works perfectly well
+    on a normal writable root — you simply need to use the SHUT DOWN entry in
+    settings, or the GPIO button, rather than pulling the plug.
+
+EXPLAIN
+}
+
+enable_readonly() {
+  step "Enabling the read-only overlay filesystem"
+
+  local part; part="$(data_partition)"
+  if [[ -z "$part" ]]; then
+    warn "no partition labelled ${DATA_LABEL} found"
+    explain_data_partition
+    die "refusing to enable a read-only root with nowhere to keep high scores"
+  fi
+  info "data partition: $part"
+
+  # Mount it now and on every boot. nofail so a missing card never blocks boot.
+  install -d -m 0755 "$DATA_DIR"
+  write_block /etc/fstab "LABEL=${DATA_LABEL}  ${DATA_DIR}  ext4  defaults,noatime,nofail  0  2"
+  mountpoint -q "$DATA_DIR" || mount "$DATA_DIR" || warn "could not mount ${DATA_DIR} yet"
+  chown -R "$ARCADE_USER":"$ARCADE_USER" "$DATA_DIR" 2>/dev/null || true
+
+  if ! command -v raspi-config >/dev/null 2>&1; then
+    die "raspi-config not available; cannot toggle the overlay filesystem"
+  fi
+
+  confirm "Enable the read-only overlay? The root filesystem becomes non-persistent." \
+    || die "cancelled"
+
+  raspi-config nonint enable_overlayfs
+  info "overlay enabled — reboot to apply"
+  warn "the root filesystem will be read-only after reboot."
+  warn "run 'sudo ./setup-arcade.sh --writable' before making system changes."
+}
+
+disable_readonly() {
+  step "Disabling the read-only overlay filesystem"
+  command -v raspi-config >/dev/null 2>&1 || die "raspi-config not available"
+  raspi-config nonint disable_overlayfs
+  info "overlay disabled — reboot to apply"
+}
+
+# ------------------------------------------------------------- uninstall ---
+
+uninstall() {
+  step "Removing ArcadeOS"
+
+  svc_disable arcadeos.service
+  svc_disable arcadeos-agent.service
+  svc_disable arcadeos-gpio.service
+  systemctl daemon-reload
+  info "services removed"
+
+  if command -v plymouth-set-default-theme >/dev/null 2>&1; then
+    plymouth-set-default-theme pix >/dev/null 2>&1 \
+      || plymouth-set-default-theme --reset >/dev/null 2>&1 || true
+    command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u >/dev/null 2>&1 || true
+  fi
+  rm -rf "$THEME_DIR"
+  info "splash removed"
+
+  local cmdline; cmdline="$(boot_cmdline)"
+  if [[ -n "$cmdline" && -f "${cmdline}.arcadeos.bak" ]]; then
+    mv "${cmdline}.arcadeos.bak" "$cmdline"
+    info "restored $(basename "$cmdline")"
+  fi
+
+  local cfg; cfg="$(boot_config)"
+  [[ -n "$cfg" ]] && { remove_block "$cfg"; info "cleaned $(basename "$cfg")"; }
+  remove_block /etc/fstab
+
+  # Overlay off first — otherwise these deletions evaporate on reboot.
+  if command -v raspi-config >/dev/null 2>&1; then
+    raspi-config nonint disable_overlayfs >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "$APP_DIR"
+  info "removed ${APP_DIR}"
+
+  if [[ "$PURGE" -eq 1 ]]; then
+    rm -rf "$DATA_DIR"
+    warn "purged ${DATA_DIR} — high scores are gone"
+  else
+    info "kept ${DATA_DIR} (high scores). Use --purge to delete it."
+  fi
+
+  systemctl set-default multi-user.target >/dev/null 2>&1 || true
+
+  step "Done. Reboot to return to a normal console."
+}
+
+# ------------------------------------------------------------------ main ---
+
+main() {
+  if [[ $DO_UNINSTALL -eq 1 ]]; then uninstall; exit 0; fi
+  if [[ $DO_UNREADONLY -eq 1 ]]; then disable_readonly; exit 0; fi
+
+  printf '\n%sArcadeOS %s%s — installing for user %s%s%s\n\n' \
+    "$C_OK" "$VERSION" "$C_OFF" "$C_OK" "$ARCADE_USER" "$C_OFF"
+
+  id "$ARCADE_USER" >/dev/null 2>&1 || die "user '$ARCADE_USER' does not exist (set ARCADE_USER=...)"
+
+  # A read-only root would silently swallow the whole install.
+  if [[ -d /overlay ]] || grep -qs ' / overlay ' /proc/mounts; then
+    die "the root filesystem is currently read-only. Run --writable and reboot first."
+  fi
+
+  install_packages
+  install_app
+  install_services
+  install_gpio
+  install_splash
+
+  [[ $DO_READONLY -eq 1 ]] && enable_readonly
+
+  cat <<DONE
+
+$(printf '%s==>%s' "$C_OK" "$C_OFF") Installed.
+
+    Kiosk        systemctl status arcadeos
+    Logs         journalctl -u arcadeos -f
+    Agent        curl http://127.0.0.1:8127/    (should answer {"ok": true})
+    Rotation     ${ROTATE} degrees
+    Scores       ${DATA_DIR}/chromium
+    Uninstall    sudo ./setup-arcade.sh --uninstall
+
+    Reboot to boot straight into the cabinet:
+
+        sudo reboot
+
+DONE
+}
+
+main "$@"

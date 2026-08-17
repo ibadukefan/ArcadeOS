@@ -119,6 +119,9 @@ var SETTINGS_DEFAULTS = {
   layout: 'auto',
   crt: true,
   reducedMotion: false,
+  /* On-cabinet frame timer. Off by default; the only way to confirm 60fps
+   * on real hardware without attaching a debugger to a kiosk. */
+  showFps: false,
 };
 
 var Settings = (function () {
@@ -135,6 +138,7 @@ var Settings = (function () {
       raw.layout === 'nintendo') ? raw.layout : 'auto';
     out.crt = raw.crt !== false;
     out.reducedMotion = raw.reducedMotion === true;
+    out.showFps = raw.showFps === true;
     return out;
   }
 
