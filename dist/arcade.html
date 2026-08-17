@@ -3336,6 +3336,1666 @@ var SNAKE = (function () {
   });
 })();
 
+/* ===== games/breakout.js ========================================= */
+/*
+ * BREAKOUT — a deliberately tall well.
+ *
+ * The portrait aspect is the design: with ~700px of clear air between the
+ * brick field and the paddle, a ball spends most of its life in transit, so
+ * angle choice matters far more than reaction speed. On a wide screen this
+ * would be a twitch game; here it is a planning one.
+ *
+ * Controls: left/right to move the paddle, confirm to launch.
+ */
+
+var BREAKOUT = (function () {
+  var PAD_X = 24;
+  var TOP = HUD_H + 12;
+  var BOT = GH - 20;
+  var LEFT = PAD_X, RIGHT = GW - PAD_X;
+  var FIELD_W = RIGHT - LEFT;
+
+  var COLS = 8, ROWS = 6;
+  var BRICK_W = FIELD_W / COLS;
+  var BRICK_H = 26;
+  var BRICK_TOP = TOP + 40;
+
+  var PADDLE_Y = BOT - 34;
+  var PADDLE_W = 108, PADDLE_H = 16;
+  var PADDLE_SPEED = 0.62;
+
+  var BALL_R = 8;
+  var BASE_SPEED = 0.40;
+  var MAX_SPEED = 0.86;
+
+  /* Row colours run down the tetromino ramp so the field reads as a gradient. */
+  var ROW_COL = ['Z', 'L', 'O', 'S', 'I', 'J'];
+
+  var bricks = new Int8Array(COLS * ROWS);   /* 0 empty, else hits remaining */
+  var paddle = { x: GW / 2, w: PADDLE_W, wide: 0 };
+  var balls = makePool(function () {
+    return { alive: false, x: 0, y: 0, vx: 0, vy: 0, stuck: true };
+  }, 4);
+  var drops = makePool(function () {
+    return { alive: false, x: 0, y: 0, kind: 0 };
+  }, 8);
+  var particles = makeParticles(80);
+
+  var score = 0, lives = 3, level = 1, remaining = 0, over = false;
+  var shakeT = 0, flashT = 0;
+
+  /* 0 = wide paddle, 1 = multi-ball, 2 = extra life */
+  var DROP_COL = ['#37E1C4', '#F0C64E', '#F0645E'];
+
+  function idx(c, r) { return r * COLS + c; }
+
+  function buildField() {
+    remaining = 0;
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        /* Higher rows take more hits as levels advance. */
+        var hits = 1;
+        if (level >= 2 && r === 0) hits = 2;
+        if (level >= 3 && r <= 1) hits = 2;
+        if (level >= 5 && r === 0) hits = 3;
+        bricks[idx(c, r)] = hits;
+        remaining++;
+      }
+    }
+  }
+
+  function resetBall() {
+    balls.clear();
+    var b = balls.spawn();
+    if (!b) return;
+    b.x = paddle.x;
+    b.y = PADDLE_Y - BALL_R - 2;
+    b.vx = 0; b.vy = 0;
+    b.stuck = true;
+  }
+
+  function launch(b) {
+    if (!b.stuck) return;
+    b.stuck = false;
+    var speed = BASE_SPEED + (level - 1) * 0.03;
+    var ang = -Math.PI / 2 + rndRange(-0.5, 0.5);
+    b.vx = Math.cos(ang) * speed;
+    b.vy = Math.sin(ang) * speed;
+    Audio2.sfx('bounce');
+  }
+
+  function start() {
+    score = 0; lives = 3; level = 1; over = false;
+    shakeT = 0; flashT = 0;
+    paddle.x = GW / 2; paddle.w = PADDLE_W; paddle.wide = 0;
+    drops.clear();
+    particles.clear();
+    buildField();
+    resetBall();
+  }
+
+  function nextLevel() {
+    level++;
+    Audio2.sfx('powerup');
+    paddle.w = PADDLE_W; paddle.wide = 0;
+    drops.clear();
+    buildField();
+    resetBall();
+  }
+
+  function loseLife() {
+    lives--;
+    shakeT = 260;
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 240);
+    if (lives <= 0) {
+      over = true;
+      Shell.gameOver(score);
+      return;
+    }
+    paddle.w = PADDLE_W; paddle.wide = 0;
+    resetBall();
+  }
+
+  function hitBrick(c, r, b) {
+    var i = idx(c, r);
+    var hp = bricks[i];
+    if (hp <= 0) return false;
+    bricks[i] = hp - 1;
+    var bx = LEFT + c * BRICK_W + BRICK_W / 2;
+    var by = BRICK_TOP + r * BRICK_H + BRICK_H / 2;
+    var col = PIECE_COL[ROW_COL[r % ROW_COL.length]][0];
+
+    if (bricks[i] <= 0) {
+      remaining--;
+      score += 50 + (ROWS - r) * 10 + (level - 1) * 5;
+      particles.burst(bx, by, 8, col, { speed: 0.24, life: 420, size: 4 });
+      Audio2.sfx('hit');
+      /* One brick in twelve carries something. */
+      if (rndInt(1, 12) === 1) {
+        var d = drops.spawn();
+        if (d) { d.x = bx; d.y = by; d.kind = rndInt(0, 2); }
+      }
+    } else {
+      score += 10;
+      particles.burst(bx, by, 3, '#FFFFFF', { speed: 0.12, life: 200, size: 3 });
+      Audio2.sfx('bounce');
+    }
+    return true;
+  }
+
+  /**
+   * Step one ball. Swept against the brick grid on each axis separately so a
+   * fast ball cannot tunnel through a row — at 0.86px/ms and a 26px brick, a
+   * naive position test misses on a long frame.
+   */
+  function stepBall(b, dt) {
+    if (b.stuck) {
+      b.x = paddle.x;
+      b.y = PADDLE_Y - BALL_R - 2;
+      return;
+    }
+
+    /* Substep so no single move exceeds half a brick. */
+    var dist = Math.max(Math.abs(b.vx), Math.abs(b.vy)) * dt;
+    var steps = Math.max(1, Math.min(8, Math.ceil(dist / (BRICK_H * 0.5))));
+    var sdt = dt / steps;
+
+    for (var s = 0; s < steps && b.alive; s++) {
+      b.x += b.vx * sdt;
+      if (b.x - BALL_R < LEFT) { b.x = LEFT + BALL_R; b.vx = Math.abs(b.vx); Audio2.sfx('bounce'); }
+      if (b.x + BALL_R > RIGHT) { b.x = RIGHT - BALL_R; b.vx = -Math.abs(b.vx); Audio2.sfx('bounce'); }
+      collideBricks(b, true);
+
+      b.y += b.vy * sdt;
+      if (b.y - BALL_R < TOP) { b.y = TOP + BALL_R; b.vy = Math.abs(b.vy); Audio2.sfx('bounce'); }
+      collideBricks(b, false);
+
+      /* Paddle. */
+      if (b.vy > 0 &&
+        b.y + BALL_R >= PADDLE_Y && b.y - BALL_R <= PADDLE_Y + PADDLE_H &&
+        b.x >= paddle.x - paddle.w / 2 - BALL_R &&
+        b.x <= paddle.x + paddle.w / 2 + BALL_R) {
+        b.y = PADDLE_Y - BALL_R;
+        /* Contact point sets the angle — the whole skill of the game. */
+        var off = clamp((b.x - paddle.x) / (paddle.w / 2), -1, 1);
+        var speed = Math.min(MAX_SPEED, Math.sqrt(b.vx * b.vx + b.vy * b.vy) * 1.015);
+        var ang = -Math.PI / 2 + off * 1.02;
+        b.vx = Math.cos(ang) * speed;
+        b.vy = Math.sin(ang) * speed;
+        Audio2.sfx('bounce');
+        Input.rumble(0.15, 0.1, 40);
+      }
+
+      if (b.y - BALL_R > BOT) b.alive = false;
+    }
+  }
+
+  function collideBricks(b, horizontal) {
+    if (b.y + BALL_R < BRICK_TOP || b.y - BALL_R > BRICK_TOP + ROWS * BRICK_H) return;
+    var c0 = Math.floor((b.x - BALL_R - LEFT) / BRICK_W);
+    var c1 = Math.floor((b.x + BALL_R - LEFT) / BRICK_W);
+    var r0 = Math.floor((b.y - BALL_R - BRICK_TOP) / BRICK_H);
+    var r1 = Math.floor((b.y + BALL_R - BRICK_TOP) / BRICK_H);
+
+    for (var r = Math.max(0, r0); r <= Math.min(ROWS - 1, r1); r++) {
+      for (var c = Math.max(0, c0); c <= Math.min(COLS - 1, c1); c++) {
+        if (bricks[idx(c, r)] <= 0) continue;
+        if (hitBrick(c, r, b)) {
+          if (horizontal) b.vx = -b.vx; else b.vy = -b.vy;
+          return;
+        }
+      }
+    }
+  }
+
+  function applyDrop(kind) {
+    if (kind === 0) {
+      paddle.w = Math.min(PADDLE_W * 1.8, paddle.w * 1.35);
+      paddle.wide = 12000;
+      Audio2.sfx('powerup');
+    } else if (kind === 1) {
+      /* Split every live ball once. */
+      var spawned = [];
+      balls.forEach(function (b) {
+        if (b.stuck) return;
+        var n = balls.spawn();
+        if (!n) return;
+        n.x = b.x; n.y = b.y; n.stuck = false;
+        var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy) || BASE_SPEED;
+        var a = Math.atan2(b.vy, b.vx) + rndRange(0.4, 0.9);
+        n.vx = Math.cos(a) * sp;
+        n.vy = Math.sin(a) * sp;
+        spawned.push(n);
+      });
+      Audio2.sfx('powerup');
+    } else {
+      lives++;
+      Audio2.sfx('coin');
+    }
+    flashT = 200;
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0004);
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+    if (flashT > 0) flashT = Math.max(0, flashT - dt);
+    if (over) return;
+
+    if (paddle.wide > 0) {
+      paddle.wide -= dt;
+      if (paddle.wide <= 0) paddle.w = PADDLE_W;
+    }
+
+    var dx = (Input.down('right') ? 1 : 0) - (Input.down('left') ? 1 : 0);
+    paddle.x = clamp(paddle.x + dx * PADDLE_SPEED * dt,
+      LEFT + paddle.w / 2, RIGHT - paddle.w / 2);
+
+    if (Input.hit('confirm') || Input.hit('up')) {
+      balls.forEach(function (b) { launch(b); });
+    }
+
+    balls.forEach(function (b) { stepBall(b, dt); });
+
+    /* Power-up drops. */
+    drops.forEach(function (d) {
+      d.y += 0.22 * dt;
+      if (d.y > BOT + 20) { d.alive = false; return; }
+      if (d.y > PADDLE_Y - 12 && d.y < PADDLE_Y + PADDLE_H + 12 &&
+        Math.abs(d.x - paddle.x) < paddle.w / 2 + 12) {
+        d.alive = false;
+        applyDrop(d.kind);
+      }
+    });
+
+    if (balls.count() === 0) loseLife();
+    else if (remaining <= 0) nextLevel();
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawField(c) {
+    for (var r = 0; r < ROWS; r++) {
+      var name = ROW_COL[r % ROW_COL.length];
+      var col = PIECE_COL[name];
+      for (var cc = 0; cc < COLS; cc++) {
+        var hp = bricks[idx(cc, r)];
+        if (hp <= 0) continue;
+        var x = LEFT + cc * BRICK_W + 2;
+        var y = BRICK_TOP + r * BRICK_H + 2;
+        /* Reinforced bricks read as brighter; one hit dulls them. */
+        var base = hp > 1 ? shade(col[0], 0.22) : col[0];
+        slab(c, x, y, BRICK_W - 4, BRICK_H - 4, base, col[1], 'solid');
+        if (hp > 1) {
+          c.globalAlpha = 0.5;
+          dataText(c, String(hp), x + (BRICK_W - 4) / 2, y + BRICK_H / 2 + 3, {
+            size: 11, align: 'center', color: '#07050E',
+          });
+          c.globalAlpha = 1;
+        }
+      }
+    }
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.breakout);
+    gHud(ACCENT.breakout, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'LEVEL', value: pad(level, 2) },
+      { label: 'BALLS', value: String(Math.max(0, lives)), color: lives <= 1 ? COL.bad : COL.data },
+    ]);
+
+    c.save();
+    if (shakeT > 0) {
+      var k = shakeT / 260;
+      c.translate(Math.sin(shakeT * 1.2) * 4 * k, 0);
+    }
+    c.save();
+    roundRect(c, LEFT - 10, TOP - 6, FIELD_W + 20, BOT - TOP + 14, COL.radius);
+    c.clip();
+
+    if (flashT > 0) {
+      c.globalAlpha = clamp(flashT / 200 * 0.18, 0, 1);
+      c.fillStyle = ACCENT.breakout;
+      c.fillRect(LEFT - 10, TOP - 6, FIELD_W + 20, BOT - TOP + 14);
+      c.globalAlpha = 1;
+    }
+
+    drawField(c);
+    particles.draw(c);
+
+    drops.forEach(function (d) {
+      var col = DROP_COL[d.kind];
+      Render.glow(c, d.x, d.y, 26, col, 0.7);
+      tile(c, d.x - 11, d.y - 11, 22, col, shade(col, 0.4), 'solid');
+    });
+
+    /* Paddle. */
+    Render.glow(c, paddle.x, PADDLE_Y + PADDLE_H / 2, paddle.w * 0.8,
+      ACCENT.breakout, 0.5);
+    slab(c, paddle.x - paddle.w / 2, PADDLE_Y, paddle.w, PADDLE_H,
+      ACCENT.breakout, shade(ACCENT.breakout, 0.45), 'solid');
+
+    balls.forEach(function (b) {
+      Render.glow(c, b.x, b.y, BALL_R * 3, '#EFEDFF', 0.7);
+      c.beginPath();
+      c.arc(b.x, b.y, BALL_R, 0, Math.PI * 2);
+      c.fillStyle = '#EFEDFF';
+      c.fill();
+      if (b.stuck) {
+        /* Aiming guide while the ball is held. */
+        c.globalAlpha = 0.35 + Math.sin(b.x * 0.1) * 0.1;
+        c.strokeStyle = ACCENT.breakout;
+        c.lineWidth = 1;
+        c.beginPath();
+        c.moveTo(b.x, b.y - BALL_R);
+        c.lineTo(b.x, b.y - 60);
+        c.stroke();
+        c.globalAlpha = 1;
+      }
+    });
+
+    c.restore();
+    c.restore();
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  function preview(c, w, h, t) {
+    var cols = 6, rowsP = 3;
+    var bw = w / cols, bh = h * 0.09;
+    for (var r = 0; r < rowsP; r++) {
+      var col = PIECE_COL[ROW_COL[r % ROW_COL.length]];
+      for (var cc = 0; cc < cols; cc++) {
+        /* A couple of gaps so it reads as a game in progress. */
+        if ((cc + r * 2) % 7 === 3) continue;
+        slab(c, cc * bw + 2, h * 0.08 + r * bh + 1, bw - 4, bh - 2, col[0], col[1], 'solid');
+      }
+    }
+
+    /* Ball tracing a long arc, paddle following it. */
+    var loop = (t % 2600) / 2600;
+    var bx = w * 0.5 + Math.sin(loop * Math.PI * 2) * w * 0.34;
+    var arc = Math.abs(Math.sin(loop * Math.PI * 2));
+    var by = h * 0.42 + (1 - arc) * h * 0.36;
+    var pr = Math.max(3, Math.min(w, h) * 0.035);
+    Render.glow(c, bx, by, pr * 3, '#EFEDFF', 0.7);
+    c.beginPath();
+    c.arc(bx, by, pr, 0, Math.PI * 2);
+    c.fillStyle = '#EFEDFF';
+    c.fill();
+
+    var pw = w * 0.28;
+    var px = clamp(bx - pw / 2, 0, w - pw);
+    slab(c, px, h - h * 0.10, pw, h * 0.045,
+      ACCENT.breakout, shade(ACCENT.breakout, 0.45), 'solid');
+  }
+
+  return registerGame({
+    id: 'breakout',
+    title: 'BREAKOUT',
+    tag: 'A tall well makes long arcs',
+    accent: ACCENT.breakout,
+    hint: 'D-PAD move · A launch',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+  });
+})();
+
+/* ===== games/climb.js ============================================ */
+/*
+ * CLIMB — endless upward hopper. The camera rises with you and never comes
+ * back down; fall off the bottom and it is over.
+ *
+ * Portrait is mandatory here in a way it is not for the other games: the whole
+ * loop is "how far up can I see, and can I reach it", and a landscape panel
+ * shows you almost no future at all.
+ *
+ * Controls: left/right to steer. Bouncing is automatic.
+ */
+
+var CLIMB = (function () {
+  var LEFT = 20, RIGHT = GW - 20;
+  var TOP = HUD_H + 8;
+  var BOT = GH - 12;
+
+  var HOP_R = 17;
+  var MOVE = 0.40;            /* px per ms horizontal */
+  var GRAVITY = 0.0018;       /* px per ms^2 */
+  var BOUNCE = -0.86;         /* upward velocity on a normal platform */
+  var SPRING = -1.35;
+  var TERMINAL = 1.4;
+
+  var PLAT_W = 108, PLAT_H = 16;
+  var PLAT_GAP = 118;         /* vertical spacing target */
+
+  /* 0 solid, 1 moving, 2 crumbling, 3 spring */
+  var PLAT_COL = ['#5B7BF0', '#37E1C4', '#F0954E', '#F0C64E'];
+
+  var hop = { x: GW / 2, y: 0, vx: 0, vy: 0, face: 1, squash: 0 };
+  var camY = 0;               /* world y at the top of the view */
+  var highest = 0;            /* best (most negative) world y reached */
+  var spawnY = 0;
+  var score = 0, over = false;
+  var shakeT = 0;
+
+  var plats = makePool(function () {
+    return { alive: false, x: 0, y: 0, w: PLAT_W, kind: 0, t: 0, dir: 1, used: 0, seed: 0 };
+  }, 26);
+  var particles = makeParticles(64);
+
+  /** World y -> screen y. Up is negative in world space. */
+  function sy(worldY) { return worldY - camY; }
+
+  function addPlatform(worldY, forceSolid) {
+    var p = plats.spawn();
+    if (!p) return null;
+    var kind = 0;
+    if (!forceSolid) {
+      var roll = rnd();
+      var height = Math.max(0, -worldY);
+      /* Difficulty is a function of altitude, not time — a cautious player
+       * and a fast one meet the same platforms at the same height. */
+      var hard = clamp(height / 9000, 0, 1);
+      if (roll < 0.06 + hard * 0.06) kind = 3;              /* spring */
+      else if (roll < 0.20 + hard * 0.22) kind = 1;         /* moving */
+      else if (roll < 0.30 + hard * 0.28) kind = 2;         /* crumbling */
+    }
+    p.kind = kind;
+    p.w = kind === 3 ? PLAT_W * 0.62 : PLAT_W;
+    p.x = rndRange(LEFT + 6, RIGHT - p.w - 6);
+    p.y = worldY;
+    p.t = 0;
+    p.used = 0;
+    p.dir = rnd() < 0.5 ? -1 : 1;
+    p.seed = rnd() * 6.283;
+    return p;
+  }
+
+  function start() {
+    plats.clear();
+    particles.clear();
+    camY = 0;
+    spawnY = 0;
+    highest = 0;
+    score = 0;
+    over = false;
+    shakeT = 0;
+
+    /* A guaranteed solid platform under the player, then the field. */
+    var base = addPlatform(BOT - 80, true);
+    hop.x = base ? base.x + base.w / 2 : GW / 2;
+    hop.y = (base ? base.y : BOT - 80) - HOP_R - 2;
+    hop.vx = 0; hop.vy = BOUNCE; hop.face = 1; hop.squash = 0;
+
+    spawnY = BOT - 80;
+    while (spawnY > -PLAT_GAP * 8) {
+      spawnY -= rndRange(PLAT_GAP * 0.72, PLAT_GAP * 1.15);
+      addPlatform(spawnY, false);
+    }
+  }
+
+  function die() {
+    if (over) return;
+    over = true;
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 300);
+    Shell.gameOver(score);
+  }
+
+  function bounceOff(p) {
+    hop.vy = (p.kind === 3) ? SPRING : BOUNCE;
+    hop.squash = 1;
+    if (p.kind === 3) {
+      Audio2.sfx('powerup');
+      Input.rumble(0.4, 0.3, 90);
+      particles.burst(p.x + p.w / 2, p.y, 10, PLAT_COL[3], { speed: 0.22, life: 400, size: 4 });
+    } else {
+      Audio2.sfx('jump');
+    }
+    if (p.kind === 2) {
+      /* Crumbling platforms give exactly one bounce. */
+      p.used = 1;
+      particles.burst(p.x + p.w / 2, p.y, 8, PLAT_COL[2], { speed: 0.2, life: 500, size: 4 });
+    }
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0012);
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+    if (over) return;
+
+    if (hop.squash > 0) hop.squash = Math.max(0, hop.squash - dt / 180);
+
+    /* Steering, with wrap-around at the walls — the classic affordance that
+     * makes a narrow field feel generous. */
+    var dx = (Input.down('right') ? 1 : 0) - (Input.down('left') ? 1 : 0);
+    if (dx) hop.face = dx;
+    hop.vx = approach(hop.vx, dx * MOVE, 18, dt);
+    hop.x += hop.vx * dt;
+    if (hop.x < LEFT - HOP_R) hop.x = RIGHT + HOP_R;
+    if (hop.x > RIGHT + HOP_R) hop.x = LEFT - HOP_R;
+
+    /* Vertical integration, substepped so a fast fall cannot pass through a
+     * platform between frames. */
+    var steps = Math.max(1, Math.min(6, Math.ceil(Math.abs(hop.vy * dt) / (PLAT_H * 0.8))));
+    var sdt = dt / steps;
+    for (var s = 0; s < steps; s++) {
+      hop.vy = Math.min(TERMINAL, hop.vy + GRAVITY * sdt);
+      var prevY = hop.y;
+      hop.y += hop.vy * sdt;
+
+      /* Only land while descending, and only from above. */
+      if (hop.vy > 0) {
+        plats.forEach(function (p) {
+          if (p.used > 1) return;
+          var footPrev = prevY + HOP_R;
+          var foot = hop.y + HOP_R;
+          if (footPrev <= p.y && foot >= p.y &&
+            hop.x + HOP_R * 0.6 > p.x && hop.x - HOP_R * 0.6 < p.x + p.w) {
+            hop.y = p.y - HOP_R;
+            bounceOff(p);
+          }
+        });
+      }
+    }
+
+    /* Crumbling platforms fall away after use. */
+    plats.forEach(function (p) {
+      p.t += dt;
+      if (p.kind === 1) {
+        p.x += p.dir * 0.11 * dt;
+        if (p.x <= LEFT) { p.x = LEFT; p.dir = 1; }
+        if (p.x + p.w >= RIGHT) { p.x = RIGHT - p.w; p.dir = -1; }
+      }
+      if (p.kind === 2 && p.used === 1) {
+        p.y += 0.5 * dt;
+        p.used = p.y > camY + GH + 60 ? 2 : 1;
+        if (p.used === 2) p.alive = false;
+      }
+    });
+
+    /* Camera only ever rises, and only once the player is above the midline. */
+    var wantCam = hop.y - GH * 0.42;
+    if (wantCam < camY) camY = wantCam;
+
+    if (hop.y < highest) {
+      highest = hop.y;
+      score = Math.max(score, Math.floor((BOT - 80 - highest) / 10));
+    }
+
+    /* Recycle: drop anything below the view, extend the field above it. */
+    plats.forEach(function (p) {
+      if (p.y > camY + GH + 80) p.alive = false;
+    });
+    while (spawnY > camY - PLAT_GAP * 2) {
+      spawnY -= rndRange(PLAT_GAP * 0.72, PLAT_GAP * 1.15);
+      addPlatform(spawnY, false);
+    }
+
+    if (hop.y - HOP_R > camY + GH + 40) die();
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawHopper(c, x, y, r, squash) {
+    var sq = 1 - squash * 0.32;
+    var w = r * 2 / sq, h = r * 2 * sq;
+    Render.glow(c, x, y, r * 2.8, ACCENT.climb, 0.55);
+    var g = c.createLinearGradient(x, y - h / 2, x, y + h / 2);
+    g.addColorStop(0, shade(ACCENT.climb, 0.55));
+    g.addColorStop(1, ACCENT.climb);
+    c.fillStyle = g;
+    roundRect(c, x - w / 2, y - h / 2, w, h, Math.min(w, h) * 0.42);
+    c.fill();
+    c.strokeStyle = rgba(shade(ACCENT.climb, 0.7), 0.6);
+    c.lineWidth = 1.5;
+    c.stroke();
+
+    /* Eyes, so it reads as a character rather than a blob. */
+    c.fillStyle = '#07050E';
+    var ex = x + hop.face * r * 0.24;
+    c.beginPath(); c.arc(ex - r * 0.22, y - r * 0.12, r * 0.13, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(ex + r * 0.22, y - r * 0.12, r * 0.13, 0, Math.PI * 2); c.fill();
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.climb);
+    gHud(ACCENT.climb, [
+      { label: 'HEIGHT', value: fmtScore(score) + 'm' },
+      { label: 'BEST', value: fmtScore(Scores.best('climb')) },
+    ]);
+
+    c.save();
+    if (shakeT > 0) c.translate(0, Math.sin(shakeT) * 3 * (shakeT / 260));
+    c.save();
+    roundRect(c, 8, HUD_H - 4, GW - 16, GH - HUD_H - 4, COL.radius);
+    c.clip();
+
+    /* Altitude rungs every 500m, so progress is legible while climbing. */
+    var rung = 500;
+    var firstRung = Math.floor((BOT - 80 - (camY + GH)) / (rung * 10)) * rung;
+    for (var m = firstRung; m < firstRung + 4000; m += rung) {
+      if (m <= 0) continue;
+      var wy = BOT - 80 - m * 10;
+      var y = sy(wy);
+      if (y < TOP - 20 || y > BOT + 20) continue;
+      c.globalAlpha = 0.10;
+      c.strokeStyle = COL.a1;
+      c.lineWidth = 1;
+      c.beginPath(); c.moveTo(LEFT, y); c.lineTo(RIGHT, y); c.stroke();
+      c.globalAlpha = 0.35;
+      dataText(c, fmtScore(m) + 'm', RIGHT - 6, y - 6, {
+        size: 13, align: 'right', color: COL.dim,
+      });
+      c.globalAlpha = 1;
+    }
+
+    plats.forEach(function (p) {
+      var y = sy(p.y);
+      if (y < TOP - 40 || y > BOT + 60) return;
+      var col = PLAT_COL[p.kind];
+      var fading = (p.kind === 2 && p.used >= 1);
+      c.globalAlpha = fading ? 0.5 : 1;
+      if (p.kind === 3) {
+        slab(c, p.x, y, p.w, PLAT_H, col, shade(col, 0.45), 'glow');
+        /* Coil marks so a spring is obvious at a glance. */
+        c.strokeStyle = rgba('#07050E', 0.5);
+        c.lineWidth = 2;
+        for (var k = 1; k < 4; k++) {
+          c.beginPath();
+          c.moveTo(p.x + p.w * k / 4, y + 3);
+          c.lineTo(p.x + p.w * k / 4, y + PLAT_H - 3);
+          c.stroke();
+        }
+      } else {
+        slab(c, p.x, y, p.w, PLAT_H, col, shade(col, 0.4), 'solid');
+      }
+      c.globalAlpha = 1;
+    });
+
+    particles.draw(c);
+
+    if (!over) {
+      var hx = hop.x, hy = sy(hop.y);
+      drawHopper(c, hx, hy, HOP_R, hop.squash);
+      /* Draw the wrap-around ghost so leaving one edge reads correctly. */
+      if (hx < LEFT + HOP_R) drawHopper(c, hx + (RIGHT - LEFT) + HOP_R * 2, hy, HOP_R, hop.squash);
+      if (hx > RIGHT - HOP_R) drawHopper(c, hx - (RIGHT - LEFT) - HOP_R * 2, hy, HOP_R, hop.squash);
+    }
+
+    c.restore();
+    c.restore();
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  function preview(c, w, h, t) {
+    var loop = (t % 1800) / 1800;
+    /* Three platforms scrolling down, hopper arcing between them. */
+    var pw = w * 0.34, ph = Math.max(4, h * 0.055);
+    for (var i = 0; i < 4; i++) {
+      var py = ((i / 4 + loop) % 1) * (h + ph) - ph;
+      var px = w * (0.12 + 0.5 * Math.abs(Math.sin(i * 2.1)));
+      var kind = i === 2 ? 3 : 0;
+      slab(c, clamp(px, 0, w - pw), py, pw, ph,
+        PLAT_COL[kind], shade(PLAT_COL[kind], 0.4), 'solid');
+    }
+    var bounce = Math.abs(Math.sin(loop * Math.PI * 3));
+    var hr = Math.min(w, h) * 0.09;
+    var hxp = w * 0.5 + Math.sin(loop * Math.PI * 2) * w * 0.18;
+    var hyp = h * 0.52 - bounce * h * 0.20;
+    Render.glow(c, hxp, hyp, hr * 2.8, ACCENT.climb, 0.55);
+    var g = c.createLinearGradient(hxp, hyp - hr, hxp, hyp + hr);
+    g.addColorStop(0, shade(ACCENT.climb, 0.55));
+    g.addColorStop(1, ACCENT.climb);
+    c.fillStyle = g;
+    roundRect(c, hxp - hr, hyp - hr, hr * 2, hr * 2, hr * 0.84);
+    c.fill();
+  }
+
+  return registerGame({
+    id: 'climb',
+    title: 'CLIMB',
+    tag: 'The camera only goes up',
+    accent: ACCENT.climb,
+    hint: 'D-PAD steer',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+    _test: {
+      score: function () { return score; },
+      hop: function () { return hop; },
+      camY: function () { return camY; },
+      platformCount: function () { return plats.count(); },
+      /** Drop the hopper into clear air below the view to force a fall. */
+      forceFall: function () {
+        plats.clear();
+        hop.y = camY + GH + 10;
+        hop.vy = 1;
+      },
+      /** Teleport upward as a successful climb would. */
+      lift: function (px) { hop.y -= px; hop.vy = -0.2; },
+    },
+  });
+})();
+
+/* ===== games/pulse.js ============================================ */
+/*
+ * PULSE — rhythm highway. Four lanes descend to a judgement line; the lanes
+ * are the four d-pad directions, so the whole game is playable on the pad
+ * with nothing else.
+ *
+ * The chart and the track come from the SAME pattern data, generated
+ * procedurally from a seed at load time. Nothing external is loaded, and the
+ * notes you see are by construction the notes you hear.
+ *
+ * TIMING
+ * ------
+ * Song position is accumulated from dt, not read from the audio clock. That
+ * matters for two reasons: the cabinet must still be playable if the audio
+ * context never starts (Chromium's autoplay policy, a muted cabinet, a
+ * headless test), and a WebAudio clock that drifts or stalls would otherwise
+ * desynchronise the chart from the visuals. Audio is scheduled *against* the
+ * song position with a look-ahead window, so sound follows the chart rather
+ * than the other way round.
+ */
+
+var PULSE = (function () {
+  var LANES = 4;
+  var LANE_ACTION = ['left', 'down', 'up', 'right'];
+  var LANE_GLYPH = ['◀', '▼', '▲', '▶'];
+  var LANE_COL = ['#34D3E0', '#46CE7A', '#F0C64E', '#F06CC9'];
+
+  var MARGIN = 40;
+  var HIGHWAY_W = GW - MARGIN * 2;
+  var LANE_W = HIGHWAY_W / LANES;
+  var TOP = HUD_H + 8;
+  var HIT_Y = GH - 150;
+  var NOTE_H = 22;
+
+  /** How long a note is visible before it reaches the line. */
+  var LEAD_MS = 1500;
+
+  var BPM = 128;
+  var STEP_MS = 60000 / BPM / 4;     /* one sixteenth */
+  var BARS = 32;
+  var STEPS = BARS * 16;
+  var SONG_MS = STEPS * STEP_MS;
+  var OUTRO_MS = 2500;
+
+  /* Judgement windows, in ms either side of the note. */
+  var W_PERFECT = 45, W_GREAT = 85, W_GOOD = 130;
+  var JUDGE_NAME = ['PERFECT', 'GREAT', 'GOOD', 'MISS'];
+  var JUDGE_COL = ['#37E1C4', '#8B7BF0', '#F0C64E', '#F0645E'];
+  var JUDGE_SCORE = [300, 200, 100, 0];
+
+  /* A pentatonic-ish scale keeps procedurally chosen notes consonant. */
+  var SCALE = [0, 3, 5, 7, 10, 12, 15, 17];
+  var ROOT = 55;                      /* A1 */
+
+  /** The chart: {step, lane, pitch}. Built once, replayed every game. */
+  var chart = [];
+  var notes = [];                     /* live copy with per-run judged state */
+
+  var songT = 0;
+  var score = 0, combo = 0, maxCombo = 0, health = 100;
+  var counts = [0, 0, 0, 0];
+  var over = false, finished = false;
+  var laneFlash = [0, 0, 0, 0];
+  var judgeText = { name: '', col: COL.text, life: 0 };
+  var scheduled = 0;                  /* index of the next note to sonify */
+  var audioAnchor = -1;
+  var particles = makeParticles(72);
+
+  function midiHz(n) { return 440 * Math.pow(2, (n - 69) / 12); }
+
+  /**
+   * Build the chart. Density rises through the song and the lane walk is
+   * biased to stay near the previous lane, which is what makes a generated
+   * pattern feel authored rather than random.
+   */
+  function buildChart() {
+    /* Fixed seed: every cabinet plays the same track, so scores compare. */
+    var r = makeRng(0x50BEA7);
+    chart.length = 0;
+    var lane = 1;
+    var scaleIdx = 0;
+
+    for (var s = 0; s < STEPS; s++) {
+      var bar = Math.floor(s / 16);
+      var inBar = s % 16;
+      var progress = s / STEPS;
+
+      /* Every song needs a runway: the first bar is empty, the second sparse. */
+      if (bar === 0) continue;
+
+      var onBeat = (inBar % 4 === 0);
+      var offBeat = (inBar % 2 === 0);
+      var density = 0.18 + progress * 0.34;
+
+      var place = false;
+      if (onBeat) place = true;                       /* the pulse itself */
+      else if (offBeat) place = r() < density + 0.18;
+      else place = r() < density * 0.55;
+
+      /* Breathe: drop a bar every eight so it is not relentless. */
+      if (bar % 8 === 7 && inBar >= 8) place = onBeat && r() < 0.5;
+      if (!place) continue;
+
+      /* Lane walk. */
+      var move = r();
+      if (move < 0.42) { /* stay */ }
+      else if (move < 0.78) lane += (r() < 0.5 ? -1 : 1);
+      else lane += (r() < 0.5 ? -2 : 2);
+      lane = ((lane % LANES) + LANES) % LANES;
+
+      scaleIdx += (r() < 0.5 ? -1 : 1) * (r() < 0.7 ? 1 : 2);
+      scaleIdx = ((scaleIdx % SCALE.length) + SCALE.length) % SCALE.length;
+
+      chart.push({
+        step: s,
+        time: s * STEP_MS,
+        lane: lane,
+        pitch: ROOT + 24 + SCALE[scaleIdx],
+        bass: ROOT + SCALE[scaleIdx % 5],
+        accent: onBeat,
+      });
+    }
+  }
+
+  buildChart();
+
+  function start() {
+    notes.length = 0;
+    for (var i = 0; i < chart.length; i++) {
+      var c = chart[i];
+      notes.push({ time: c.time, lane: c.lane, pitch: c.pitch, bass: c.bass,
+        accent: c.accent, judged: -1, hitT: 0 });
+    }
+    songT = -1800;                    /* count-in before the first bar */
+    score = 0; combo = 0; maxCombo = 0; health = 100;
+    counts[0] = counts[1] = counts[2] = counts[3] = 0;
+    over = false; finished = false;
+    laneFlash[0] = laneFlash[1] = laneFlash[2] = laneFlash[3] = 0;
+    judgeText.life = 0;
+    scheduled = 0;
+    audioAnchor = -1;
+    particles.clear();
+  }
+
+  /**
+   * Sonify everything inside the look-ahead window. The audio clock is only
+   * ever used as a scheduling base — never as the source of song position.
+   */
+  function scheduleAudio() {
+    var ctx = Audio2.ctx();
+    if (!ctx) { scheduled = notes.length; return; }
+    var LOOKAHEAD = 220;
+    if (audioAnchor < 0) audioAnchor = ctx.currentTime - songT / 1000;
+
+    while (scheduled < notes.length && notes[scheduled].time < songT + LOOKAHEAD) {
+      var n = notes[scheduled];
+      var when = audioAnchor + n.time / 1000 - ctx.currentTime;
+      if (when >= 0) {
+        Audio2.tone({ freq: midiHz(n.pitch), dur: n.accent ? 0.16 : 0.10,
+          type: 'square', gain: n.accent ? 0.075 : 0.05, when: when });
+        if (n.accent) {
+          Audio2.tone({ freq: midiHz(n.bass), dur: 0.22, type: 'triangle',
+            gain: 0.085, when: when });
+        }
+      }
+      scheduled++;
+    }
+  }
+
+  function judge(delta) {
+    var a = Math.abs(delta);
+    if (a <= W_PERFECT) return 0;
+    if (a <= W_GREAT) return 1;
+    if (a <= W_GOOD) return 2;
+    return 3;
+  }
+
+  function applyJudgement(n, j) {
+    n.judged = j;
+    n.hitT = 260;
+    counts[j]++;
+    if (j === 3) {
+      combo = 0;
+      health = Math.max(0, health - 7);
+      Audio2.sfx('denied');
+      Input.rumble(0.5, 0.3, 90);
+    } else {
+      combo++;
+      maxCombo = Math.max(maxCombo, combo);
+      health = Math.min(100, health + 1.6);
+      /* Combo multiplier caps at 4x so a long run is rewarded without
+       * making the first minute irrelevant. */
+      var mult = 1 + Math.min(3, Math.floor(combo / 12));
+      score += JUDGE_SCORE[j] * mult;
+      laneFlash[n.lane] = 220;
+      particles.burst(laneX(n.lane) + LANE_W / 2, HIT_Y, j === 0 ? 12 : 6,
+        LANE_COL[n.lane], { speed: 0.22, life: 380, size: 4 });
+      if (j === 0) Input.rumble(0.2, 0.15, 40);
+    }
+    judgeText.name = JUDGE_NAME[j];
+    judgeText.col = JUDGE_COL[j];
+    judgeText.life = 420;
+
+    if (health <= 0 && !over) {
+      over = true;
+      Audio2.sfx('over');
+      Shell.gameOver(score);
+    }
+  }
+
+  function laneX(i) { return MARGIN + i * LANE_W; }
+
+  function tryHit(lane) {
+    laneFlash[lane] = Math.max(laneFlash[lane], 120);
+    var best = null, bestD = 1e9;
+    for (var i = 0; i < notes.length; i++) {
+      var n = notes[i];
+      if (n.judged >= 0 || n.lane !== lane) continue;
+      var d = n.time - songT;
+      if (d > W_GOOD + 60) break;             /* chart is time-ordered */
+      if (Math.abs(d) < Math.abs(bestD)) { best = n; bestD = d; }
+    }
+    if (!best || Math.abs(bestD) > W_GOOD) {
+      Audio2.tone({ freq: 160, dur: 0.05, type: 'square', gain: 0.04 });
+      return;
+    }
+    applyJudgement(best, judge(bestD));
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0004);
+    for (var i = 0; i < LANES; i++) {
+      if (laneFlash[i] > 0) laneFlash[i] = Math.max(0, laneFlash[i] - dt);
+    }
+    if (judgeText.life > 0) judgeText.life = Math.max(0, judgeText.life - dt);
+    /* Judged notes fade out; decayed here so draw() stays free of state. */
+    for (var h = 0; h < notes.length; h++) {
+      if (notes[h].hitT > 0) notes[h].hitT = Math.max(0, notes[h].hitT - dt);
+    }
+    if (over) return;
+
+    songT += dt;
+    scheduleAudio();
+
+    for (i = 0; i < LANES; i++) {
+      if (Input.hit(LANE_ACTION[i])) tryHit(i);
+    }
+
+    /* Anything that has fallen past the window is a miss. */
+    for (i = 0; i < notes.length; i++) {
+      var n = notes[i];
+      if (n.judged >= 0) continue;
+      if (songT - n.time > W_GOOD) applyJudgement(n, 3);
+      else if (n.time - songT > W_GOOD) break;
+    }
+
+    if (!finished && songT > SONG_MS + OUTRO_MS) {
+      finished = true;
+      over = true;
+      /* Clearing the track is worth a completion bonus scaled by accuracy. */
+      var hits = counts[0] + counts[1] + counts[2];
+      var total = Math.max(1, hits + counts[3]);
+      score += Math.floor(2000 * (hits / total));
+      Audio2.sfx('highscore');
+      Shell.gameOver(score);
+    }
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function accuracy() {
+    var total = counts[0] + counts[1] + counts[2] + counts[3];
+    if (!total) return 100;
+    return (counts[0] * 100 + counts[1] * 80 + counts[2] * 50) / total;
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.pulse);
+    gHud(ACCENT.pulse, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'COMBO', value: pad(combo, 3), color: combo >= 12 ? COL.a1 : COL.data },
+      { label: 'ACC', value: accuracy().toFixed(1) + '%' },
+    ]);
+
+    c.save();
+    roundRect(c, MARGIN - 10, TOP - 4, HIGHWAY_W + 20, GH - TOP - 12, COL.radius);
+    c.clip();
+
+    /* Highway. */
+    var g = c.createLinearGradient(0, TOP, 0, GH);
+    g.addColorStop(0, 'rgba(8,6,18,0.10)');
+    g.addColorStop(1, 'rgba(8,6,18,0.55)');
+    c.fillStyle = g;
+    c.fillRect(MARGIN, TOP, HIGHWAY_W, GH - TOP);
+
+    var i;
+    for (i = 0; i <= LANES; i++) {
+      c.globalAlpha = 0.12;
+      c.strokeStyle = COL.a1;
+      c.lineWidth = 1;
+      c.beginPath();
+      c.moveTo(laneX(i), TOP);
+      c.lineTo(laneX(i), GH - 20);
+      c.stroke();
+      c.globalAlpha = 1;
+    }
+
+    /* Beat rulers scrolling with the song give the highway a sense of speed. */
+    var firstBeat = Math.floor((songT - 200) / (STEP_MS * 4)) * (STEP_MS * 4);
+    for (var b = 0; b < 10; b++) {
+      var bt = firstBeat + b * STEP_MS * 4;
+      var y = HIT_Y - ((bt - songT) / LEAD_MS) * (HIT_Y - TOP);
+      if (y < TOP || y > HIT_Y + 4) continue;
+      c.globalAlpha = 0.10;
+      c.strokeStyle = COL.text2;
+      c.lineWidth = 1;
+      c.beginPath(); c.moveTo(MARGIN, y); c.lineTo(MARGIN + HIGHWAY_W, y); c.stroke();
+      c.globalAlpha = 1;
+    }
+
+    /* Lane receptors. */
+    for (i = 0; i < LANES; i++) {
+      var x = laneX(i);
+      var flash = laneFlash[i] / 220;
+      if (flash > 0) {
+        c.globalAlpha = clamp(flash * 0.30, 0, 1);
+        c.fillStyle = LANE_COL[i];
+        c.fillRect(x, TOP, LANE_W, HIT_Y - TOP);
+        c.globalAlpha = 1;
+        Render.glow(c, x + LANE_W / 2, HIT_Y, LANE_W * 1.3, LANE_COL[i],
+          clamp(flash, 0, 1));
+      }
+      panel(c, x + 6, HIT_Y - NOTE_H / 2 - 4, LANE_W - 12, NOTE_H + 8, {
+        fill: flash > 0 ? rgba(LANE_COL[i], 0.28) : 'rgba(16,12,34,0.6)',
+        stroke: rgba(LANE_COL[i], 0.4 + flash * 0.5),
+        lineWidth: 2, radius: 10,
+      });
+      text(c, LANE_GLYPH[i], x + LANE_W / 2, HIT_Y + 1, {
+        size: 18, color: flash > 0 ? COL.text : rgba(LANE_COL[i], 0.8),
+        align: 'center', baseline: 'middle',
+      });
+    }
+
+    /* Notes. */
+    for (i = 0; i < notes.length; i++) {
+      var n = notes[i];
+      var d = n.time - songT;
+      if (d > LEAD_MS) break;
+      if (n.judged >= 0 && n.hitT <= 0) continue;
+      if (d < -400) continue;
+
+      var y = HIT_Y - (d / LEAD_MS) * (HIT_Y - TOP);
+      if (!isFinite(y)) continue;
+      var nx = laneX(n.lane) + 8;
+      var nw = LANE_W - 16;
+      var col = LANE_COL[n.lane];
+
+      if (n.judged >= 0) {
+        /* Judged notes pop and fade rather than vanishing. */
+        var a = clamp(n.hitT / 260, 0, 1);
+        c.globalAlpha = a;
+        var grow = (1 - a) * 10;
+        slab(c, nx - grow, HIT_Y - NOTE_H / 2 - grow / 2, nw + grow * 2,
+          NOTE_H + grow, col, shade(col, 0.5), 'solid');
+        c.globalAlpha = 1;
+        continue;
+      }
+
+      slab(c, nx, y - NOTE_H / 2, nw, NOTE_H, col, shade(col, 0.45),
+        n.accent ? 'glow' : 'solid');
+    }
+
+    particles.draw(c);
+    c.restore();
+
+    /* Judgement banner. */
+    if (judgeText.life > 0) {
+      var ja = clamp(judgeText.life / 420, 0, 1);
+      c.globalAlpha = ja;
+      text(c, judgeText.name, GW / 2, HIT_Y - 90, {
+        size: 30, weight: '700', track: 6, color: judgeText.col,
+        align: 'center', baseline: 'middle',
+      });
+      if (combo > 2) {
+        dataText(c, combo + 'x', GW / 2, HIT_Y - 52, {
+          size: 22, align: 'center', color: COL.text2, baseline: 'middle',
+        });
+      }
+      c.globalAlpha = 1;
+    }
+
+    /* Health bar along the bottom. */
+    var hw = GW - MARGIN * 2;
+    c.fillStyle = 'rgba(110,106,160,.22)';
+    c.fillRect(MARGIN, GH - 34, hw, 8);
+    var hg = c.createLinearGradient(MARGIN, 0, MARGIN + hw, 0);
+    hg.addColorStop(0, health < 30 ? COL.bad : COL.a1);
+    hg.addColorStop(1, health < 30 ? COL.warn : COL.a2);
+    c.fillStyle = hg;
+    c.fillRect(MARGIN, GH - 34, hw * clamp(health / 100, 0, 1), 8);
+
+    /* Count-in. */
+    if (songT < 0) {
+      var beats = Math.ceil(-songT / (STEP_MS * 4));
+      text(c, String(Math.max(1, beats)), GW / 2, GH / 2, {
+        size: 96, weight: '700', color: rgba(ACCENT.pulse, 0.8),
+        align: 'center', baseline: 'middle',
+      });
+    }
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  function preview(c, w, h, t) {
+    var lw = w / LANES;
+    var hitY = h * 0.82;
+    var i;
+    for (i = 0; i <= LANES; i++) {
+      c.globalAlpha = 0.14;
+      c.strokeStyle = COL.a1;
+      c.lineWidth = 1;
+      c.beginPath(); c.moveTo(i * lw, 0); c.lineTo(i * lw, h); c.stroke();
+      c.globalAlpha = 1;
+    }
+
+    var nh = Math.max(4, h * 0.075);
+    /* Replay the real chart's opening so the card shows the actual game. */
+    for (i = 0; i < 14 && i < chart.length; i++) {
+      var n = chart[i];
+      var span = 2400;
+      var phase = ((t + i * 40) % span) / span;
+      var y = phase * (hitY + nh) - nh;
+      var col = LANE_COL[n.lane];
+      slab(c, n.lane * lw + 3, y, lw - 6, nh, col, shade(col, 0.45), 'solid');
+    }
+
+    for (i = 0; i < LANES; i++) {
+      var flash = (Math.floor(t / 240) % LANES === i) ? 1 : 0;
+      var col2 = LANE_COL[i];
+      if (flash) Render.glow(c, i * lw + lw / 2, hitY, lw * 1.2, col2, 0.8);
+      panel(c, i * lw + 3, hitY - nh / 2, lw - 6, nh, {
+        fill: flash ? rgba(col2, 0.3) : 'rgba(16,12,34,0.6)',
+        stroke: rgba(col2, 0.5), lineWidth: 2, radius: 6,
+      });
+    }
+  }
+
+  return registerGame({
+    id: 'pulse',
+    title: 'PULSE',
+    tag: 'Four lanes, one d-pad',
+    accent: ACCENT.pulse,
+    hint: 'D-PAD hit the lanes',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+    /* Test seam: chart generation must be deterministic and judgement
+     * windows must not drift with frame pacing. */
+    _test: {
+      chart: function () { return chart; },
+      notes: function () { return notes; },
+      songT: function () { return songT; },
+      setSongT: function (v) { songT = v; },
+      counts: function () { return counts; },
+      score: function () { return score; },
+      health: function () { return health; },
+      combo: function () { return combo; },
+      laneAction: LANE_ACTION,
+      STEP_MS: STEP_MS,
+      SONG_MS: SONG_MS,
+      W_GOOD: W_GOOD,
+    },
+  });
+})();
+
+/* ===== games/drop.js ============================================= */
+/*
+ * DROP — Columns-style match-3. A vertical triple of gems falls; land it so
+ * three or more of a colour line up in any direction, including diagonals.
+ * Clears collapse and can cascade.
+ *
+ * Deliberately built on the same bones as TETRIS: an Int8Array well, the same
+ * cell arithmetic, and tile() for every gem, so the two games look like they
+ * came out of the same machine — because they did.
+ *
+ * Controls:
+ *   left/right  move       up / confirm  cycle the gems within the piece
+ *   down        soft drop  alt           hard drop
+ */
+
+var DROP = (function () {
+  var COLS = 7, ROWS = 13;
+  var CELL = 64;
+  var BX = Math.round((GW - COLS * CELL) / 2);   /* 76 */
+  var BY = HUD_H + 18;                           /* 110 */
+
+  /* Six gem colours, reusing the tetromino stops. */
+  var GEMS = ['I', 'S', 'O', 'L', 'Z', 'T'];
+  var PIECE_LEN = 3;
+  var MATCH_MIN = 3;
+
+  /* Every direction a run can form: right, down, and both diagonals. */
+  var DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+
+  var grid = new Int8Array(COLS * ROWS);         /* 0 empty, else gem+1 */
+  var marked = new Uint8Array(COLS * ROWS);
+
+  var piece = { col: 0, row: 0, gems: [0, 0, 0] };
+  var nextGems = [0, 0, 0];
+
+  var score = 0, cleared = 0, level = 1, chain = 0;
+  var over = false;
+  var dropTimer = 0, settleTimer = 0;
+  var phase = 'fall';        /* fall | resolve | collapse */
+  var flashT = 0;
+  var shakeT = 0;
+  var dasL = makeRepeater(170, 60);
+  var dasR = makeRepeater(170, 60);
+  var dasD = makeRepeater(70, 45);
+  var particles = makeParticles(96);
+
+  function idx(c, r) { return r * COLS + c; }
+  function gemCol(g) { return PIECE_COL[GEMS[g % GEMS.length]]; }
+
+  function rollGems(out) {
+    for (var i = 0; i < PIECE_LEN; i++) {
+      /* Early levels use four colours; six by level five. Ramping the palette
+       * rather than the speed is what keeps this game readable. */
+      var palette = Math.min(GEMS.length, 4 + Math.floor((level - 1) / 2));
+      out[i] = rndInt(0, palette - 1);
+    }
+    return out;
+  }
+
+  function spawn() {
+    piece.col = COLS >> 1;
+    piece.row = 0;
+    piece.gems[0] = nextGems[0];
+    piece.gems[1] = nextGems[1];
+    piece.gems[2] = nextGems[2];
+    rollGems(nextGems);
+    dropTimer = 0;
+    phase = 'fall';
+
+    /* Top-out: the spawn column is already occupied at the landing height. */
+    for (var i = 0; i < PIECE_LEN; i++) {
+      var r = piece.row - i;
+      if (r >= 0 && grid[idx(piece.col, r)] !== 0) { topOut(); return; }
+    }
+    if (grid[idx(piece.col, 0)] !== 0) topOut();
+  }
+
+  function topOut() {
+    if (over) return;
+    over = true;
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 340);
+    Shell.gameOver(score);
+  }
+
+  /** The piece occupies (col, row), (col, row-1), (col, row-2). */
+  function canBeAt(col, row) {
+    if (col < 0 || col >= COLS) return false;
+    if (row >= ROWS) return false;
+    for (var i = 0; i < PIECE_LEN; i++) {
+      var r = row - i;
+      if (r < 0) continue;
+      if (grid[idx(col, r)] !== 0) return false;
+    }
+    return true;
+  }
+
+  function cycleGems() {
+    var last = piece.gems[PIECE_LEN - 1];
+    for (var i = PIECE_LEN - 1; i > 0; i--) piece.gems[i] = piece.gems[i - 1];
+    piece.gems[0] = last;
+    Audio2.sfx('rotate');
+  }
+
+  function lockPiece() {
+    for (var i = 0; i < PIECE_LEN; i++) {
+      var r = piece.row - i;
+      if (r < 0) { topOut(); return; }
+      grid[idx(piece.col, r)] = piece.gems[i] + 1;
+    }
+    Audio2.sfx('lock');
+    chain = 0;
+    phase = 'resolve';
+    settleTimer = 0;
+  }
+
+  /**
+   * Mark every run of MATCH_MIN or more. Returns how many cells were marked.
+   * Scans each direction once from every cell — O(cells * 4), which at 91
+   * cells is nothing, and far easier to reason about than a flood fill.
+   */
+  function findMatches() {
+    marked.fill(0);
+    var count = 0;
+
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var v = grid[idx(c, r)];
+        if (v === 0) continue;
+        for (var d = 0; d < DIRS.length; d++) {
+          var dx = DIRS[d][0], dy = DIRS[d][1];
+          /* Only start a run at its beginning, so each is found once. */
+          var pc = c - dx, pr = r - dy;
+          if (pc >= 0 && pc < COLS && pr >= 0 && pr < ROWS && grid[idx(pc, pr)] === v) continue;
+
+          var len = 1;
+          var nc = c + dx, nr = r + dy;
+          while (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS && grid[idx(nc, nr)] === v) {
+            len++; nc += dx; nr += dy;
+          }
+          if (len >= MATCH_MIN) {
+            for (var k = 0; k < len; k++) {
+              var mi = idx(c + dx * k, r + dy * k);
+              if (!marked[mi]) { marked[mi] = 1; count++; }
+            }
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  function clearMarked(n) {
+    chain++;
+    /* Chain bonus is the whole strategy: a cascade is worth far more than the
+     * same gems cleared one run at a time. */
+    var base = n * 30;
+    var bonus = Math.pow(2, chain - 1);
+    score += Math.floor(base * bonus * level);
+    cleared += n;
+    level = 1 + Math.floor(cleared / 24);
+
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var i = idx(c, r);
+        if (!marked[i]) continue;
+        var col = gemCol(grid[i] - 1)[0];
+        particles.burst(BX + c * CELL + CELL / 2, BY + r * CELL + CELL / 2,
+          5, col, { speed: 0.24, life: 460, size: 5 });
+        grid[i] = 0;
+      }
+    }
+
+    Audio2.sfx('clear', Math.min(4, chain));
+    Input.rumble(0.4 + chain * 0.1, 0.3, 120 + chain * 40);
+    flashT = 200;
+    if (chain > 1) shakeT = 180;
+  }
+
+  /** Settle gems downward. Returns true if anything moved. */
+  function collapse() {
+    var moved = false;
+    for (var c = 0; c < COLS; c++) {
+      var write = ROWS - 1;
+      for (var r = ROWS - 1; r >= 0; r--) {
+        var v = grid[idx(c, r)];
+        if (v === 0) continue;
+        if (write !== r) {
+          grid[idx(c, write)] = v;
+          grid[idx(c, r)] = 0;
+          moved = true;
+        }
+        write--;
+      }
+    }
+    return moved;
+  }
+
+  function gravityMs() { return Math.max(120, 700 - (level - 1) * 55); }
+
+  /* -------------------------------------------------------- lifecycle --- */
+
+  function start() {
+    grid = new Int8Array(COLS * ROWS);
+    marked = new Uint8Array(COLS * ROWS);
+    score = 0; cleared = 0; level = 1; chain = 0;
+    over = false;
+    dropTimer = 0; settleTimer = 0;
+    phase = 'fall';
+    flashT = 0; shakeT = 0;
+    dasL.reset(); dasR.reset(); dasD.reset();
+    particles.clear();
+    rollGems(nextGems);
+    spawn();
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0005);
+    if (flashT > 0) flashT = Math.max(0, flashT - dt);
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+    if (over) return;
+
+    if (phase === 'resolve') {
+      /* A short beat between landing and clearing so the player can see what
+       * they built before it disappears. */
+      settleTimer += dt;
+      if (settleTimer < 140) return;
+      settleTimer = 0;
+      var n = findMatches();
+      if (n > 0) { clearMarked(n); phase = 'collapse'; }
+      else { spawn(); }
+      return;
+    }
+
+    if (phase === 'collapse') {
+      settleTimer += dt;
+      if (settleTimer < 160) return;
+      settleTimer = 0;
+      collapse();
+      phase = 'resolve';
+      return;
+    }
+
+    /* --- falling ---------------------------------------------------- */
+    var i;
+    var stepsL = dasL.step(Input.down('left'), dt);
+    var stepsR = dasR.step(Input.down('right'), dt);
+    for (i = 0; i < stepsL; i++) {
+      if (canBeAt(piece.col - 1, piece.row)) { piece.col--; Audio2.sfx('move'); }
+    }
+    for (i = 0; i < stepsR; i++) {
+      if (canBeAt(piece.col + 1, piece.row)) { piece.col++; Audio2.sfx('move'); }
+    }
+
+    if (Input.hit('up') || Input.hit('confirm')) cycleGems();
+
+    if (Input.hit('alt')) {
+      /* Hard drop. */
+      var target = piece.row;
+      while (canBeAt(piece.col, target + 1)) target++;
+      score += (target - piece.row) * 2;
+      piece.row = target;
+      Audio2.sfx('drop');
+      shakeT = 110;
+      lockPiece();
+      return;
+    }
+
+    var soft = dasD.step(Input.down('down'), dt);
+    for (i = 0; i < soft; i++) {
+      if (canBeAt(piece.col, piece.row + 1)) { piece.row++; score += 1; dropTimer = 0; }
+    }
+
+    dropTimer += dt;
+    var g = gravityMs();
+    var guard = 0;
+    while (dropTimer >= g && guard < 6) {
+      dropTimer -= g;
+      guard++;
+      if (canBeAt(piece.col, piece.row + 1)) piece.row++;
+      else { lockPiece(); return; }
+    }
+    if (!canBeAt(piece.col, piece.row + 1) && dropTimer > g * 0.9) lockPiece();
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawWell(c) {
+    panel(c, BX - 8, BY - 8, COLS * CELL + 16, ROWS * CELL + 16, {
+      fill: 'rgba(8,6,18,0.55)', stroke: rgba(ACCENT.drop, 0.22), radius: 12,
+    });
+    c.globalAlpha = 0.05;
+    c.strokeStyle = COL.a2;
+    c.lineWidth = 1;
+    for (var x = 1; x < COLS; x++) {
+      c.beginPath();
+      c.moveTo(BX + x * CELL, BY);
+      c.lineTo(BX + x * CELL, BY + ROWS * CELL);
+      c.stroke();
+    }
+    c.globalAlpha = 1;
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.drop);
+    gHud(ACCENT.drop, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'GEMS', value: pad(cleared, 3) },
+      { label: 'LEVEL', value: pad(level, 2) },
+    ]);
+
+    c.save();
+    if (shakeT > 0) {
+      var k = shakeT / 180;
+      c.translate(Math.sin(shakeT * 1.1) * 4 * k, 0);
+    }
+
+    drawWell(c);
+
+    /* Settled gems. */
+    for (var r = 0; r < ROWS; r++) {
+      for (var col = 0; col < COLS; col++) {
+        var i = idx(col, r);
+        var v = grid[i];
+        if (v === 0) continue;
+        var gc = gemCol(v - 1);
+        tile(c, BX + col * CELL, BY + r * CELL, CELL, gc[0], gc[1],
+          (marked[i] && phase === 'collapse') ? 'flash' : 'solid');
+      }
+    }
+
+    /* Falling piece, plus a landing shadow so the drop is predictable. */
+    if (!over && phase === 'fall') {
+      var target = piece.row;
+      while (canBeAt(piece.col, target + 1)) target++;
+      var g;
+      for (var s = 0; s < PIECE_LEN; s++) {
+        var gr = target - s;
+        if (gr < 0) continue;
+        g = gemCol(piece.gems[s]);
+        tile(c, BX + piece.col * CELL, BY + gr * CELL, CELL, g[0], g[1], 'ghost');
+      }
+      for (var p = 0; p < PIECE_LEN; p++) {
+        var pr = piece.row - p;
+        if (pr < 0) continue;
+        g = gemCol(piece.gems[p]);
+        tile(c, BX + piece.col * CELL, BY + pr * CELL, CELL, g[0], g[1], 'glow');
+      }
+    }
+
+    particles.draw(c);
+    c.restore();
+
+    /* Next piece, and the live chain multiplier. */
+    var nx = GW - 66, ny = BY - 4;
+    text(c, 'NEXT', nx, ny - 8, {
+      size: 11, track: 2, color: COL.text2, align: 'center',
+    });
+    for (var n = 0; n < PIECE_LEN; n++) {
+      var ng = gemCol(nextGems[n]);
+      tile(c, nx - 16, ny + n * 32, 32, ng[0], ng[1], 'solid');
+    }
+
+    if (chain > 1 && flashT > 0) {
+      c.globalAlpha = clamp(flashT / 200, 0, 1);
+      text(c, chain + 'x CHAIN', GW / 2, GH / 2, {
+        size: 40, weight: '700', track: 5, color: COL.a1,
+        align: 'center', baseline: 'middle',
+      });
+      c.globalAlpha = 1;
+    }
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  /* A small settled field with a matching run flashing on a loop. */
+  var PREV = [
+    [0, 1, 2, 0, 1],
+    [1, 2, 0, 1, 2],
+    [2, 2, 2, 0, 1],
+  ];
+
+  function preview(c, w, h, t) {
+    var cols = 5;
+    var s = Math.min(w / (cols + 0.6), h / 6);
+    var ox = (w - cols * s) / 2;
+    var oy = h - PREV.length * s - s * 0.3;
+    var loop = (t % 2200) / 2200;
+
+    for (var r = 0; r < PREV.length; r++) {
+      for (var cc = 0; cc < cols; cc++) {
+        var g = gemCol(PREV[r][cc]);
+        /* The bottom-left run of three flashes as it "matches". */
+        var isRun = (r === 2 && cc < 3);
+        var mode = (isRun && loop > 0.72) ? 'flash' : 'solid';
+        tile(c, ox + cc * s, oy + r * s, s, g[0], g[1], mode);
+      }
+    }
+
+    /* Falling triple. */
+    var fall = Math.min(1, loop / 0.66);
+    var fy = lerp(-s * 3, oy - 3 * s, fall);
+    for (var p = 0; p < 3; p++) {
+      var pg = gemCol((p + 1) % 3);
+      tile(c, ox + 3 * s, fy + p * s, s, pg[0], pg[1], 'glow');
+    }
+  }
+
+  return registerGame({
+    id: 'drop',
+    title: 'DROP',
+    tag: 'Match three, chain the cascade',
+    accent: ACCENT.drop,
+    hint: 'D-PAD move · A cycle · X drop',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+    /* Test seam: the diagonal matcher is the easiest thing here to get
+     * subtly wrong, so the harness drives it directly. */
+    _test: {
+      COLS: COLS, ROWS: ROWS,
+      clear: function () { grid.fill(0); marked.fill(0); },
+      set: function (c, r, gem) { grid[idx(c, r)] = gem + 1; },
+      get: function (c, r) { return grid[idx(c, r)] - 1; },
+      findMatches: findMatches,
+      marked: function (c, r) { return !!marked[idx(c, r)]; },
+      collapse: collapse,
+      score: function () { return score; },
+    },
+  });
+})();
+
 /* ===== core/shell.js ============================================= */
 /*
  * The shell: boot, dashboard, game, pause, game over, high scores, settings,

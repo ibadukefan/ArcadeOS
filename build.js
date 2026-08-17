@@ -31,6 +31,10 @@ const GAMES = [
   'games/ascent.js',
   'games/stack.js',
   'games/snake.js',
+  'games/breakout.js',
+  'games/climb.js',
+  'games/pulse.js',
+  'games/drop.js',
 ];
 
 const CORE_POST = [
