@@ -122,7 +122,9 @@ var TETRIS = (function () {
   }
 
   function pullNext() {
-    while (nextQueue.length < 3) nextQueue.push(nextType());
+    /* Four deep so that three remain visible after the shift — the panel has
+     * three slots and an empty one reads as a bug. */
+    while (nextQueue.length < 4) nextQueue.push(nextType());
     spawn(nextQueue.shift());
   }
 
