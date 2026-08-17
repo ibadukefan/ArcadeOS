@@ -870,7 +870,18 @@ var ACTIONS = ['up', 'down', 'left', 'right', 'confirm', 'back', 'alt', 'pause']
 
 var REPEAT_DELAY = 360;
 var REPEAT_RATE = 120;
-var DEADZONE = 0.4;
+/*
+ * Stick deadzone, as a Schmitt trigger rather than a single threshold.
+ *
+ * A worn analog stick rests off-centre and jitters. With one threshold at
+ * 0.4, a stick resting at ~0.4 crosses it constantly, and because presses are
+ * latched at 250Hz every crossing becomes a menu step: measured at 120 phantom
+ * steps per second from a stick nobody was touching. Requiring 0.5 to engage
+ * and holding until it falls back below 0.35 makes that physically impossible
+ * while keeping the feel of the original 0.4.
+ */
+var DEADZONE_ON = 0.5;
+var DEADZONE_OFF = 0.35;
 var MAX_PLAYERS = 4;
 
 var Input = (function () {
@@ -907,6 +918,8 @@ var Input = (function () {
       padIndex: -1,
       padId: '',
       padStamp: -1,
+      /** Schmitt-trigger state for the four stick directions. */
+      axis: { up: false, down: false, left: false, right: false },
       kind: 'keyboard',
       active: false,
       /** Physical state as of the most recent sample. */
@@ -1020,14 +1033,27 @@ var Input = (function () {
     return (typeof v === 'number' && isFinite(v)) ? v : 0;
   }
 
+  /**
+   * One stick direction, with hysteresis. `held` is the previous state for
+   * this direction, so engaging and releasing use different thresholds.
+   */
+  function stick(held, magnitude) {
+    return held ? magnitude > DEADZONE_OFF : magnitude > DEADZONE_ON;
+  }
+
   /** Fill `out` with the raw action state for one gamepad. */
-  function readPad(gp, layout, out) {
+  function readPad(gp, layout, out, held) {
     var f = faceMap(layout);
     var ax = axis(gp, 0), ay = axis(gp, 1);
-    out.up = btn(gp, 12) || ay < -DEADZONE;
-    out.down = btn(gp, 13) || ay > DEADZONE;
-    out.left = btn(gp, 14) || ax < -DEADZONE;
-    out.right = btn(gp, 15) || ax > DEADZONE;
+    /* The d-pad is digital and needs no deadzone; only the stick does. */
+    held.up = stick(held.up, -ay);
+    held.down = stick(held.down, ay);
+    held.left = stick(held.left, -ax);
+    held.right = stick(held.right, ax);
+    out.up = btn(gp, 12) || held.up;
+    out.down = btn(gp, 13) || held.down;
+    out.left = btn(gp, 14) || held.left;
+    out.right = btn(gp, 15) || held.right;
     out.confirm = btn(gp, f.confirm);
     out.back = btn(gp, f.back) || btn(gp, 8);
     out.alt = btn(gp, 2) || btn(gp, 3) || btn(gp, 4) || btn(gp, 5);
@@ -1109,6 +1135,8 @@ var Input = (function () {
       if (players[i].padIndex === padIndex) {
         players[i].padIndex = -1;
         players[i].padId = '';
+        players[i].axis.up = players[i].axis.down = false;
+        players[i].axis.left = players[i].axis.right = false;
         players[i].kind = 'keyboard';
         /* Slot 0 stays alive on the keyboard; higher slots drop out. */
         if (i > 0) players[i].active = false;
@@ -1162,7 +1190,7 @@ var Input = (function () {
         if (slot.padIndex !== -1) {
           var g = list[slot.padIndex];
           if (g && g.connected) {
-            readPad(g, layoutOf(slot), padScratch);
+            readPad(g, layoutOf(slot), padScratch, slot.axis);
             for (var b = 0; b < ACTIONS.length; b++) {
               if (padScratch[ACTIONS[b]]) scratch[ACTIONS[b]] = true;
             }

@@ -398,23 +398,67 @@ describe('input plumbing', () => {
     assert.ok(IG.down('left') && IG.hit('left'));
   });
 
-  it('reads the left stick past the 0.4 deadzone but not inside it', () => {
+  it('reads the left stick with a hysteresis deadzone', () => {
     const pad = makePad(PAD_IDS.xbox);
     const env = makeEnv({ gamepads: [pad] });
     const { Input } = env.api();
     env.pollOnly(16);
 
-    pad.setAxis(0, 0.39);
+    pad.setAxis(0, 0.45);
     env.pollOnly(16);
-    assert.notOk(Input.down('right'), '0.39 is inside the deadzone');
+    assert.notOk(Input.down('right'), '0.45 does not engage; it takes 0.5');
 
-    pad.setAxis(0, 0.41);
+    pad.setAxis(0, 0.55);
     env.pollOnly(16);
-    assert.ok(Input.down('right'), '0.41 clears the deadzone');
+    assert.ok(Input.down('right'), '0.55 engages');
+
+    /* Once engaged it holds down to 0.35, so a hand resting slightly off
+     * centre keeps its direction instead of stuttering. */
+    pad.setAxis(0, 0.40);
+    env.pollOnly(16);
+    assert.ok(Input.down('right'), 'holds at 0.40 once engaged');
+
+    pad.setAxis(0, 0.30);
+    env.pollOnly(16);
+    assert.notOk(Input.down('right'), 'releases below 0.35');
 
     pad.setAxis(0, 0).setAxis(1, -0.9);
     env.pollOnly(16);
     assert.ok(Input.down('up'));
+  });
+
+  it('a worn stick jittering at the deadzone edge produces nothing', () => {
+    /* Measured before hysteresis: 120 phantom menu steps per second from a
+     * stick nobody was touching. Latching every 250Hz crossing amplified an
+     * existing single-threshold problem into an unusable one. */
+    const pad = makePad(PAD_IDS.xbox);
+    const env = makeEnv({ gamepads: [pad] });
+    const { Input } = env.api();
+    env.pollOnly(16);
+
+    let steps = 0;
+    for (let f = 0; f < 60; f++) {
+      for (let s2 = 0; s2 < 4; s2++) {
+        pad.setAxis(1, 0.38 + (s2 % 2) * 0.06);   /* jitters 0.38 <-> 0.44 */
+        Input.sample();
+      }
+      env.pollOnly(16.667);
+      steps += Input.repCount('down');
+    }
+    assert.equal(steps, 0, `a resting stick generated ${steps} menu steps`);
+  });
+
+  it('a deliberate stick flick still registers immediately', () => {
+    const pad = makePad(PAD_IDS.xbox);
+    const env = makeEnv({ gamepads: [pad] });
+    const { Input } = env.api();
+    env.pollOnly(16);
+    pad.setAxis(1, 0.95);
+    Input.sample();
+    pad.setAxis(1, 0);
+    Input.sample();
+    env.pollOnly(16.667);
+    assert.ok(Input.hit('down'), 'a full deflection and release still counts');
   });
 
   it('ignores non-finite axis values', () => {
