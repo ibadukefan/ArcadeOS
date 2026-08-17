@@ -1,0 +1,273 @@
+/*
+ * SNAKE — a tall 19x30 field, which changes the game: vertical runs are long
+ * and horizontal ones are tight, so the classic spiral strategy has to adapt.
+ *
+ * Direction changes are queued rather than applied immediately. At 60ms per
+ * step a player can easily press two directions inside one tick, and dropping
+ * the second one is the difference between "responsive" and "it ate my input".
+ *
+ * Controls: d-pad to turn.
+ */
+
+var SNAKE = (function () {
+  var COLS = 19, ROWS = 30, CELL = 28;
+  var X0 = Math.round((GW - COLS * CELL) / 2);
+  var Y0 = HUD_H + 24;
+
+  var DIRS = {
+    up: { x: 0, y: -1 }, down: { x: 0, y: 1 },
+    left: { x: -1, y: 0 }, right: { x: 1, y: 0 },
+  };
+
+  /* Body is a ring buffer of cell indices — no shift/unshift churn per tick. */
+  var body = new Int16Array(COLS * ROWS);
+  var head = 0, tail = 0, length = 0;
+  var occupied = new Uint8Array(COLS * ROWS);
+
+  var dir = DIRS.up, queued = [];
+  var food = -1, gold = -1, goldTimer = 0;
+  var stepMs = 140, acc = 0;
+  var score = 0, eaten = 0, over = false;
+  var eatFlash = 0;
+  var particles = makeParticles(48);
+
+  function idx(x, y) { return y * COLS + x; }
+  function cx(i) { return i % COLS; }
+  function cy(i) { return (i / COLS) | 0; }
+
+  function push(i) {
+    body[head] = i;
+    head = (head + 1) % body.length;
+    occupied[i] = 1;
+    length++;
+  }
+
+  function pop() {
+    var i = body[tail];
+    tail = (tail + 1) % body.length;
+    occupied[i] = 0;
+    length--;
+    return i;
+  }
+
+  function headCell() { return body[(head - 1 + body.length) % body.length]; }
+
+  function placeFood(exclude) {
+    /* Reservoir pick over free cells: uniform, and never loops forever when
+     * the board is nearly full. */
+    var chosen = -1, seen = 0;
+    for (var i = 0; i < COLS * ROWS; i++) {
+      if (occupied[i] || i === exclude) continue;
+      seen++;
+      if (rndInt(1, seen) === 1) chosen = i;
+    }
+    return chosen;
+  }
+
+  function start() {
+    head = 0; tail = 0; length = 0;
+    occupied = new Uint8Array(COLS * ROWS);
+    queued.length = 0;
+    dir = DIRS.up;
+    var sx2 = (COLS >> 1), sy2 = (ROWS >> 1) + 4;
+    push(idx(sx2, sy2 + 2));
+    push(idx(sx2, sy2 + 1));
+    push(idx(sx2, sy2));
+    food = placeFood(-1);
+    gold = -1; goldTimer = 9000;
+    stepMs = 140; acc = 0;
+    score = 0; eaten = 0; over = false;
+    eatFlash = 0;
+    particles.clear();
+  }
+
+  function turn(name) {
+    var d = DIRS[name];
+    if (!d) return;
+    /* Compare against the last queued direction, not the current one, so two
+     * quick turns in a row both land. */
+    var ref = queued.length ? queued[queued.length - 1] : dir;
+    if (d.x === -ref.x && d.y === -ref.y) return;   /* no 180s */
+    if (d.x === ref.x && d.y === ref.y) return;     /* no duplicates */
+    if (queued.length < 2) queued.push(d);
+  }
+
+  function die() {
+    if (over) return;
+    over = true;
+    var h = headCell();
+    particles.burst(X0 + cx(h) * CELL + CELL / 2, Y0 + cy(h) * CELL + CELL / 2,
+      18, ACCENT.snake, { speed: 0.3, life: 600, size: 5 });
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 320);
+    Shell.gameOver(score);
+  }
+
+  function step() {
+    if (queued.length) dir = queued.shift();
+
+    var h = headCell();
+    var nx = cx(h) + dir.x;
+    var ny = cy(h) + dir.y;
+    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) { die(); return; }
+
+    var ni = idx(nx, ny);
+    var tailCell = body[tail];
+    /* Moving into the tail cell is legal — it vacates on this same tick. */
+    if (occupied[ni] && !(ni === tailCell && ni !== food && ni !== gold)) { die(); return; }
+
+    var ate = (ni === food), ateGold = (ni === gold);
+    if (!ate && !ateGold) pop();
+
+    push(ni);
+
+    if (ate) {
+      eaten++;
+      score += 10 + Math.floor(eaten / 5) * 5;
+      food = placeFood(ni);
+      stepMs = Math.max(60, 140 - eaten * 2.2);
+      eatFlash = 140;
+      Audio2.sfx('eat');
+      particles.burst(X0 + nx * CELL + CELL / 2, Y0 + ny * CELL + CELL / 2,
+        8, ACCENT.snake, { speed: 0.2, life: 340, size: 4 });
+      if (food < 0) { die(); return; }   /* board full: a perfect game */
+    } else if (ateGold) {
+      score += 100;
+      gold = -1;
+      goldTimer = 12000;
+      eatFlash = 220;
+      Audio2.sfx('powerup');
+      Input.rumble(0.4, 0.5, 120);
+      particles.burst(X0 + nx * CELL + CELL / 2, Y0 + ny * CELL + CELL / 2,
+        16, '#F0C64E', { speed: 0.28, life: 520, size: 5 });
+    }
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0003);
+    if (eatFlash > 0) eatFlash = Math.max(0, eatFlash - dt);
+    if (over) return;
+
+    if (Input.hit('up')) turn('up');
+    if (Input.hit('down')) turn('down');
+    if (Input.hit('left')) turn('left');
+    if (Input.hit('right')) turn('right');
+
+    /* Golden apple: appears for a while, then leaves. */
+    goldTimer -= dt;
+    if (goldTimer <= 0) {
+      if (gold >= 0) { gold = -1; goldTimer = 10000; }
+      else { gold = placeFood(food); goldTimer = 5000; }
+    }
+
+    acc += dt;
+    var guard = 0;
+    while (acc >= stepMs && !over && guard < 6) {
+      acc -= stepMs;
+      guard++;
+      step();
+    }
+    if (guard >= 6) acc = 0;
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.snake);
+    gHud(ACCENT.snake, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'LENGTH', value: pad(length, 3) },
+      { label: 'SPEED', value: pad(Math.round(1000 / stepMs), 2) },
+    ]);
+
+    /* Field. */
+    panel(c, X0 - 8, Y0 - 8, COLS * CELL + 16, ROWS * CELL + 16, {
+      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.20), radius: 12,
+    });
+
+    c.globalAlpha = 0.045;
+    c.strokeStyle = COL.a1;
+    c.lineWidth = 1;
+    var i;
+    for (i = 1; i < COLS; i++) {
+      c.beginPath(); c.moveTo(X0 + i * CELL, Y0); c.lineTo(X0 + i * CELL, Y0 + ROWS * CELL); c.stroke();
+    }
+    for (i = 1; i < ROWS; i++) {
+      c.beginPath(); c.moveTo(X0, Y0 + i * CELL); c.lineTo(X0 + COLS * CELL, Y0 + i * CELL); c.stroke();
+    }
+    c.globalAlpha = 1;
+
+    /* Food. */
+    if (food >= 0) {
+      var fx = X0 + cx(food) * CELL, fy = Y0 + cy(food) * CELL;
+      Render.glow(c, fx + CELL / 2, fy + CELL / 2, CELL * 1.4, '#F0645E', 0.75);
+      tile(c, fx, fy, CELL, '#F0645E', '#F79E9A', 'solid');
+    }
+    if (gold >= 0) {
+      var gxp = X0 + cx(gold) * CELL, gyp = Y0 + cy(gold) * CELL;
+      var pulse = 0.6 + Math.sin(goldTimer * 0.006) * 0.3;
+      Render.glow(c, gxp + CELL / 2, gyp + CELL / 2, CELL * 1.8, '#F0C64E', pulse);
+      tile(c, gxp, gyp, CELL, '#F0C64E', '#F7DE93', 'solid');
+    }
+
+    /* Body, tail-to-head so the head paints last. */
+    var n = length;
+    for (var k = 0; k < n; k++) {
+      var ci = body[(tail + k) % body.length];
+      var isHead = (k === n - 1);
+      var f = n > 1 ? k / (n - 1) : 1;
+      var base = isHead ? shade(ACCENT.snake, 0.30) : ACCENT.snake;
+      var top = isHead ? shade(ACCENT.snake, 0.62) : shade(ACCENT.snake, 0.20 + f * 0.20);
+      var px = X0 + cx(ci) * CELL, py = Y0 + cy(ci) * CELL;
+      if (isHead) Render.glow(c, px + CELL / 2, py + CELL / 2, CELL * 1.6, ACCENT.snake, 0.7);
+      tile(c, px, py, CELL, base, top, (isHead && eatFlash > 0) ? 'flash' : 'solid');
+    }
+
+    particles.draw(c);
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  /* A short looping path drawn as a snake crawling around the card. */
+  var PATH = [
+    [1, 4], [1, 3], [1, 2], [2, 2], [3, 2], [3, 3], [3, 4], [4, 4],
+    [5, 4], [5, 3], [5, 2], [5, 1],
+  ];
+
+  function preview(c, w, h, t) {
+    var cols = 7, rows2 = 6;
+    var s = Math.min(w / cols, h / rows2) * 0.86;
+    var ox = (w - cols * s) / 2, oy = (h - rows2 * s) / 2;
+    var lenS = 5;
+    var headI = Math.floor((t * 0.006) % PATH.length);
+
+    /* apple two steps ahead of the head */
+    var ai = (headI + 3) % PATH.length;
+    var ax = ox + PATH[ai][0] * s, ay = oy + PATH[ai][1] * s;
+    Render.glow(c, ax + s / 2, ay + s / 2, s * 1.4, '#F0645E', 0.7);
+    tile(c, ax, ay, s, '#F0645E', '#F79E9A', 'solid');
+
+    for (var k = 0; k < lenS; k++) {
+      var pi = (headI - (lenS - 1 - k) + PATH.length * 2) % PATH.length;
+      var px = ox + PATH[pi][0] * s, py = oy + PATH[pi][1] * s;
+      var isHead = (k === lenS - 1);
+      if (isHead) Render.glow(c, px + s / 2, py + s / 2, s * 1.5, ACCENT.snake, 0.7);
+      tile(c, px, py, s,
+        isHead ? shade(ACCENT.snake, 0.3) : ACCENT.snake,
+        shade(ACCENT.snake, isHead ? 0.6 : 0.25), 'solid');
+    }
+  }
+
+  return registerGame({
+    id: 'snake',
+    title: 'SNAKE',
+    tag: 'Long field, tight corners',
+    accent: ACCENT.snake,
+    hint: 'D-PAD turn',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+  });
+})();

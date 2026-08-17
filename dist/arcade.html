@@ -1,0 +1,4632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>ArcadeOS</title>
+<style>/*
+ * ArcadeOS shell chrome.
+ *
+ * Deliberately tiny: the entire front end renders into one <canvas>. Keeping
+ * the DOM to a single element means one compositor layer, no CSS filters in
+ * the paint path, and no layout thrash — which is what buys us 60fps on a
+ * Pi 4. The page background matches the canvas backdrop so letterbox bars on
+ * a non-portrait display are seamless.
+ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #07050E;
+  /* Cabinet has no mouse. Hide it in case one is plugged in for setup. */
+  cursor: none;
+  /* System stacks only — the cabinet never touches a network. */
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "DejaVu Sans", Arial, sans-serif;
+  color: #EFEDFF;
+  /* Suppress mobile/touch affordances if someone opens this on a tablet. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+#screen {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* The canvas owns its own scaling; never let the browser resample it. */
+  image-rendering: auto;
+}
+
+/* Chromium draws a focus ring on the canvas when it takes keyboard focus. */
+#screen:focus { outline: none; }</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>(function(){
+'use strict';
+
+/* ===== core/util.js ============================================== */
+/*
+ * Shared constants, design tokens and small helpers.
+ *
+ * Everything downstream reads its colours from COL / ACCENT — no module is
+ * allowed to invent one. Keeping the palette in a single frozen object is what
+ * stops the front end drifting as games get added.
+ */
+
+/** Game logical space. Games never see real pixels. */
+var GW = 600;
+var GH = 1000;
+
+/** Shell logical space — a 1080x1920 portrait panel. */
+var SW = 1080;
+var SH = 1920;
+
+/** Design tokens. Do not add colours here without a design decision. */
+var COL = {
+  /* Backdrop stops for the radial gradient. */
+  bgTop: '#1D1748',
+  bgMid: '#0D0A1F',
+  bgBot: '#07050E',
+
+  /* Aurora ramp — wordmark, headings, selection glow. */
+  a1: '#37E1C4',
+  a2: '#8B7BF0',
+  a3: '#F06CC9',
+
+  /* Card surface + hairline border. */
+  card: 'rgba(22,18,46,.52)',
+  cardLine: 'rgba(140,150,255,.10)',
+  radius: 16,
+
+  /* Type. */
+  text: '#EFEDFF',
+  text2: '#8A85BC',
+  dim: '#6E6AA0',
+  data: '#B9B4E8',
+
+  /* Semantic. */
+  warn: '#F0954E',
+  bad: '#F0645E',
+  good: '#46CE7A',
+};
+
+/** Per-game accent colours. */
+var ACCENT = {
+  tetris: '#8B7BF0',
+  ascent: '#37E1C4',
+  stack: '#F06CC9',
+  snake: '#46CE7A',
+  breakout: '#F0C64E',
+  climb: '#5B7BF0',
+  pulse: '#34D3E0',
+  drop: '#F0645E',
+  versus: '#A46BF0',
+};
+
+/**
+ * Tetromino colours, each as [base, top]. The lighter top stop is what gives
+ * every tile its moulded look through tile().
+ */
+var PIECE_COL = {
+  I: ['#34D3E0', '#7FE9F2'],
+  O: ['#F0C64E', '#F7DE93'],
+  T: ['#A46BF0', '#C9A5F7'],
+  S: ['#46CE7A', '#8AE4AB'],
+  Z: ['#F0645E', '#F79E9A'],
+  J: ['#5B7BF0', '#94ABF7'],
+  L: ['#F0954E', '#F7BC8E'],
+};
+
+var FONT_SANS =
+  'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "DejaVu Sans", Arial, sans-serif';
+var FONT_MONO =
+  'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace';
+
+/* ---------------------------------------------------------------- math --- */
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+/** Frame-rate independent exponential approach. `rate` is per-second. */
+function approach(cur, target, rate, dt) {
+  var k = 1 - Math.exp(-rate * (dt / 1000));
+  return cur + (target - cur) * k;
+}
+
+/** Guard against a NaN leaking into a coordinate and poisoning a draw call. */
+function num(v, fallback) {
+  return typeof v === 'number' && isFinite(v) ? v : (fallback || 0);
+}
+
+/**
+ * Parse #rgb / #rrggbb into [r,g,b].
+ *
+ * Returns null for anything else. Callers MUST handle null rather than
+ * assuming a shape — feeding an `rgb()` string back into a hex parser is
+ * exactly the bug that produced NaN colour stops and threw inside
+ * addColorStop, so this never guesses.
+ */
+function hexRgb(hex) {
+  if (typeof hex !== 'string') return null;
+  var s = hex.trim();
+  if (s.charAt(0) !== '#') return null;
+  if (s.length === 4) {
+    var r = parseInt(s.charAt(1) + s.charAt(1), 16);
+    var g = parseInt(s.charAt(2) + s.charAt(2), 16);
+    var b = parseInt(s.charAt(3) + s.charAt(3), 16);
+    return isFinite(r + g + b) ? [r, g, b] : null;
+  }
+  if (s.length === 7) {
+    var rr = parseInt(s.slice(1, 3), 16);
+    var gg = parseInt(s.slice(3, 5), 16);
+    var bb = parseInt(s.slice(5, 7), 16);
+    return isFinite(rr + gg + bb) ? [rr, gg, bb] : null;
+  }
+  return null;
+}
+
+/**
+ * Last-resort colour. rgba()/shade() return this rather than undefined when
+ * handed something unusable, because the alternative is an `undefined`
+ * reaching ctx.fillStyle — which paints nothing and silently blanks whatever
+ * was being drawn. In-palette so a bug degrades quietly instead of screaming.
+ */
+var FALLBACK_COL = '#8B7BF0';
+
+/**
+ * Colour with alpha. Accepts hex or an existing rgb()/rgba() string; a
+ * non-hex string is passed through untouched rather than mangled, and a
+ * non-string never escapes as one.
+ */
+function rgba(color, alpha) {
+  var c = hexRgb(color);
+  var a = clamp(num(alpha, 1), 0, 1);
+  if (!c) return (typeof color === 'string' && color) ? color : FALLBACK_COL;
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+}
+
+/** Blend towards white (t>0) or black (t<0). Returns a hex string. */
+function shade(color, t) {
+  var c = hexRgb(color);
+  if (!c) return (typeof color === 'string' && color) ? color : FALLBACK_COL;
+  var to = t >= 0 ? 255 : 0;
+  var k = Math.abs(clamp(num(t, 0), -1, 1));
+  var out = '#';
+  for (var i = 0; i < 3; i++) {
+    var v = Math.round(lerp(c[i], to, k));
+    out += ('0' + clamp(v, 0, 255).toString(16)).slice(-2);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------- random --- */
+
+/**
+ * Seedable PRNG (mulberry32). The whole front end draws from this so a failing
+ * test can be replayed exactly from its seed.
+ */
+function makeRng(seed) {
+  var a = (seed >>> 0) || 1;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var _rng = makeRng(0x9E3779B9);
+
+/** Reseed the global stream. Tests call this; production seeds from the clock. */
+function seedRng(seed) { _rng = makeRng(seed); }
+
+function rnd() { return _rng(); }
+function rndRange(lo, hi) { return lo + _rng() * (hi - lo); }
+function rndInt(lo, hi) { return Math.floor(lo + _rng() * (hi - lo + 1)); }
+function pick(arr) { return arr[Math.floor(_rng() * arr.length) % arr.length]; }
+
+/* ------------------------------------------------------------ formats --- */
+
+/** Score formatting with thin separators, always tabular width. */
+function fmtScore(n) {
+  var v = Math.max(0, Math.floor(num(n, 0)));
+  return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function pad(n, width) {
+  var s = String(Math.floor(num(n, 0)));
+  while (s.length < width) s = '0' + s;
+  return s;
+}
+
+/* ---------------------------------------------------------- repeater --- */
+
+/**
+ * Time-based auto-repeat, for games that need their own DAS timings rather
+ * than the shell's menu cadence (Tetris wants ~170/50ms, a menu wants
+ * 360/120ms). Millisecond driven, never frame counted, so it behaves
+ * identically at 30, 60 or 144Hz.
+ */
+function makeRepeater(delay, rate) {
+  var d = num(delay, 360);
+  var r = num(rate, 120);
+  var timer = 0;
+  var wasDown = false;
+  return {
+    /** Returns how many steps to take this frame (0, 1 or more). */
+    step: function (isDown, dt) {
+      var ms = num(dt, 16);
+      if (!isDown) { timer = 0; wasDown = false; return 0; }
+      if (!wasDown) { wasDown = true; timer = d; return 1; }
+      timer -= ms;
+      var n = 0;
+      while (timer <= 0 && n < 8) { n++; timer += r; }
+      if (n >= 8) timer = r;
+      return n;
+    },
+    reset: function () { timer = 0; wasDown = false; },
+  };
+}
+
+/* ----------------------------------------------------------- registry --- */
+
+/**
+ * Game registry. Each game module pushes its object here at load time; the
+ * shell reads GAMES to build the dashboard. Order here is dashboard order.
+ */
+var GAMES = [];
+
+/** Games playable head-to-head only; hidden from the normal dashboard. */
+var VERSUS_GAMES = [];
+
+function registerGame(game) {
+  GAMES.push(game);
+  return game;
+}
+
+function registerVersus(game) {
+  VERSUS_GAMES.push(game);
+  return game;
+}
+
+function gameById(id) {
+  for (var i = 0; i < GAMES.length; i++) if (GAMES[i].id === id) return GAMES[i];
+  for (var j = 0; j < VERSUS_GAMES.length; j++) if (VERSUS_GAMES[j].id === id) return VERSUS_GAMES[j];
+  return null;
+}
+
+/* ===== core/storage.js =========================================== */
+/*
+ * Guarded persistence.
+ *
+ * localStorage works on the Pi but throws outright in sandboxed preview
+ * contexts (and in Chromium when cookies are blocked for file:// origins).
+ * Every access in the whole front end goes through here: one try/catch, one
+ * in-memory fallback, one schema validator. A storage failure degrades to a
+ * session-only cabinet — it never breaks a game.
+ */
+
+var Store = (function () {
+  var NS = 'arcadeos';
+  var VERSION = 1;
+
+  /** In-memory mirror. Always authoritative during a session. */
+  var mem = Object.create(null);
+  /** null until probed. */
+  var backend = undefined;
+  var lastError = null;
+
+  function key(name) { return NS + ':v' + VERSION + ':' + name; }
+
+  /**
+   * Probe for a usable backend exactly once. Chromium can expose
+   * window.localStorage yet throw on the first read, so we round-trip a
+   * canary rather than trusting the property's existence.
+   */
+  function be() {
+    if (backend !== undefined) return backend;
+    backend = null;
+    try {
+      var ls = (typeof window !== 'undefined') ? window.localStorage : null;
+      if (ls) {
+        var probe = key('__probe');
+        ls.setItem(probe, '1');
+        if (ls.getItem(probe) === '1') backend = ls;
+        ls.removeItem(probe);
+      }
+    } catch (e) {
+      lastError = e;
+      backend = null;
+    }
+    return backend;
+  }
+
+  function readRaw(name) {
+    var b = be();
+    if (!b) return null;
+    try { return b.getItem(key(name)); } catch (e) { lastError = e; return null; }
+  }
+
+  function writeRaw(name, str) {
+    var b = be();
+    if (!b) return false;
+    try { b.setItem(key(name), str); return true; }
+    catch (e) { lastError = e; return false; }
+  }
+
+  /**
+   * Read and parse a record. `validate` gets the parsed value and must return
+   * a well-formed value or null; anything that throws, fails to parse, or
+   * fails validation falls back to `fallback`. Corrupt records are never
+   * allowed to reach the rest of the app.
+   */
+  function get(name, fallback, validate) {
+    if (name in mem) return mem[name];
+    var raw = readRaw(name);
+    var out = fallback;
+    if (raw != null) {
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+      if (parsed != null) {
+        var checked = null;
+        try { checked = validate ? validate(parsed) : parsed; }
+        catch (e2) { checked = null; }
+        if (checked != null) out = checked;
+      }
+    }
+    mem[name] = out;
+    return out;
+  }
+
+  function set(name, value) {
+    mem[name] = value;
+    var str;
+    try { str = JSON.stringify(value); }
+    catch (e) { lastError = e; return false; }
+    return writeRaw(name, str);
+  }
+
+  function remove(name) {
+    delete mem[name];
+    var b = be();
+    if (!b) return false;
+    try { b.removeItem(key(name)); return true; }
+    catch (e) { lastError = e; return false; }
+  }
+
+  return {
+    get: get,
+    set: set,
+    remove: remove,
+    /** True when writes actually survive a reboot. Surfaced in settings. */
+    persistent: function () { return !!be(); },
+    lastError: function () { return lastError; },
+    /** Test seam: drop the memoised backend and cache. */
+    _reset: function () { mem = Object.create(null); backend = undefined; lastError = null; },
+    _key: key,
+    VERSION: VERSION,
+  };
+})();
+
+/* ------------------------------------------------------------ settings --- */
+
+var SETTINGS_DEFAULTS = {
+  volume: 0.7,
+  muted: false,
+  /** 'auto' | 'xbox' | 'playstation' | 'nintendo' */
+  layout: 'auto',
+  crt: true,
+  reducedMotion: false,
+};
+
+var Settings = (function () {
+  var cur = null;
+
+  /** Coerce every field independently so one bad value cannot poison the rest. */
+  function validate(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var out = {};
+    out.volume = (typeof raw.volume === 'number' && isFinite(raw.volume))
+      ? clamp(raw.volume, 0, 1) : SETTINGS_DEFAULTS.volume;
+    out.muted = raw.muted === true;
+    out.layout = (raw.layout === 'xbox' || raw.layout === 'playstation' ||
+      raw.layout === 'nintendo') ? raw.layout : 'auto';
+    out.crt = raw.crt !== false;
+    out.reducedMotion = raw.reducedMotion === true;
+    return out;
+  }
+
+  function all() {
+    if (!cur) {
+      var loaded = Store.get('settings', null, validate);
+      cur = loaded || {};
+      for (var k in SETTINGS_DEFAULTS) {
+        if (!(k in cur)) cur[k] = SETTINGS_DEFAULTS[k];
+      }
+    }
+    return cur;
+  }
+
+  function get(name) { return all()[name]; }
+
+  function set(name, value) {
+    var s = all();
+    s[name] = value;
+    Store.set('settings', s);
+    if (name === 'volume' || name === 'muted') audioRefresh();
+    return value;
+  }
+
+  function reset() {
+    cur = null;
+    Store.remove('settings');
+    audioRefresh();
+    return all();
+  }
+
+  /* Audio2 loads after storage in the bundle; only reachable post-boot. */
+  function audioRefresh() {
+    if (typeof Audio2 !== 'undefined' && Audio2) Audio2.refresh();
+  }
+
+  return { all: all, get: get, set: set, reset: reset, _validate: validate };
+})();
+
+/* --------------------------------------------------------- high scores --- */
+
+var TOP_N = 5;
+
+var Scores = (function () {
+  var cache = null;
+
+  /** A name is exactly three A-Z characters. Anything else is repaired. */
+  function cleanName(v) {
+    var s = (typeof v === 'string' ? v : '').toUpperCase().replace(/[^A-Z]/g, '');
+    while (s.length < 3) s += 'A';
+    return s.slice(0, 3);
+  }
+
+  function cleanEntry(e) {
+    if (!e || typeof e !== 'object') return null;
+    var score = Number(e.score);
+    if (!isFinite(score) || score < 0) return null;
+    return {
+      name: cleanName(e.name),
+      score: Math.floor(score),
+      at: (typeof e.at === 'number' && isFinite(e.at)) ? e.at : 0,
+    };
+  }
+
+  /**
+   * Validate the whole table. Partial records are dropped individually rather
+   * than discarding an entire game's history — a truncated write should cost
+   * you one row, not the leaderboard.
+   */
+  function validate(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    var out = {};
+    for (var id in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, id)) continue;
+      var list = raw[id];
+      if (!Array.isArray(list)) continue;
+      var clean = [];
+      for (var i = 0; i < list.length; i++) {
+        var e = cleanEntry(list[i]);
+        if (e) clean.push(e);
+      }
+      clean.sort(function (a, b) { return b.score - a.score; });
+      out[id] = clean.slice(0, TOP_N);
+    }
+    return out;
+  }
+
+  function all() {
+    if (!cache) cache = Store.get('scores', {}, validate) || {};
+    return cache;
+  }
+
+  function table(gameId) {
+    var t = all()[gameId];
+    return Array.isArray(t) ? t : [];
+  }
+
+  function best(gameId) {
+    var t = table(gameId);
+    return t.length ? t[0].score : 0;
+  }
+
+  /** True when `score` would earn a place in the table. */
+  function qualifies(gameId, score) {
+    var s = Math.floor(num(score, 0));
+    if (s <= 0) return false;
+    var t = table(gameId);
+    if (t.length < TOP_N) return true;
+    return s > t[t.length - 1].score;
+  }
+
+  /** Insert and persist. Returns the 0-based rank, or -1 if it did not place. */
+  function submit(gameId, score, name, now) {
+    var s = Math.floor(num(score, 0));
+    if (s <= 0) return -1;
+    var t = table(gameId).slice();
+    t.push({ name: cleanName(name), score: s, at: num(now, 0) });
+    t.sort(function (a, b) { return b.score - a.score || a.at - b.at; });
+    t = t.slice(0, TOP_N);
+    var data = all();
+    data[gameId] = t;
+    Store.set('scores', data);
+    for (var i = 0; i < t.length; i++) {
+      if (t[i].score === s && t[i].at === num(now, 0)) return i;
+    }
+    return -1;
+  }
+
+  function reset() {
+    cache = {};
+    Store.set('scores', {});
+  }
+
+  return {
+    all: all, table: table, best: best, qualifies: qualifies,
+    submit: submit, reset: reset, _validate: validate, _cleanName: cleanName,
+    /** Test seam. */
+    _drop: function () { cache = null; },
+  };
+})();
+
+/* ===== core/audio.js ============================================= */
+/*
+ * WebAudio synthesis. No samples, no files, no network.
+ *
+ * Everything the cabinet makes noise with is generated from oscillators and
+ * a single shared noise buffer. The context is created lazily and resumed on
+ * first input, because Chromium suspends it until a gesture even in kiosk
+ * mode unless --autoplay-policy is set (the setup script sets it; this is the
+ * belt to that pair of braces).
+ *
+ * Every entry point is wrapped so that a missing or broken AudioContext
+ * degrades to silence rather than throwing into a game loop.
+ */
+
+var Audio2 = (function () {
+  var ctx = null;
+  var master = null;
+  var available = true;
+  /** Voice budget — a Pi 4 will happily grind if a game spams tones. */
+  var voices = 0;
+  var VOICE_CAP = 16;
+  var noiseBuf = null;
+
+  function ensure() {
+    if (ctx || !available) return ctx;
+    try {
+      var AC = (typeof window !== 'undefined') &&
+        (window.AudioContext || window.webkitAudioContext);
+      if (!AC) { available = false; return null; }
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = level();
+      master.connect(ctx.destination);
+    } catch (e) {
+      available = false;
+      ctx = null;
+      master = null;
+    }
+    return ctx;
+  }
+
+  function level() {
+    try {
+      var s = Settings.all();
+      return s.muted ? 0 : clamp(num(s.volume, 0.7), 0, 1);
+    } catch (e) { return 0.7; }
+  }
+
+  /** Re-read volume/mute from settings. Called whenever either changes. */
+  function refresh() {
+    if (!master || !ctx) return;
+    try { master.gain.setTargetAtTime(level(), ctx.currentTime, 0.02); }
+    catch (e) { /* ignore */ }
+  }
+
+  /** Called on the first real input event; Chromium requires a gesture. */
+  function unlock() {
+    var c = ensure();
+    if (!c) return;
+    try { if (c.state === 'suspended') c.resume(); } catch (e) { /* ignore */ }
+  }
+
+  function now() {
+    var c = ensure();
+    return c ? c.currentTime : 0;
+  }
+
+  function claimVoice(dur) {
+    if (voices >= VOICE_CAP) return false;
+    voices++;
+    var ms = Math.max(20, num(dur, 0.1) * 1000 + 60);
+    if (typeof setTimeout === 'function') setTimeout(release, ms);
+    else voices--;
+    return true;
+  }
+
+  function release() { if (voices > 0) voices--; }
+
+  /**
+   * One synth voice: oscillator -> gain envelope -> master.
+   * opts: {freq, freq2, dur, type, gain, attack, when, detune}
+   */
+  function tone(opts) {
+    var c = ensure();
+    if (!c || !master) return;
+    var o = opts || {};
+    var dur = clamp(num(o.dur, 0.12), 0.01, 4);
+    if (!claimVoice(dur)) return;
+    try {
+      var t0 = c.currentTime + Math.max(0, num(o.when, 0));
+      var osc = c.createOscillator();
+      var g = c.createGain();
+      var f0 = clamp(num(o.freq, 440), 20, 12000);
+      var f1 = clamp(num(o.freq2, f0), 20, 12000);
+      osc.type = o.type || 'square';
+      osc.frequency.setValueAtTime(f0, t0);
+      if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+      if (o.detune) osc.detune.setValueAtTime(clamp(num(o.detune, 0), -1200, 1200), t0);
+
+      var peak = clamp(num(o.gain, 0.18), 0, 1);
+      var atk = clamp(num(o.attack, 0.005), 0.001, dur * 0.9);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t0 + atk);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+      osc.connect(g); g.connect(master);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    } catch (e) { release(); }
+  }
+
+  /** Shared 1s white-noise buffer; built once, played as a source. */
+  function noiseBuffer(c) {
+    if (noiseBuf) return noiseBuf;
+    try {
+      var len = Math.floor(c.sampleRate * 1);
+      noiseBuf = c.createBuffer(1, len, c.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      /* Deterministic fill — no reliance on Math.random anywhere. */
+      var r = makeRng(0xC0FFEE);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+    } catch (e) { noiseBuf = null; }
+    return noiseBuf;
+  }
+
+  /** Filtered noise burst: impacts, explosions, line clears. */
+  function noise(opts) {
+    var c = ensure();
+    if (!c || !master) return;
+    var o = opts || {};
+    var dur = clamp(num(o.dur, 0.14), 0.01, 3);
+    if (!claimVoice(dur)) return;
+    try {
+      var buf = noiseBuffer(c);
+      if (!buf) { release(); return; }
+      var t0 = c.currentTime + Math.max(0, num(o.when, 0));
+      var src = c.createBufferSource();
+      src.buffer = buf;
+      var flt = c.createBiquadFilter();
+      flt.type = o.filter || 'bandpass';
+      var f0 = clamp(num(o.freq, 1200), 40, 14000);
+      var f1 = clamp(num(o.freq2, f0), 40, 14000);
+      flt.frequency.setValueAtTime(f0, t0);
+      if (f1 !== f0) flt.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+      flt.Q.value = clamp(num(o.q, 1), 0.1, 20);
+
+      var g = c.createGain();
+      var peak = clamp(num(o.gain, 0.16), 0, 1);
+      g.gain.setValueAtTime(Math.max(0.0002, peak), t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+      src.connect(flt); flt.connect(g); g.connect(master);
+      src.start(t0);
+      src.stop(t0 + dur + 0.02);
+    } catch (e) { release(); }
+  }
+
+  /* ------------------------------------------------------------- sfx --- */
+
+  /**
+   * Named effects. Games call these rather than building tones inline, so the
+   * cabinet has one consistent voice across every title.
+   */
+  var SFX = {
+    move: function () { tone({ freq: 320, dur: 0.04, type: 'square', gain: 0.07 }); },
+    select: function () { tone({ freq: 520, freq2: 720, dur: 0.08, type: 'square', gain: 0.10 }); },
+    back: function () { tone({ freq: 420, freq2: 260, dur: 0.09, type: 'square', gain: 0.09 }); },
+    denied: function () { tone({ freq: 180, freq2: 120, dur: 0.14, type: 'sawtooth', gain: 0.10 }); },
+    rotate: function () { tone({ freq: 640, dur: 0.045, type: 'triangle', gain: 0.09 }); },
+    lock: function () { tone({ freq: 190, freq2: 120, dur: 0.07, type: 'square', gain: 0.10 }); },
+    drop: function () { noise({ freq: 900, freq2: 200, dur: 0.10, gain: 0.13, q: 0.8 }); },
+    clear: function (n) {
+      var lines = clamp(num(n, 1), 1, 4);
+      for (var i = 0; i < lines; i++) {
+        tone({ freq: 440 * Math.pow(1.26, i), freq2: 880 * Math.pow(1.26, i),
+          dur: 0.16, type: 'triangle', gain: 0.13, when: i * 0.05 });
+      }
+      noise({ freq: 2200, freq2: 400, dur: 0.20, gain: 0.10 });
+    },
+    coin: function () {
+      tone({ freq: 988, dur: 0.06, type: 'square', gain: 0.11 });
+      tone({ freq: 1319, dur: 0.14, type: 'square', gain: 0.11, when: 0.06 });
+    },
+    hit: function () { noise({ freq: 1800, freq2: 600, dur: 0.06, gain: 0.12, q: 1.5 }); },
+    bounce: function () { tone({ freq: 700, freq2: 900, dur: 0.035, type: 'square', gain: 0.08 }); },
+    eat: function () { tone({ freq: 600, freq2: 1000, dur: 0.07, type: 'triangle', gain: 0.11 }); },
+    jump: function () { tone({ freq: 380, freq2: 720, dur: 0.09, type: 'triangle', gain: 0.10 }); },
+    land: function () { tone({ freq: 200, freq2: 140, dur: 0.05, type: 'sine', gain: 0.09 }); },
+    powerup: function () {
+      for (var i = 0; i < 4; i++) {
+        tone({ freq: 523 * Math.pow(1.19, i), dur: 0.08, type: 'square', gain: 0.09, when: i * 0.045 });
+      }
+    },
+    over: function () {
+      var seq = [523, 392, 311, 262];
+      for (var i = 0; i < seq.length; i++) {
+        tone({ freq: seq[i], dur: 0.30, type: 'triangle', gain: 0.13, when: i * 0.16 });
+      }
+    },
+    highscore: function () {
+      var seq = [523, 659, 784, 1047, 784, 1047];
+      for (var i = 0; i < seq.length; i++) {
+        tone({ freq: seq[i], dur: 0.18, type: 'square', gain: 0.11, when: i * 0.11 });
+      }
+    },
+    start: function () {
+      tone({ freq: 330, freq2: 660, dur: 0.18, type: 'triangle', gain: 0.13 });
+      tone({ freq: 660, freq2: 990, dur: 0.22, type: 'square', gain: 0.08, when: 0.10 });
+    },
+  };
+
+  function sfx(name, arg) {
+    var fn = SFX[name];
+    if (!fn) return;
+    try { fn(arg); } catch (e) { /* never let a sound break a frame */ }
+  }
+
+  return {
+    unlock: unlock,
+    refresh: refresh,
+    tone: tone,
+    noise: noise,
+    sfx: sfx,
+    now: now,
+    /** Exposed for the rhythm game, which needs sample-accurate scheduling. */
+    ctx: function () { return ensure(); },
+    available: function () { return available && !!ensure(); },
+    _reset: function () { ctx = null; master = null; available = true; voices = 0; noiseBuf = null; },
+  };
+})();
+
+/* ===== core/input.js ============================================= */
+/*
+ * Input: gamepads and keyboards collapsed into eight semantic actions.
+ *
+ *   up  down  left  right  confirm  back  alt  pause
+ *
+ * Nothing above this layer ever asks "which button" — it asks "which action".
+ * That is what lets an Xbox pad, a DualSense, a Switch Pro controller and a
+ * USB arcade encoder wired as an arrow-key keyboard all drive the same shell.
+ *
+ * THE FACE-BUTTON SWAP
+ * --------------------
+ * Xbox and PlayStation confirm with the BOTTOM face button (index 0).
+ * Nintendo confirms with the RIGHT one (index 1) because their A/B are
+ * physically mirrored. Both end up displaying "A" for confirm — the label is
+ * the same, the index is not. Getting this wrong makes a Switch Pro pad feel
+ * broken in a way users cannot articulate. Do not "simplify" it away.
+ *
+ * Auto-repeat is measured in milliseconds, never in frames: 360ms to the
+ * first repeat, then one every 120ms. Total steps over a given wall-clock
+ * span are identical whether the display runs at 30, 60 or 144Hz.
+ */
+
+var ACTIONS = ['up', 'down', 'left', 'right', 'confirm', 'back', 'alt', 'pause'];
+
+var REPEAT_DELAY = 360;
+var REPEAT_RATE = 120;
+var DEADZONE = 0.4;
+var MAX_PLAYERS = 4;
+
+var Input = (function () {
+
+  /* ------------------------------------------------------ keyboard --- */
+
+  /**
+   * Generous mapping. USB arcade encoders in keyboard mode emit arrows plus
+   * some scattering of Z/X/C, Ctrl, Alt, Space and Enter depending on the
+   * board, so we accept all of the common ones rather than making the user
+   * reflash their encoder.
+   */
+  var KEYMAP = {
+    ArrowUp: 'up', KeyW: 'up', Numpad8: 'up',
+    ArrowDown: 'down', KeyS: 'down', Numpad2: 'down',
+    ArrowLeft: 'left', KeyA: 'left', Numpad4: 'left',
+    ArrowRight: 'right', KeyD: 'right', Numpad6: 'right',
+    Enter: 'confirm', NumpadEnter: 'confirm', Space: 'confirm',
+    KeyZ: 'confirm', ControlLeft: 'confirm', ControlRight: 'confirm',
+    Escape: 'back', Backspace: 'back', KeyX: 'back',
+    AltLeft: 'back', AltRight: 'back',
+    KeyC: 'alt', ShiftLeft: 'alt', ShiftRight: 'alt',
+    KeyP: 'pause', Tab: 'pause', Digit1: 'pause',
+  };
+
+  var keys = Object.create(null);
+  /** Set on any key/button transition; drives attract-mode wake-up. */
+  var activity = false;
+
+  /* -------------------------------------------------------- players --- */
+
+  function newSlot() {
+    var s = {
+      padIndex: -1,
+      padId: '',
+      kind: 'keyboard',
+      active: false,
+      down: Object.create(null),
+      prev: Object.create(null),
+      hit: Object.create(null),
+      reps: Object.create(null),
+      timer: Object.create(null),
+    };
+    for (var i = 0; i < ACTIONS.length; i++) {
+      var a = ACTIONS[i];
+      s.down[a] = false; s.prev[a] = false; s.hit[a] = false;
+      s.reps[a] = 0; s.timer[a] = 0;
+    }
+    return s;
+  }
+
+  var players = [];
+  for (var p = 0; p < MAX_PLAYERS; p++) players.push(newSlot());
+  /* Player 1 always exists: keyboard is the floor. */
+  players[0].active = true;
+
+  /** Aggregate of every active player — what menus and 1P games read. */
+  var any = newSlot();
+
+  /** Pads seen but not yet assigned to a slot; watched for a Start press. */
+  var pending = Object.create(null);
+
+  var padSignature = '';
+  var padsVersion = 0;
+  var joinVersion = 0;
+
+  /* ------------------------------------------------------ detection --- */
+
+  /**
+   * Identify a pad from its id string. Chromium formats ids as
+   * "Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)",
+   * so both the human name and the USB vendor id are fair game.
+   */
+  function detect(id) {
+    var s = String(id || '').toLowerCase();
+    if (/nintendo|pro controller|switch|joy-con|joycon|057e/.test(s)) return 'nintendo';
+    if (/dualsense|dualshock|playstation|054c|sony/.test(s)) return 'playstation';
+    if (/xbox|xinput|x-box|045e/.test(s)) return 'xbox';
+    return 'unknown';
+  }
+
+  /**
+   * Effective layout for a slot: the settings override wins over detection so
+   * an unrecognised pad can still be corrected by the user without a keyboard.
+   */
+  function layoutOf(slot) {
+    var override = 'auto';
+    try { override = Settings.get('layout'); } catch (e) { override = 'auto'; }
+    if (override && override !== 'auto') return override;
+    if (!slot || slot.kind === 'keyboard' || slot.kind === 'unknown') return 'xbox';
+    return slot.kind;
+  }
+
+  /** Face indices for confirm/back. This is the swap. */
+  function faceMap(layout) {
+    return layout === 'nintendo'
+      ? { confirm: 1, back: 0 }
+      : { confirm: 0, back: 1 };
+  }
+
+  /**
+   * On-screen glyphs. Always describes the physical controller in front of
+   * the player, never the button index underneath.
+   */
+  function glyphsFor(layout, kind) {
+    if (layout === 'playstation') return { confirm: '✕', back: '○', alt: '□' };
+    if (layout === 'nintendo') return { confirm: 'A', back: 'B', alt: 'Y' };
+    if (kind === 'keyboard') return { confirm: 'ENTER', back: 'ESC', alt: 'SHIFT' };
+    return { confirm: 'A', back: 'B', alt: 'X' };
+  }
+
+  function glyphs(playerIndex) {
+    var slot = players[playerIndex || 0] || players[0];
+    return glyphsFor(layoutOf(slot), slot.kind);
+  }
+
+  /* ----------------------------------------------------------- poll --- */
+
+  function pads() {
+    try {
+      var g = (typeof navigator !== 'undefined' && navigator.getGamepads)
+        ? navigator.getGamepads() : null;
+      return g || [];
+    } catch (e) { return []; }
+  }
+
+  function btn(gp, i) {
+    var b = gp.buttons && gp.buttons[i];
+    if (!b) return false;
+    return typeof b === 'object' ? !!b.pressed : b > 0.5;
+  }
+
+  function axis(gp, i) {
+    var v = gp.axes && gp.axes[i];
+    return (typeof v === 'number' && isFinite(v)) ? v : 0;
+  }
+
+  /** Fill `out` with the raw action state for one gamepad. */
+  function readPad(gp, layout, out) {
+    var f = faceMap(layout);
+    var ax = axis(gp, 0), ay = axis(gp, 1);
+    out.up = btn(gp, 12) || ay < -DEADZONE;
+    out.down = btn(gp, 13) || ay > DEADZONE;
+    out.left = btn(gp, 14) || ax < -DEADZONE;
+    out.right = btn(gp, 15) || ax > DEADZONE;
+    out.confirm = btn(gp, f.confirm);
+    out.back = btn(gp, f.back) || btn(gp, 8);
+    out.alt = btn(gp, 2) || btn(gp, 3) || btn(gp, 4) || btn(gp, 5);
+    out.pause = btn(gp, 9);
+    return out;
+  }
+
+  var scratch = Object.create(null);
+
+  /**
+   * Advance edge/repeat bookkeeping for one slot from its freshly-computed
+   * `down` map. dt is in milliseconds.
+   */
+  function step(slot, dt) {
+    for (var i = 0; i < ACTIONS.length; i++) {
+      var a = ACTIONS[i];
+      var isDown = !!slot.down[a];
+      var wasDown = !!slot.prev[a];
+      slot.hit[a] = isDown && !wasDown;
+      slot.reps[a] = 0;
+
+      if (isDown && !wasDown) {
+        slot.reps[a] = 1;
+        slot.timer[a] = REPEAT_DELAY;
+        activity = true;
+      } else if (isDown) {
+        slot.timer[a] -= dt;
+        /* Cap the catch-up so a long stall cannot fire a hundred steps. */
+        var guard = 0;
+        while (slot.timer[a] <= 0 && guard < 8) {
+          slot.reps[a]++;
+          slot.timer[a] += REPEAT_RATE;
+          guard++;
+        }
+        if (guard >= 8) slot.timer[a] = REPEAT_RATE;
+      } else {
+        slot.timer[a] = 0;
+      }
+      slot.prev[a] = isDown;
+    }
+  }
+
+  /** Assign a connected-but-unassigned pad to the lowest free slot. */
+  function assign(padIndex, id) {
+    for (var i = 0; i < MAX_PLAYERS; i++) {
+      /* Slot 0 starts keyboard-active but padless; a real pad may claim it. */
+      if (players[i].padIndex !== -1) continue;
+      players[i].padIndex = padIndex;
+      players[i].padId = id;
+      players[i].kind = detect(id);
+      players[i].active = true;
+      delete pending[padIndex];
+      joinVersion++;
+      return i;
+    }
+    return -1;
+  }
+
+  function releasePad(padIndex) {
+    for (var i = 0; i < MAX_PLAYERS; i++) {
+      if (players[i].padIndex === padIndex) {
+        players[i].padIndex = -1;
+        players[i].padId = '';
+        players[i].kind = 'keyboard';
+        /* Slot 0 stays alive on the keyboard; higher slots drop out. */
+        if (i > 0) players[i].active = false;
+        joinVersion++;
+      }
+    }
+    delete pending[padIndex];
+  }
+
+  /**
+   * Poll every device and recompute all action state. Called exactly once per
+   * frame by the shell, before any update().
+   */
+  function poll(dt) {
+    var d = clamp(num(dt, 16), 0, 250);
+    var list = pads();
+
+    /* --- hot-plug: rebuild the signature and reconcile slots ---------- */
+    var sig = '';
+    var seen = Object.create(null);
+    for (var i = 0; i < list.length; i++) {
+      var gp = list[i];
+      if (!gp || !gp.connected) continue;
+      seen[i] = true;
+      sig += i + ':' + (gp.id || '') + '|';
+    }
+    if (sig !== padSignature) {
+      padSignature = sig;
+      padsVersion++;
+      /*
+       * Drop slots whose pad vanished — or whose pad was swapped for a
+       * different one at the same index. Chromium reuses index 0 when you
+       * unplug an Xbox pad and plug in a Switch pad, so comparing presence
+       * alone would leave the slot claiming the old layout and glyphs.
+       */
+      for (var s = 0; s < MAX_PLAYERS; s++) {
+        var pidx = players[s].padIndex;
+        if (pidx === -1) continue;
+        var still = seen[pidx] && list[pidx] && (list[pidx].id || '') === players[s].padId;
+        if (!still) releasePad(pidx);
+      }
+      for (var k in pending) {
+        if (!seen[k]) delete pending[k];
+      }
+      /* A newly-seen pad claims slot 0 if nothing holds it yet. */
+      for (var j = 0; j < list.length; j++) {
+        if (!seen[j]) continue;
+        if (isAssigned(j) || pending[j]) continue;
+        if (players[0].padIndex === -1) assign(j, list[j].id);
+        else pending[j] = true;
+      }
+    }
+
+    /* --- per-slot action state --------------------------------------- */
+    for (var pi = 0; pi < MAX_PLAYERS; pi++) {
+      var slot = players[pi];
+      for (var a = 0; a < ACTIONS.length; a++) slot.down[ACTIONS[a]] = false;
+      if (!slot.active) { step(slot, d); continue; }
+
+      /* Keyboard drives player 1 only. */
+      if (pi === 0) {
+        for (var code in keys) {
+          if (!keys[code]) continue;
+          var act = KEYMAP[code];
+          if (act) slot.down[act] = true;
+        }
+      }
+
+      if (slot.padIndex !== -1) {
+        var g = list[slot.padIndex];
+        if (g && g.connected) {
+          readPad(g, layoutOf(slot), scratch);
+          for (var b = 0; b < ACTIONS.length; b++) {
+            if (scratch[ACTIONS[b]]) slot.down[ACTIONS[b]] = true;
+          }
+        }
+      }
+      step(slot, d);
+    }
+
+    /* --- unassigned pads: watch only for a Start press to join -------- */
+    for (var pk in pending) {
+      var idx = +pk;
+      var pg = list[idx];
+      if (!pg || !pg.connected) continue;
+      if (btn(pg, 9) || btn(pg, 0)) {
+        assign(idx, pg.id);
+        activity = true;
+        Audio2.sfx('coin');
+      }
+    }
+
+    /* --- aggregate --------------------------------------------------- */
+    for (var ai = 0; ai < ACTIONS.length; ai++) {
+      var act2 = ACTIONS[ai];
+      var on = false;
+      for (var q = 0; q < MAX_PLAYERS; q++) {
+        if (players[q].active && players[q].down[act2]) { on = true; break; }
+      }
+      any.down[act2] = on;
+    }
+    step(any, d);
+  }
+
+  function isAssigned(padIndex) {
+    for (var i = 0; i < MAX_PLAYERS; i++) if (players[i].padIndex === padIndex) return true;
+    return false;
+  }
+
+  /* --------------------------------------------------------- queries --- */
+
+  function slotOf(playerIndex) {
+    if (playerIndex === undefined || playerIndex === null) return any;
+    return players[playerIndex] || any;
+  }
+
+  function down(action, playerIndex) { return !!slotOf(playerIndex).down[action]; }
+  function hit(action, playerIndex) { return !!slotOf(playerIndex).hit[action]; }
+  function rep(action, playerIndex) { return slotOf(playerIndex).reps[action] > 0; }
+  function repCount(action, playerIndex) { return slotOf(playerIndex).reps[action] | 0; }
+
+  /** Per-player accessor, for versus modes. */
+  function p(index) {
+    return {
+      down: function (a) { return down(a, index); },
+      hit: function (a) { return hit(a, index); },
+      rep: function (a) { return rep(a, index); },
+      repCount: function (a) { return repCount(a, index); },
+      active: function () { return !!players[index] && players[index].active; },
+      glyphs: function () { return glyphs(index); },
+    };
+  }
+
+  /**
+   * Swallow the current frame's edges. Called on every state transition so the
+   * button that opened a screen does not immediately act inside it.
+   */
+  function flush() {
+    var all = players.concat([any]);
+    for (var i = 0; i < all.length; i++) {
+      for (var a = 0; a < ACTIONS.length; a++) {
+        var act = ACTIONS[a];
+        all[i].hit[act] = false;
+        all[i].reps[act] = 0;
+        all[i].prev[act] = all[i].down[act];
+        all[i].timer[act] = REPEAT_DELAY;
+      }
+    }
+  }
+
+  /** True if anything was pressed since the last call. Wakes attract mode. */
+  function consumeActivity() {
+    var a = activity;
+    activity = false;
+    return a;
+  }
+
+  /* ---------------------------------------------------------- rumble --- */
+
+  function rumble(strong, weak, ms, playerIndex) {
+    var slot = players[playerIndex || 0];
+    if (!slot || slot.padIndex === -1) return;
+    try {
+      if (Settings.get('reducedMotion')) return;
+      var gp = pads()[slot.padIndex];
+      if (!gp) return;
+      var act = gp.vibrationActuator || gp.hapticActuators && gp.hapticActuators[0];
+      if (!act || !act.playEffect) return;
+      act.playEffect('dual-rumble', {
+        startDelay: 0,
+        duration: clamp(num(ms, 120), 0, 2000),
+        strongMagnitude: clamp(num(strong, 0.5), 0, 1),
+        weakMagnitude: clamp(num(weak, 0.5), 0, 1),
+      });
+    } catch (e) { /* pads without haptics are the common case */ }
+  }
+
+  /* ------------------------------------------------------------ init --- */
+
+  function attach(target) {
+    var t = target || (typeof window !== 'undefined' ? window : null);
+    if (!t || !t.addEventListener) return;
+    t.addEventListener('keydown', function (e) {
+      var code = e.code || e.key;
+      if (KEYMAP[code]) {
+        if (!keys[code]) activity = true;
+        keys[code] = true;
+        if (e.preventDefault) e.preventDefault();
+      }
+      Audio2.unlock();
+    }, false);
+    t.addEventListener('keyup', function (e) {
+      var code = e.code || e.key;
+      if (KEYMAP[code]) {
+        keys[code] = false;
+        if (e.preventDefault) e.preventDefault();
+      }
+    }, false);
+    /* Losing focus while a key is held would otherwise stick it down. */
+    t.addEventListener('blur', function () { keys = Object.create(null); }, false);
+    t.addEventListener('gamepadconnected', function () { Audio2.unlock(); }, false);
+  }
+
+  return {
+    poll: poll,
+    attach: attach,
+    down: down,
+    hit: hit,
+    rep: rep,
+    repCount: repCount,
+    p: p,
+    flush: flush,
+    glyphs: glyphs,
+    rumble: rumble,
+    consumeActivity: consumeActivity,
+    detect: detect,
+    /** Bumps whenever the set of connected pads changes — legends re-read it. */
+    padsVersion: function () { return padsVersion; },
+    /** Bumps whenever a player joins or drops. */
+    joinVersion: function () { return joinVersion; },
+    players: function () { return players; },
+    playerCount: function () {
+      var n = 0;
+      for (var i = 0; i < MAX_PLAYERS; i++) if (players[i].active) n++;
+      return n;
+    },
+    padCount: function () {
+      var n = 0;
+      for (var i = 0; i < MAX_PLAYERS; i++) if (players[i].padIndex !== -1) n++;
+      return n;
+    },
+    /** Human-readable layout of a slot, for the settings screen. */
+    layoutOf: function (i) { return layoutOf(players[i || 0]); },
+    kindOf: function (i) { return (players[i || 0] || players[0]).kind; },
+    _faceMap: faceMap,
+    _glyphsFor: glyphsFor,
+    _keymap: KEYMAP,
+    _key: function (code, isDown) { keys[code] = !!isDown; if (isDown) activity = true; },
+    _reset: function () {
+      keys = Object.create(null);
+      players.length = 0;
+      for (var i = 0; i < MAX_PLAYERS; i++) players.push(newSlot());
+      players[0].active = true;
+      any = newSlot();
+      pending = Object.create(null);
+      padSignature = ''; padsVersion = 0; joinVersion = 0; activity = false;
+    },
+  };
+})();
+
+/* ===== core/render.js ============================================ */
+/*
+ * Rendering: logical-space canvas helpers and the shared drawing primitives.
+ *
+ * The whole front end is ONE canvas. That is a deliberate performance choice:
+ * a Pi 4 compositing a dozen small card canvases behind a CSS-blurred aurora
+ * cannot hold 60fps at 1080x1920, but a single layer with everything painted
+ * into it comfortably can.
+ *
+ * Two logical spaces exist, and neither is ever measured in device pixels:
+ *   shell space  1080 x 1920   menus, cards, settings
+ *   game space    600 x 1000   every game, letterboxed inside shell space
+ *
+ * PERFORMANCE NOTES
+ *  - shadowBlur is banned in hot paths. Glow comes from pre-rendered sprites
+ *    on offscreen canvases, cached by colour and size. Per-tile shadowBlur is
+ *    the single most expensive thing you can do in a Pi draw loop.
+ *  - The aurora and vignette render into small offscreen buffers and are
+ *    blitted up. Gradient fill cost scales with pixels touched, so a quarter-
+ *    scale buffer is sixteen times cheaper and looks identical once blurred
+ *    by the upscale.
+ *  - Nothing here allocates per frame except where unavoidable.
+ */
+
+var Render = (function () {
+  var canvas = null;
+  var ctx = null;
+
+  /* Device backing size. */
+  var W = SW, H = SH;
+  var dpr = 1;
+
+  /* Shell-space transform. */
+  var scale = 1, ox = 0, oy = 0;
+  /* Game-space transform, relative to shell space. */
+  var gScale = 1, gox = 0, goy = 0;
+
+  /* Offscreen layers. */
+  var plate = null, plateCtx = null;
+  var aurora = null, auroraCtx = null;
+  var vig = null, vigCtx = null;
+  var veil = null, veilPattern = null;
+
+  var LOWRES = 4;      /* backdrop buffers render at 1/4 linear scale */
+  var auroraT = 0;
+
+  function makeCanvas(w, h) {
+    var c;
+    if (typeof document !== 'undefined' && document.createElement) {
+      c = document.createElement('canvas');
+    } else {
+      return null;
+    }
+    c.width = Math.max(1, Math.floor(w));
+    c.height = Math.max(1, Math.floor(h));
+    return c;
+  }
+
+  function init(el) {
+    canvas = el;
+    ctx = canvas.getContext('2d', { alpha: false });
+    gx = ctx;
+    sx = ctx;
+    resize();
+    return ctx;
+  }
+
+  function resize() {
+    if (!canvas) return;
+    var vw = (typeof window !== 'undefined' && window.innerWidth) || SW;
+    var vh = (typeof window !== 'undefined' && window.innerHeight) || SH;
+    var ratio = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    /* Above 1.5 the Pi burns fill rate for pixels nobody can resolve. */
+    dpr = clamp(num(ratio, 1), 1, 1.5);
+
+    W = Math.max(1, Math.floor(vw * dpr));
+    H = Math.max(1, Math.floor(vh * dpr));
+    canvas.width = W;
+    canvas.height = H;
+    if (canvas.style) {
+      canvas.style.width = vw + 'px';
+      canvas.style.height = vh + 'px';
+    }
+
+    /* Shell space letterboxed into the device surface. */
+    scale = Math.min(W / SW, H / SH);
+    ox = (W - SW * scale) / 2;
+    oy = (H - SH * scale) / 2;
+
+    /* Game space letterboxed into shell space. */
+    gScale = Math.min(SW / GW, SH / GH);
+    gox = (SW - GW * gScale) / 2;
+    goy = (SH - GH * gScale) / 2;
+
+    buildLayers();
+  }
+
+  /* ------------------------------------------------------- backdrop --- */
+
+  function buildLayers() {
+    var lw = Math.max(2, Math.floor(W / LOWRES));
+    var lh = Math.max(2, Math.floor(H / LOWRES));
+
+    plate = makeCanvas(lw, lh);
+    aurora = makeCanvas(lw, lh);
+    vig = makeCanvas(lw, lh);
+    if (!plate || !aurora || !vig) return;
+    plateCtx = plate.getContext('2d');
+    auroraCtx = aurora.getContext('2d');
+    vigCtx = vig.getContext('2d');
+
+    /* radial-gradient(125% 80% at 50% -10%, #1D1748, #0D0A1F 55%, #07050E) */
+    if (plateCtx) {
+      var cx = lw * 0.5, cy = lh * -0.10;
+      var r = Math.max(lw * 1.25, lh * 0.80);
+      var g = plateCtx.createRadialGradient(cx, cy, 0, cx, cy, r);
+      g.addColorStop(0, COL.bgTop);
+      g.addColorStop(0.55, COL.bgMid);
+      g.addColorStop(1, COL.bgBot);
+      plateCtx.fillStyle = g;
+      plateCtx.fillRect(0, 0, lw, lh);
+    }
+
+    if (vigCtx) {
+      vigCtx.clearRect(0, 0, lw, lh);
+      var vr = Math.max(lw, lh) * 0.78;
+      var vg = vigCtx.createRadialGradient(lw / 2, lh / 2, vr * 0.42, lw / 2, lh / 2, vr);
+      vg.addColorStop(0, 'rgba(0,0,0,0)');
+      vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+      vigCtx.fillStyle = vg;
+      vigCtx.fillRect(0, 0, lw, lh);
+    }
+
+    buildVeil();
+  }
+
+  /** Scanline veil as a 1x4 repeating pattern — one fill, no per-line loop. */
+  function buildVeil() {
+    veil = makeCanvas(1, 4);
+    veilPattern = null;
+    if (!veil) return;
+    var vc = veil.getContext('2d');
+    if (!vc) return;
+    vc.clearRect(0, 0, 1, 4);
+    vc.fillStyle = 'rgba(0,0,0,0.16)';
+    vc.fillRect(0, 0, 1, 1);
+    vc.fillStyle = 'rgba(0,0,0,0.06)';
+    vc.fillRect(0, 1, 1, 1);
+    try { veilPattern = ctx ? ctx.createPattern(veil, 'repeat') : null; }
+    catch (e) { veilPattern = null; }
+  }
+
+  /**
+   * Three drifting aurora blobs. Rendered as radial gradients into a quarter-
+   * scale buffer — the upscale is what gives them their soft blurred edge, at
+   * a fraction of the cost of a real blur filter.
+   */
+  var BLOBS = [
+    { c: COL.a1, x: 0.22, y: 0.18, r: 0.62, sx: 0.055, sy: 0.041, px: 0.13, py: 0.09, a: 0.30 },
+    { c: COL.a2, x: 0.78, y: 0.42, r: 0.70, sx: 0.037, sy: 0.063, px: 0.11, py: 0.12, a: 0.34 },
+    { c: COL.a3, x: 0.42, y: 0.80, r: 0.58, sx: 0.048, sy: 0.033, px: 0.15, py: 0.07, a: 0.24 },
+  ];
+
+  function drawAurora(t, tint) {
+    if (!auroraCtx || !aurora) return;
+    var lw = aurora.width, lh = aurora.height;
+    auroraCtx.clearRect(0, 0, lw, lh);
+    var sec = t / 1000;
+    for (var i = 0; i < BLOBS.length; i++) {
+      var b = BLOBS[i];
+      var bx = (b.x + Math.sin(sec * b.sx * 6.283 + i) * b.px) * lw;
+      var by = (b.y + Math.cos(sec * b.sy * 6.283 + i * 1.7) * b.py) * lh;
+      var br = b.r * Math.min(lw, lh);
+      if (!isFinite(bx) || !isFinite(by) || br <= 0) continue;
+      var col = (tint && i === 1) ? tint : b.c;
+      var g = auroraCtx.createRadialGradient(bx, by, 0, bx, by, br);
+      g.addColorStop(0, rgba(col, b.a));
+      g.addColorStop(0.5, rgba(col, b.a * 0.35));
+      g.addColorStop(1, rgba(col, 0));
+      auroraCtx.fillStyle = g;
+      auroraCtx.fillRect(0, 0, lw, lh);
+    }
+  }
+
+  /**
+   * Paint the shared background and set up shell space. Returns the shell ctx.
+   * `tint` optionally recolours the middle aurora blob to a game accent.
+   */
+  function beginFrame(dt, tint) {
+    if (!ctx) return null;
+    var reduced = false;
+    try { reduced = !!Settings.get('reducedMotion'); } catch (e) { reduced = false; }
+    if (!reduced) auroraT += num(dt, 16);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COL.bgBot;
+    ctx.fillRect(0, 0, W, H);
+
+    if (plate) ctx.drawImage(plate, 0, 0, W, H);
+    drawAurora(auroraT, tint);
+    if (aurora) {
+      ctx.globalAlpha = 1;
+      ctx.drawImage(aurora, 0, 0, W, H);
+    }
+
+    /* Enter shell space. */
+    ctx.setTransform(scale, 0, 0, scale, ox, oy);
+    return ctx;
+  }
+
+  /** Scanlines + vignette sit on top of everything. */
+  function endFrame() {
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+
+    var crt = true;
+    try { crt = Settings.get('crt') !== false; } catch (e) { crt = true; }
+    if (crt && veilPattern) {
+      ctx.fillStyle = veilPattern;
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (vig) ctx.drawImage(vig, 0, 0, W, H);
+
+    /* Letterbox bars, in case the panel is not 9:16. */
+    if (ox > 0.5 || oy > 0.5) {
+      ctx.fillStyle = '#000';
+      if (ox > 0.5) { ctx.fillRect(0, 0, ox, H); ctx.fillRect(W - ox, 0, ox, H); }
+      if (oy > 0.5) { ctx.fillRect(0, 0, W, oy); ctx.fillRect(0, H - oy, W, oy); }
+    }
+  }
+
+  /** Switch the active transform into 600x1000 game space. */
+  function enterGame() {
+    if (!ctx) return null;
+    ctx.setTransform(scale * gScale, 0, 0, scale * gScale,
+      ox + gox * scale, oy + goy * scale);
+    return ctx;
+  }
+
+  /** Back to 1080x1920 shell space. */
+  function enterShell() {
+    if (!ctx) return null;
+    ctx.setTransform(scale, 0, 0, scale, ox, oy);
+    return ctx;
+  }
+
+  /* ----------------------------------------------------- glow cache --- */
+
+  var glowCache = Object.create(null);
+  var glowKeys = [];
+  var GLOW_CAP = 96;
+
+  /**
+   * Pre-rendered radial glow sprite. This exists so that no draw loop ever
+   * touches ctx.shadowBlur — the sprite is rasterised once and then blitted,
+   * which is roughly two orders of magnitude cheaper per tile on a Pi 4.
+   */
+  function glowSprite(color, size) {
+    var s = Math.max(4, Math.round(num(size, 16)));
+    var key = color + '|' + s;
+    var hit = glowCache[key];
+    if (hit) return hit;
+
+    var dim = s * 3;
+    var c = makeCanvas(dim, dim);
+    if (!c) return null;
+    var g2 = c.getContext('2d');
+    if (!g2) return null;
+    var r = dim / 2;
+    var grad = g2.createRadialGradient(r, r, s * 0.25, r, r, r);
+    grad.addColorStop(0, rgba(color, 0.55));
+    grad.addColorStop(0.45, rgba(color, 0.18));
+    grad.addColorStop(1, rgba(color, 0));
+    g2.fillStyle = grad;
+    g2.fillRect(0, 0, dim, dim);
+
+    if (glowKeys.length >= GLOW_CAP) {
+      var evict = glowKeys.shift();
+      delete glowCache[evict];
+    }
+    glowKeys.push(key);
+    glowCache[key] = c;
+    return c;
+  }
+
+  /** Blit a cached glow centred on (x,y). */
+  function glow(c, x, y, size, color, alpha) {
+    var spr = glowSprite(color, size);
+    if (!spr) return;
+    var a = clamp(num(alpha, 1), 0, 1);
+    if (a <= 0) return;
+    var dim = spr.width;
+    var px = num(x, 0) - dim / 2, py = num(y, 0) - dim / 2;
+    var prev = c.globalAlpha;
+    c.globalAlpha = clamp(prev * a, 0, 1);
+    c.drawImage(spr, px, py, dim, dim);
+    c.globalAlpha = prev;
+  }
+
+  return {
+    init: init,
+    resize: resize,
+    beginFrame: beginFrame,
+    endFrame: endFrame,
+    enterGame: enterGame,
+    enterShell: enterShell,
+    glow: glow,
+    glowSprite: glowSprite,
+    ctx: function () { return ctx; },
+    size: function () { return { w: W, h: H, scale: scale, ox: ox, oy: oy }; },
+    gameRect: function () { return { x: gox, y: goy, w: GW * gScale, h: GH * gScale, s: gScale }; },
+    _clearGlow: function () { glowCache = Object.create(null); glowKeys = []; },
+  };
+})();
+
+/** The context games draw into, in 600x1000 logical space. */
+var gx = null;
+/** The context the shell draws into, in 1080x1920 logical space. */
+var sx = null;
+
+/* ==================================================================== */
+/*  Shared drawing primitives — available to every game.                */
+/* ==================================================================== */
+
+/** Rounded rectangle path. Written out rather than using ctx.roundRect so the
+ *  same code runs under the headless harness. */
+function roundRect(c, x, y, w, h, r) {
+  var xx = num(x, 0), yy = num(y, 0);
+  var ww = Math.max(0, num(w, 0)), hh = Math.max(0, num(h, 0));
+  var rr = clamp(num(r, 0), 0, Math.min(ww, hh) / 2);
+  c.beginPath();
+  c.moveTo(xx + rr, yy);
+  c.lineTo(xx + ww - rr, yy);
+  c.quadraticCurveTo(xx + ww, yy, xx + ww, yy + rr);
+  c.lineTo(xx + ww, yy + hh - rr);
+  c.quadraticCurveTo(xx + ww, yy + hh, xx + ww - rr, yy + hh);
+  c.lineTo(xx + rr, yy + hh);
+  c.quadraticCurveTo(xx, yy + hh, xx, yy + hh - rr);
+  c.lineTo(xx, yy + rr);
+  c.quadraticCurveTo(xx, yy, xx + rr, yy);
+  c.closePath();
+}
+
+/**
+ * The tile primitive. Every block in every game is drawn with this, which is
+ * what makes eight different titles look like one machine.
+ *
+ *   mode: 'solid' (default) | 'ghost' | 'glow' | 'flash'
+ */
+function tile(c, x, y, size, base, top, mode) {
+  var s = num(size, 0);
+  if (s <= 0) return;
+  var px = num(x, 0), py = num(y, 0);
+  var b = base || COL.a2;
+  var t = top || shade(b, 0.35);
+  var m = mode || 'solid';
+  var inset = Math.max(0.5, s * 0.055);
+  var w = s - inset * 2;
+  var r = Math.max(1, s * 0.18);
+  if (w <= 0) return;
+
+  if (m === 'ghost') {
+    c.globalAlpha = 0.22;
+    roundRect(c, px + inset, py + inset, w, w, r);
+    c.strokeStyle = b;
+    c.lineWidth = Math.max(1, s * 0.07);
+    c.stroke();
+    c.globalAlpha = 1;
+    return;
+  }
+
+  if (m === 'glow') Render.glow(c, px + s / 2, py + s / 2, s, b, 0.9);
+
+  var g = c.createLinearGradient(px, py + inset, px, py + inset + w);
+  g.addColorStop(0, t);
+  g.addColorStop(1, b);
+  c.fillStyle = g;
+  roundRect(c, px + inset, py + inset, w, w, r);
+  c.fill();
+
+  /* Moulded edge: light along the top, shadow along the bottom. */
+  c.strokeStyle = rgba(shade(t, 0.45), 0.55);
+  c.lineWidth = Math.max(0.6, s * 0.045);
+  roundRect(c, px + inset + s * 0.05, py + inset + s * 0.05, w - s * 0.1, w - s * 0.1, r * 0.8);
+  c.stroke();
+
+  if (m === 'flash') {
+    c.globalAlpha = 0.75;
+    c.fillStyle = '#FFFFFF';
+    roundRect(c, px + inset, py + inset, w, w, r);
+    c.fill();
+    c.globalAlpha = 1;
+  }
+}
+
+/**
+ * Wide block, in the same moulded language as tile() but for shapes that are
+ * not square — stacker slabs, breakout bricks, rhythm notes. Shares tile()'s
+ * gradient and edge treatment so the machine keeps one look.
+ */
+function slab(c, x, y, w, h, base, top, mode) {
+  var ww = num(w, 0), hh = num(h, 0);
+  if (ww <= 0 || hh <= 0) return;
+  var px = num(x, 0), py = num(y, 0);
+  var b = base || COL.a2;
+  var t = top || shade(b, 0.35);
+  var r = Math.max(1, Math.min(ww, hh) * 0.22);
+
+  if (mode === 'glow') Render.glow(c, px + ww / 2, py + hh / 2, Math.max(ww, hh) * 0.7, b, 0.75);
+
+  var g = c.createLinearGradient(px, py, px, py + hh);
+  g.addColorStop(0, t);
+  g.addColorStop(1, b);
+  c.fillStyle = g;
+  roundRect(c, px, py, ww, hh, r);
+  c.fill();
+
+  c.strokeStyle = rgba(shade(t, 0.45), 0.5);
+  c.lineWidth = Math.max(0.6, Math.min(ww, hh) * 0.06);
+  roundRect(c, px + 1, py + 1, ww - 2, hh - 2, r * 0.85);
+  c.stroke();
+
+  if (mode === 'flash') {
+    c.globalAlpha = 0.7;
+    c.fillStyle = '#FFFFFF';
+    roundRect(c, px, py, ww, hh, r);
+    c.fill();
+    c.globalAlpha = 1;
+  }
+}
+
+/** Card / panel surface, using the design-system surface and hairline. */
+function panel(c, x, y, w, h, opts) {
+  var o = opts || {};
+  var r = num(o.radius, COL.radius);
+  roundRect(c, x, y, w, h, r);
+  c.fillStyle = o.fill || COL.card;
+  c.fill();
+  c.strokeStyle = o.stroke || COL.cardLine;
+  c.lineWidth = num(o.lineWidth, 1);
+  c.stroke();
+}
+
+/**
+ * Text with optional letter-spacing. Tracking is applied by drawing glyph by
+ * glyph: ctx.letterSpacing exists in modern Chromium but not in the harness,
+ * and headings are short enough that the loop costs nothing.
+ */
+function text(c, str, x, y, opts) {
+  var o = opts || {};
+  var s = String(str == null ? '' : str);
+  var size = num(o.size, 24);
+  var weight = o.weight || '600';
+  var family = o.mono ? FONT_MONO : FONT_SANS;
+  var track = num(o.track, 0);
+  var align = o.align || 'left';
+
+  c.font = weight + ' ' + size + 'px ' + family;
+  c.textBaseline = o.baseline || 'alphabetic';
+
+  var width = measure(c, s, track);
+  var startX = num(x, 0);
+  if (align === 'center') startX -= width / 2;
+  else if (align === 'right') startX -= width;
+
+  var fill = o.color || COL.text;
+  if (o.aurora) {
+    var g = c.createLinearGradient(startX, 0, startX + Math.max(1, width), 0);
+    g.addColorStop(0, COL.a1);
+    g.addColorStop(0.5, COL.a2);
+    g.addColorStop(1, COL.a3);
+    fill = g;
+  }
+  c.fillStyle = fill;
+  c.textAlign = 'left';
+
+  if (track === 0) {
+    c.fillText(s, startX, num(y, 0));
+  } else {
+    var cx = startX;
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      c.fillText(ch, cx, num(y, 0));
+      cx += textWidth(c, ch) + track;
+    }
+  }
+  return width;
+}
+
+function textWidth(c, s) {
+  var m;
+  try { m = c.measureText(s); } catch (e) { m = null; }
+  var w = m && typeof m.width === 'number' && isFinite(m.width) ? m.width : s.length * 8;
+  return w;
+}
+
+function measure(c, s, track) {
+  var t = num(track, 0);
+  if (t === 0) return textWidth(c, s);
+  var w = 0;
+  for (var i = 0; i < s.length; i++) w += textWidth(c, s.charAt(i)) + t;
+  return Math.max(0, w - t);
+}
+
+/** Mono value text with tabular figures — every score in the machine. */
+function dataText(c, str, x, y, opts) {
+  var o = opts || {};
+  return text(c, str, x, y, {
+    size: num(o.size, 20), weight: o.weight || '500', mono: true,
+    color: o.color || COL.data, align: o.align || 'left',
+    baseline: o.baseline, track: num(o.track, 0),
+  });
+}
+
+/* ------------------------------------------------------ game chrome --- */
+
+/** Height of the HUD strip games must leave clear at the top of game space. */
+var HUD_H = 92;
+
+/**
+ * Standard game backdrop: a soft accent wash plus a framed play area. Games
+ * call this first in draw() so every title shares the same stage.
+ */
+function gBackdrop(accent) {
+  var c = gx;
+  if (!c) return;
+  var a = accent || COL.a2;
+
+  /* Vertical accent wash, strongest at the top where the HUD sits. */
+  var g = c.createLinearGradient(0, 0, 0, GH);
+  g.addColorStop(0, rgba(a, 0.13));
+  g.addColorStop(0.45, rgba(a, 0.04));
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = g;
+  c.fillRect(0, 0, GW, GH);
+
+  /* Play-field frame. */
+  panel(c, 8, HUD_H - 4, GW - 16, GH - HUD_H - 4, {
+    fill: 'rgba(10,8,22,0.42)',
+    stroke: rgba(a, 0.16),
+    radius: COL.radius,
+  });
+}
+
+/**
+ * Standard HUD strip. `fields` is an array of {label, value} rendered left to
+ * right; keep it to three or fewer so it stays readable across the room.
+ */
+function gHud(accent, fields) {
+  var c = gx;
+  if (!c) return;
+  var a = accent || COL.a2;
+  var list = fields || [];
+
+  panel(c, 8, 8, GW - 16, HUD_H - 24, {
+    fill: 'rgba(16,12,34,0.55)',
+    stroke: rgba(a, 0.18),
+    radius: COL.radius,
+  });
+
+  var n = Math.max(1, list.length);
+  var colW = (GW - 40) / n;
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i] || {};
+    var cx = 20 + colW * i + colW / 2;
+    text(c, String(f.label == null ? '' : f.label), cx, 36, {
+      size: 13, weight: '600', track: 2.4, color: COL.text2, align: 'center',
+    });
+    dataText(c, String(f.value == null ? '' : f.value), cx, 60, {
+      size: 24, color: f.color || COL.data, align: 'center',
+    });
+  }
+}
+
+/* ----------------------------------------------------------- pools --- */
+
+/**
+ * Fixed-capacity object pool. Games use these for particles and bullets so
+ * update()/draw() never allocate — GC pauses are visible as dropped frames on
+ * a Pi 4 in a way they simply are not on a desktop.
+ */
+function makePool(factory, capacity) {
+  var cap = Math.max(1, capacity | 0);
+  var items = new Array(cap);
+  for (var i = 0; i < cap; i++) { items[i] = factory(); items[i].alive = false; }
+  return {
+    items: items,
+    capacity: cap,
+    /** Returns a dead slot to reinitialise, or null when the pool is full. */
+    spawn: function () {
+      for (var j = 0; j < cap; j++) {
+        if (!items[j].alive) { items[j].alive = true; return items[j]; }
+      }
+      return null;
+    },
+    clear: function () { for (var k = 0; k < cap; k++) items[k].alive = false; },
+    forEach: function (fn) {
+      for (var m = 0; m < cap; m++) if (items[m].alive) fn(items[m], m);
+    },
+    count: function () {
+      var n = 0;
+      for (var q = 0; q < cap; q++) if (items[q].alive) n++;
+      return n;
+    },
+  };
+}
+
+/** Standard particle burst helpers, shared so debris looks alike everywhere. */
+function makeParticles(capacity) {
+  var pool = makePool(function () {
+    return { alive: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 3, color: COL.a2 };
+  }, capacity || 64);
+
+  pool.burst = function (x, y, count, color, opts) {
+    var o = opts || {};
+    var spd = num(o.speed, 0.18);
+    var spread = num(o.spread, Math.PI * 2);
+    var dir = num(o.dir, 0);
+    for (var i = 0; i < count; i++) {
+      var p = pool.spawn();
+      if (!p) return;
+      var ang = dir + (rnd() - 0.5) * spread;
+      var v = spd * (0.4 + rnd() * 0.9);
+      p.x = num(x, 0); p.y = num(y, 0);
+      p.vx = Math.cos(ang) * v;
+      p.vy = Math.sin(ang) * v;
+      p.max = num(o.life, 480) * (0.6 + rnd() * 0.7);
+      p.life = p.max;
+      p.size = num(o.size, 4) * (0.6 + rnd() * 0.8);
+      p.color = color || COL.a2;
+    }
+  };
+
+  pool.update = function (dt, gravity) {
+    var g = num(gravity, 0.00045);
+    pool.forEach(function (p) {
+      p.life -= dt;
+      if (p.life <= 0) { p.alive = false; return; }
+      p.vy += g * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    });
+  };
+
+  pool.draw = function (c) {
+    pool.forEach(function (p) {
+      var a = clamp(p.life / p.max, 0, 1);
+      c.globalAlpha = a;
+      c.fillStyle = p.color;
+      var s = Math.max(0.5, p.size * a);
+      c.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+    });
+    c.globalAlpha = 1;
+  };
+
+  return pool;
+}
+
+/* ===== core/system.js ============================================ */
+/*
+ * Cabinet control: shut down, restart, and Bluetooth pairing.
+ *
+ * Yanking mains power is the single biggest cause of SD card corruption on a
+ * Pi, so the front end has to offer a real way out. Chromium in a kiosk cannot
+ * call poweroff itself, so setup-arcade.sh installs `arcadeos-agent`, a tiny
+ * Python service bound to 127.0.0.1:8127 that accepts three commands.
+ *
+ * This is loopback IPC, not networking: the request never leaves the machine,
+ * there is no external host, and the cabinet still works with the NIC down. If
+ * the agent is not installed the call fails harmlessly and the UI says so —
+ * the front end degrades, it does not break.
+ */
+
+var System = (function () {
+  var ENDPOINT = 'http://127.0.0.1:8127/';
+  var lastResult = '';
+
+  function send(command, onDone) {
+    lastResult = 'pending';
+    var done = function (ok, detail) {
+      lastResult = ok ? 'ok' : ('failed: ' + detail);
+      if (onDone) { try { onDone(ok, detail); } catch (e) { /* ignore */ } }
+    };
+
+    if (typeof fetch !== 'function') { done(false, 'no fetch'); return; }
+    try {
+      fetch(ENDPOINT + encodeURIComponent(command), {
+        method: 'POST',
+        cache: 'no-store',
+        /* The agent replies then exits; a hung socket must not wedge the UI. */
+        keepalive: true,
+      }).then(function (res) {
+        done(!!(res && res.ok), res ? String(res.status) : 'no response');
+      }, function (err) {
+        done(false, String(err && err.message ? err.message : err));
+      });
+    } catch (e) {
+      done(false, String(e && e.message ? e.message : e));
+    }
+  }
+
+  return {
+    /** command: 'shutdown' | 'restart' | 'pair' */
+    request: function (command, onDone) {
+      if (command !== 'shutdown' && command !== 'restart' && command !== 'pair') return;
+      send(command, onDone);
+    },
+    pair: function (onDone) { send('pair', onDone); },
+    endpoint: function () { return ENDPOINT; },
+    lastResult: function () { return lastResult; },
+  };
+})();
+
+/* ===== games/tetris.js =========================================== */
+/*
+ * TETRIS — the flagship. 10x20 well, 7-bag randomiser, ghost piece, hold,
+ * lock delay, soft/hard drop.
+ *
+ * Controls (d-pad + one button is enough to play; hold is optional):
+ *   left/right  move          up       rotate clockwise
+ *   down        soft drop     confirm  hard drop
+ *   alt         hold          pause    pause
+ */
+
+var TETRIS = (function () {
+  var COLS = 10, ROWS = 20;
+  var CELL = 42;
+  var BX = 20, BY = 108;              /* board origin in game space */
+  var PANEL_X = BX + COLS * CELL + 10; /* 450 */
+  var PANEL_W = GW - PANEL_X - 10;     /* 140 */
+
+  var NAMES = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'];
+
+  /* Spawn shapes on a 4x4 grid, as [col,row] cells. */
+  var BASE = {
+    I: [[0, 1], [1, 1], [2, 1], [3, 1]],
+    O: [[1, 0], [2, 0], [1, 1], [2, 1]],
+    T: [[1, 0], [0, 1], [1, 1], [2, 1]],
+    S: [[1, 0], [2, 0], [0, 1], [1, 1]],
+    Z: [[0, 0], [1, 0], [1, 1], [2, 1]],
+    J: [[0, 0], [0, 1], [1, 1], [2, 1]],
+    L: [[2, 0], [0, 1], [1, 1], [2, 1]],
+  };
+
+  /**
+   * Rotations are precomputed at load. Rotating in update() would allocate
+   * four arrays per keypress; a Pi 4 notices that kind of churn.
+   */
+  var SHAPES = {};
+  (function build() {
+    for (var n = 0; n < NAMES.length; n++) {
+      var name = NAMES[n];
+      var size = (name === 'I') ? 4 : (name === 'O') ? 4 : 3;
+      var states = [BASE[name]];
+      for (var r = 1; r < 4; r++) {
+        var prev = states[r - 1];
+        var next = [];
+        for (var i = 0; i < prev.length; i++) {
+          var x = prev[i][0], y = prev[i][1];
+          /* clockwise within an size x size box */
+          next.push([size - 1 - y, x]);
+        }
+        states.push(next);
+      }
+      SHAPES[name] = states;
+    }
+  })();
+
+  /* Wall-kick candidates, tried in order. Not full SRS, but it handles every
+   * kick a player actually attempts and never wedges a piece. */
+  var KICKS = [[0, 0], [-1, 0], [1, 0], [-2, 0], [2, 0], [0, -1], [-1, -1], [1, -1]];
+
+  /* ------------------------------------------------------------ state --- */
+
+  var grid = new Int8Array(COLS * ROWS);
+  var bag = [];
+  var cur = { type: 0, rot: 0, x: 0, y: 0 };
+  var nextQueue = [];
+  var holdType = -1;
+  var holdUsed = false;
+
+  var score = 0, lines = 0, level = 1;
+  var dropTimer = 0, lockTimer = 0, grounded = false;
+  var clearing = null, clearTimer = 0;
+  var over = false;
+  var shakeT = 0;
+  var dasL = makeRepeater(170, 50);
+  var dasR = makeRepeater(170, 50);
+  var dasD = makeRepeater(60, 40);
+  var particles = makeParticles(72);
+
+  function idx(x, y) { return y * COLS + x; }
+
+  function refillBag() {
+    /* 7-bag: every piece appears once per bag, Fisher-Yates shuffled. */
+    var b = [0, 1, 2, 3, 4, 5, 6];
+    for (var i = b.length - 1; i > 0; i--) {
+      var j = rndInt(0, i);
+      var t = b[i]; b[i] = b[j]; b[j] = t;
+    }
+    for (var k = 0; k < b.length; k++) bag.push(b[k]);
+  }
+
+  function nextType() {
+    if (bag.length === 0) refillBag();
+    return bag.shift();
+  }
+
+  function cells(type, rot) {
+    return SHAPES[NAMES[type]][((rot % 4) + 4) % 4];
+  }
+
+  function collides(type, rot, px, py) {
+    var cs = cells(type, rot);
+    for (var i = 0; i < cs.length; i++) {
+      var x = px + cs[i][0];
+      var y = py + cs[i][1];
+      if (x < 0 || x >= COLS || y >= ROWS) return true;
+      if (y >= 0 && grid[idx(x, y)] !== 0) return true;
+    }
+    return false;
+  }
+
+  function spawn(type) {
+    cur.type = type;
+    cur.rot = 0;
+    cur.x = (type === 0) ? 3 : 3;
+    cur.y = -1;
+    holdUsed = false;
+    dropTimer = 0;
+    lockTimer = 0;
+    grounded = false;
+    if (collides(cur.type, cur.rot, cur.x, cur.y)) {
+      topOut();
+    }
+  }
+
+  function pullNext() {
+    while (nextQueue.length < 3) nextQueue.push(nextType());
+    spawn(nextQueue.shift());
+  }
+
+  function topOut() {
+    if (over) return;
+    over = true;
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 400);
+    Shell.gameOver(score);
+  }
+
+  /* ----------------------------------------------------------- moves --- */
+
+  function tryMove(dx, dy) {
+    if (collides(cur.type, cur.rot, cur.x + dx, cur.y + dy)) return false;
+    cur.x += dx;
+    cur.y += dy;
+    return true;
+  }
+
+  function tryRotate(dir) {
+    var nr = (cur.rot + dir + 4) % 4;
+    for (var i = 0; i < KICKS.length; i++) {
+      var kx = KICKS[i][0], ky = KICKS[i][1];
+      if (!collides(cur.type, nr, cur.x + kx, cur.y + ky)) {
+        cur.rot = nr;
+        cur.x += kx;
+        cur.y += ky;
+        Audio2.sfx('rotate');
+        /* Any successful move resets lock delay — this is what makes the
+         * piece feel alive rather than glued down. */
+        if (grounded) lockTimer = 0;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function ghostY() {
+    var y = cur.y;
+    while (!collides(cur.type, cur.rot, cur.x, y + 1)) y++;
+    return y;
+  }
+
+  function hardDrop() {
+    var target = ghostY();
+    var dist = target - cur.y;
+    if (dist > 0) score += dist * 2;
+    cur.y = target;
+    Audio2.sfx('drop');
+    Input.rumble(0.35, 0.2, 70);
+    shakeT = 140;
+    lockPiece();
+  }
+
+  function doHold() {
+    if (holdUsed) { Audio2.sfx('denied'); return; }
+    var prev = holdType;
+    holdType = cur.type;
+    holdUsed = true;
+    if (prev === -1) pullNext();
+    else spawn(prev);
+    holdUsed = true;
+    Audio2.sfx('select');
+  }
+
+  function lockPiece() {
+    var cs = cells(cur.type, cur.rot);
+    var above = false;
+    for (var i = 0; i < cs.length; i++) {
+      var x = cur.x + cs[i][0];
+      var y = cur.y + cs[i][1];
+      if (y < 0) { above = true; continue; }
+      if (x >= 0 && x < COLS && y < ROWS) grid[idx(x, y)] = cur.type + 1;
+    }
+    if (above) { topOut(); return; }
+
+    var full = [];
+    for (var r = 0; r < ROWS; r++) {
+      var solid = true;
+      for (var c = 0; c < COLS; c++) {
+        if (grid[idx(c, r)] === 0) { solid = false; break; }
+      }
+      if (solid) full.push(r);
+    }
+
+    if (full.length) {
+      clearing = full;
+      clearTimer = 280;
+      Audio2.sfx('clear', full.length);
+      Input.rumble(0.5, 0.4, 120 + full.length * 40);
+      for (var f = 0; f < full.length; f++) {
+        var py = BY + full[f] * CELL + CELL / 2;
+        particles.burst(BX + GW * 0.0 + COLS * CELL / 2, py, 10, ACCENT.tetris,
+          { speed: 0.34, life: 420, size: 5 });
+      }
+    } else {
+      Audio2.sfx('lock');
+      pullNext();
+    }
+  }
+
+  function finishClear() {
+    var rows = clearing;
+    clearing = null;
+    if (!rows) return;
+
+    /* Collapse from the bottom up. */
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      for (var y = r; y > 0; y--) {
+        for (var c = 0; c < COLS; c++) grid[idx(c, y)] = grid[idx(c, y - 1)];
+      }
+      for (var c2 = 0; c2 < COLS; c2++) grid[idx(c2, 0)] = 0;
+    }
+
+    var n = rows.length;
+    var award = [0, 100, 300, 500, 800][n] || 0;
+    score += award * level;
+    lines += n;
+    level = 1 + Math.floor(lines / 10);
+    pullNext();
+  }
+
+  function gravityMs() {
+    return Math.max(60, 800 - (level - 1) * 70);
+  }
+
+  /* -------------------------------------------------------- lifecycle --- */
+
+  function start() {
+    grid = new Int8Array(COLS * ROWS);
+    bag = [];
+    nextQueue = [];
+    holdType = -1;
+    holdUsed = false;
+    score = 0; lines = 0; level = 1;
+    dropTimer = 0; lockTimer = 0; grounded = false;
+    clearing = null; clearTimer = 0;
+    over = false; shakeT = 0;
+    dasL.reset(); dasR.reset(); dasD.reset();
+    particles.clear();
+    refillBag();
+    pullNext();
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0004);
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+    if (over) return;
+
+    if (clearing) {
+      clearTimer -= dt;
+      if (clearTimer <= 0) finishClear();
+      return;
+    }
+
+    /* Horizontal movement with its own DAS. */
+    var stepsL = dasL.step(Input.down('left'), dt);
+    var stepsR = dasR.step(Input.down('right'), dt);
+    var i;
+    for (i = 0; i < stepsL; i++) if (tryMove(-1, 0) && grounded) lockTimer = 0;
+    for (i = 0; i < stepsR; i++) if (tryMove(1, 0) && grounded) lockTimer = 0;
+    if (stepsL || stepsR) Audio2.sfx('move');
+
+    if (Input.hit('up')) tryRotate(1);
+    if (Input.hit('alt')) doHold();
+    if (Input.hit('confirm')) { hardDrop(); return; }
+
+    /* Soft drop. */
+    var soft = dasD.step(Input.down('down'), dt);
+    for (i = 0; i < soft; i++) {
+      if (tryMove(0, 1)) { score += 1; dropTimer = 0; }
+    }
+
+    /* Gravity. */
+    dropTimer += dt;
+    var g = gravityMs();
+    while (dropTimer >= g) {
+      dropTimer -= g;
+      if (!tryMove(0, 1)) break;
+    }
+
+    /* Lock delay: 500ms of grace once the piece is resting. */
+    grounded = collides(cur.type, cur.rot, cur.x, cur.y + 1);
+    if (grounded) {
+      lockTimer += dt;
+      if (lockTimer >= 500) lockPiece();
+    } else {
+      lockTimer = 0;
+    }
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawCell(c, col, row, type, mode) {
+    if (row < 0) return;
+    tile(c, BX + col * CELL, BY + row * CELL, CELL,
+      PIECE_COL[NAMES[type]][0], PIECE_COL[NAMES[type]][1], mode);
+  }
+
+  function drawWell(c) {
+    /* Well backing and column guides. */
+    panel(c, BX - 6, BY - 6, COLS * CELL + 12, ROWS * CELL + 12, {
+      fill: 'rgba(8,6,18,0.55)', stroke: rgba(ACCENT.tetris, 0.22), radius: 12,
+    });
+    c.globalAlpha = 0.06;
+    c.strokeStyle = COL.a2;
+    c.lineWidth = 1;
+    for (var x = 1; x < COLS; x++) {
+      c.beginPath();
+      c.moveTo(BX + x * CELL, BY);
+      c.lineTo(BX + x * CELL, BY + ROWS * CELL);
+      c.stroke();
+    }
+    c.globalAlpha = 1;
+  }
+
+  function drawMini(c, type, cx, cy, size) {
+    var cs = cells(type, 0);
+    var minX = 9, maxX = -9, minY = 9, maxY = -9;
+    for (var i = 0; i < cs.length; i++) {
+      minX = Math.min(minX, cs[i][0]); maxX = Math.max(maxX, cs[i][0]);
+      minY = Math.min(minY, cs[i][1]); maxY = Math.max(maxY, cs[i][1]);
+    }
+    var w = (maxX - minX + 1) * size, h = (maxY - minY + 1) * size;
+    var x0 = cx - w / 2 - minX * size;
+    var y0 = cy - h / 2 - minY * size;
+    for (var j = 0; j < cs.length; j++) {
+      tile(c, x0 + cs[j][0] * size, y0 + cs[j][1] * size, size,
+        PIECE_COL[NAMES[type]][0], PIECE_COL[NAMES[type]][1], 'solid');
+    }
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.tetris);
+    gHud(ACCENT.tetris, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'LINES', value: pad(lines, 3) },
+      { label: 'LEVEL', value: pad(level, 2) },
+    ]);
+
+    c.save();
+    if (shakeT > 0) {
+      var k = shakeT / 140;
+      c.translate(0, Math.sin(shakeT * 0.9) * 3 * k);
+    }
+
+    drawWell(c);
+
+    /* Settled blocks. */
+    for (var r = 0; r < ROWS; r++) {
+      var flashing = false;
+      if (clearing) {
+        for (var q = 0; q < clearing.length; q++) if (clearing[q] === r) flashing = true;
+      }
+      for (var col = 0; col < COLS; col++) {
+        var v = grid[idx(col, r)];
+        if (v === 0) continue;
+        drawCell(c, col, r, v - 1, flashing ? 'flash' : 'solid');
+      }
+    }
+
+    if (!over && !clearing) {
+      /* Ghost, then the live piece on top. */
+      var gy = ghostY();
+      var cs = cells(cur.type, cur.rot);
+      var i;
+      for (i = 0; i < cs.length; i++) {
+        drawCell(c, cur.x + cs[i][0], gy + cs[i][1], cur.type, 'ghost');
+      }
+      for (i = 0; i < cs.length; i++) {
+        drawCell(c, cur.x + cs[i][0], cur.y + cs[i][1], cur.type, 'glow');
+      }
+    }
+
+    particles.draw(c);
+    c.restore();
+
+    /* Side panel: next queue and hold. */
+    var py = BY - 6;
+    text(c, 'NEXT', PANEL_X + PANEL_W / 2, py + 20, {
+      size: 12, track: 2.6, color: COL.text2, align: 'center',
+    });
+    for (var n = 0; n < nextQueue.length && n < 3; n++) {
+      var by = py + 40 + n * 78;
+      panel(c, PANEL_X, by, PANEL_W, 68, {
+        fill: 'rgba(12,9,26,0.5)', stroke: COL.cardLine, radius: 12,
+      });
+      drawMini(c, nextQueue[n], PANEL_X + PANEL_W / 2, by + 34, 15);
+    }
+
+    var hy = py + 40 + 3 * 78 + 24;
+    text(c, 'HOLD', PANEL_X + PANEL_W / 2, hy - 10, {
+      size: 12, track: 2.6, color: COL.text2, align: 'center',
+    });
+    panel(c, PANEL_X, hy, PANEL_W, 68, {
+      fill: 'rgba(12,9,26,0.5)',
+      stroke: holdUsed ? 'rgba(140,150,255,.06)' : COL.cardLine,
+      radius: 12,
+    });
+    if (holdType >= 0) {
+      c.globalAlpha = holdUsed ? 0.35 : 1;
+      drawMini(c, holdType, PANEL_X + PANEL_W / 2, hy + 34, 15);
+      c.globalAlpha = 1;
+    }
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  /* A short scripted loop: a piece falls into a partial stack and locks. */
+  var PREV_STACK = [
+    [0, 0, 1, 1, 0, 0],
+    [0, 1, 1, 1, 1, 0],
+    [1, 1, 1, 0, 1, 1],
+  ];
+
+  function preview(c, w, h, t) {
+    var cols = 6;
+    var s = Math.min(w / (cols + 1.2), h / 7.2);
+    var ox = (w - cols * s) / 2;
+    var oy = h - PREV_STACK.length * s - s * 0.5;
+
+    for (var r = 0; r < PREV_STACK.length; r++) {
+      for (var col = 0; col < cols; col++) {
+        if (!PREV_STACK[r][col]) continue;
+        var type = (col + r) % 7;
+        tile(c, ox + col * s, oy + r * s, s,
+          PIECE_COL[NAMES[type]][0], PIECE_COL[NAMES[type]][1], 'solid');
+      }
+    }
+
+    /* Falling T piece on a 2.4s loop. */
+    var loop = (t % 2400) / 2400;
+    var fall = Math.min(1, loop / 0.78);
+    var fy = lerp(-s * 1.5, oy - 2 * s, fall);
+    var cs = SHAPES.T[0];
+    var landed = fall >= 1;
+    for (var i = 0; i < cs.length; i++) {
+      tile(c, ox + (cs[i][0] + 1.5) * s, fy + cs[i][1] * s, s,
+        PIECE_COL.T[0], PIECE_COL.T[1], landed ? 'flash' : 'glow');
+    }
+  }
+
+  return registerGame({
+    id: 'tetris',
+    title: 'TETRIS',
+    tag: 'Stack, clear, survive the climb',
+    accent: ACCENT.tetris,
+    hint: 'UP rotate · A hard drop · X hold',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+    /* Exposed for the versus mode, which reuses this engine's rules. */
+    _internals: {
+      COLS: COLS, ROWS: ROWS, NAMES: NAMES, SHAPES: SHAPES, KICKS: KICKS,
+    },
+  });
+})();
+
+/* ===== games/ascent.js =========================================== */
+/*
+ * ASCENT — vertical shoot-'em-up. The screen scrolls down past you as you
+ * climb; waves descend to meet you.
+ *
+ * Everything that moves lives in a fixed pool. update() and draw() perform no
+ * allocation at all, which is what keeps frame times flat on a Pi 4 instead of
+ * sawtoothing around GC pauses.
+ *
+ * Controls: d-pad to fly, confirm to fire (hold for auto), pause to pause.
+ */
+
+var ASCENT = (function () {
+  var PAD = 16;
+  var TOP = HUD_H + 8;
+  var BOT = GH - 16;
+  var LEFT = PAD, RIGHT = GW - PAD;
+
+  var SHIP_R = 15;
+  var SPEED = 0.42;         /* px per ms */
+  var FIRE_MS = 155;
+  var BULLET_SPD = 0.92;
+
+  var ship = { x: GW / 2, y: BOT - 90, inv: 0 };
+  var lives = 3, score = 0, wave = 1, over = false;
+  var fireTimer = 0, spawnTimer = 0, waveTimer = 0;
+  var shakeT = 0;
+
+  var bullets = makePool(function () {
+    return { alive: false, x: 0, y: 0, vy: 0, vx: 0 };
+  }, 48);
+
+  var foes = makePool(function () {
+    return { alive: false, x: 0, y: 0, vx: 0, vy: 0, hp: 1, kind: 0, t: 0, r: 16, seed: 0 };
+  }, 36);
+
+  var stars = makePool(function () {
+    return { alive: false, x: 0, y: 0, v: 0, s: 1 };
+  }, 60);
+
+  var particles = makeParticles(96);
+
+  var KINDS = [
+    /* 0 drifter: sine weave, 1hp  */ { hp: 1, r: 17, vy: 0.10, score: 100, col: '#F0645E' },
+    /* 1 diver:   straight, fast   */ { hp: 1, r: 14, vy: 0.26, score: 150, col: '#F0C64E' },
+    /* 2 tank:    slow, 3hp        */ { hp: 3, r: 24, vy: 0.06, score: 400, col: '#A46BF0' },
+  ];
+
+  function seedStars() {
+    stars.clear();
+    for (var i = 0; i < stars.capacity; i++) {
+      var s = stars.spawn();
+      if (!s) break;
+      s.x = rndRange(LEFT, RIGHT);
+      s.y = rndRange(TOP, BOT);
+      s.v = rndRange(0.04, 0.20);
+      s.s = s.v > 0.14 ? 2 : 1;
+    }
+  }
+
+  function start() {
+    ship.x = GW / 2; ship.y = BOT - 90; ship.inv = 0;
+    lives = 3; score = 0; wave = 1; over = false;
+    fireTimer = 0; spawnTimer = 600; waveTimer = 0; shakeT = 0;
+    bullets.clear();
+    foes.clear();
+    particles.clear();
+    seedStars();
+  }
+
+  function fire() {
+    var b = bullets.spawn();
+    if (!b) return;
+    b.x = ship.x; b.y = ship.y - SHIP_R - 2;
+    b.vy = -BULLET_SPD; b.vx = 0;
+    Audio2.tone({ freq: 900, freq2: 1400, dur: 0.045, type: 'square', gain: 0.06 });
+  }
+
+  function spawnFoe() {
+    var f = foes.spawn();
+    if (!f) return;
+    /* Tanks only appear from wave 3; divers from wave 2. */
+    var maxKind = wave >= 3 ? 3 : wave >= 2 ? 2 : 1;
+    var k = rndInt(0, maxKind - 1);
+    var def = KINDS[k];
+    f.kind = k;
+    f.hp = def.hp;
+    f.r = def.r;
+    f.x = rndRange(LEFT + def.r, RIGHT - def.r);
+    f.y = TOP - def.r - 10;
+    f.vy = def.vy * (1 + (wave - 1) * 0.10);
+    f.vx = (k === 0) ? rndRange(-0.06, 0.06) : 0;
+    f.t = 0;
+    f.seed = rnd() * 6.283;
+  }
+
+  function killFoe(f) {
+    var def = KINDS[f.kind];
+    f.alive = false;
+    score += def.score;
+    particles.burst(f.x, f.y, 12, def.col, { speed: 0.28, life: 460, size: 5 });
+    Audio2.sfx('hit');
+  }
+
+  function hitShip() {
+    if (ship.inv > 0 || over) return;
+    lives--;
+    ship.inv = 1600;
+    shakeT = 260;
+    particles.burst(ship.x, ship.y, 22, ACCENT.ascent, { speed: 0.36, life: 620, size: 6 });
+    Audio2.sfx('over');
+    Input.rumble(0.9, 0.7, 260);
+    if (lives <= 0) {
+      over = true;
+      Shell.gameOver(score);
+    }
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0002);
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+
+    /* Starfield runs even after death so the screen never freezes. */
+    stars.forEach(function (s) {
+      s.y += s.v * dt;
+      if (s.y > BOT) { s.y = TOP; s.x = rndRange(LEFT, RIGHT); }
+    });
+
+    if (over) return;
+
+    if (ship.inv > 0) ship.inv = Math.max(0, ship.inv - dt);
+
+    /* Flight. */
+    var dx = (Input.down('right') ? 1 : 0) - (Input.down('left') ? 1 : 0);
+    var dy = (Input.down('down') ? 1 : 0) - (Input.down('up') ? 1 : 0);
+    if (dx && dy) { dx *= 0.7071; dy *= 0.7071; }
+    ship.x = clamp(ship.x + dx * SPEED * dt, LEFT + SHIP_R, RIGHT - SHIP_R);
+    ship.y = clamp(ship.y + dy * SPEED * dt, TOP + SHIP_R + 40, BOT - SHIP_R);
+
+    /* Firing. */
+    fireTimer -= dt;
+    if (Input.down('confirm') && fireTimer <= 0) {
+      fire();
+      fireTimer = FIRE_MS;
+    }
+
+    /* Wave pacing. */
+    waveTimer += dt;
+    if (waveTimer > 18000) { waveTimer = 0; wave++; Audio2.sfx('powerup'); }
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnFoe();
+      spawnTimer = Math.max(260, 900 - wave * 55) * rndRange(0.7, 1.3);
+    }
+
+    /* Bullets. */
+    bullets.forEach(function (b) {
+      b.y += b.vy * dt;
+      b.x += b.vx * dt;
+      if (b.y < TOP - 20 || b.y > BOT + 20) b.alive = false;
+    });
+
+    /* Foes, and bullet/ship collisions. */
+    foes.forEach(function (f) {
+      f.t += dt;
+      f.y += f.vy * dt;
+      if (f.kind === 0) {
+        f.x += Math.sin(f.t * 0.0022 + f.seed) * 0.13 * dt * 0.5 + f.vx * dt;
+        f.x = clamp(f.x, LEFT + f.r, RIGHT - f.r);
+      }
+      if (f.y > BOT + f.r) { f.alive = false; return; }
+
+      bullets.forEach(function (b) {
+        if (!b.alive || !f.alive) return;
+        var ddx = b.x - f.x, ddy = b.y - f.y;
+        if (ddx * ddx + ddy * ddy < f.r * f.r) {
+          b.alive = false;
+          f.hp--;
+          if (f.hp <= 0) killFoe(f);
+          else particles.burst(b.x, b.y, 3, '#FFFFFF', { speed: 0.14, life: 200, size: 3 });
+        }
+      });
+
+      if (!f.alive) return;
+      var sdx = ship.x - f.x, sdy = ship.y - f.y;
+      var rr = f.r + SHIP_R * 0.75;
+      if (sdx * sdx + sdy * sdy < rr * rr) {
+        f.alive = false;
+        particles.burst(f.x, f.y, 10, KINDS[f.kind].col, { speed: 0.3, life: 400, size: 5 });
+        hitShip();
+      }
+    });
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawShip(c, x, y, r, accent, thrust) {
+    c.beginPath();
+    c.moveTo(x, y - r);
+    c.lineTo(x + r * 0.78, y + r * 0.82);
+    c.lineTo(x, y + r * 0.44);
+    c.lineTo(x - r * 0.78, y + r * 0.82);
+    c.closePath();
+    var g = c.createLinearGradient(x, y - r, x, y + r);
+    g.addColorStop(0, shade(accent, 0.5));
+    g.addColorStop(1, accent);
+    c.fillStyle = g;
+    c.fill();
+    c.strokeStyle = rgba(shade(accent, 0.6), 0.7);
+    c.lineWidth = 1.5;
+    c.stroke();
+    if (thrust) {
+      c.globalAlpha = 0.8;
+      c.fillStyle = '#F0C64E';
+      c.beginPath();
+      c.moveTo(x - r * 0.26, y + r * 0.6);
+      c.lineTo(x, y + r * (0.9 + thrust * 0.7));
+      c.lineTo(x + r * 0.26, y + r * 0.6);
+      c.closePath();
+      c.fill();
+      c.globalAlpha = 1;
+    }
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.ascent);
+    gHud(ACCENT.ascent, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'WAVE', value: pad(wave, 2) },
+      { label: 'SHIPS', value: String(Math.max(0, lives)), color: lives <= 1 ? COL.bad : COL.data },
+    ]);
+
+    c.save();
+    if (shakeT > 0) {
+      var k = shakeT / 260;
+      c.translate(Math.sin(shakeT * 1.1) * 5 * k, Math.cos(shakeT * 0.9) * 4 * k);
+    }
+
+    /* Clip so debris never escapes the play frame. */
+    c.save();
+    roundRect(c, PAD - 8, TOP - 8, GW - (PAD - 8) * 2, BOT - TOP + 16, COL.radius);
+    c.clip();
+
+    stars.forEach(function (s) {
+      c.globalAlpha = s.s === 2 ? 0.55 : 0.28;
+      c.fillStyle = s.s === 2 ? COL.a1 : COL.text2;
+      c.fillRect(s.x, s.y, s.s, s.s * 2);
+    });
+    c.globalAlpha = 1;
+
+    bullets.forEach(function (b) {
+      Render.glow(c, b.x, b.y, 10, ACCENT.ascent, 0.7);
+      c.fillStyle = '#EFEDFF';
+      c.fillRect(b.x - 1.5, b.y - 8, 3, 12);
+    });
+
+    foes.forEach(function (f) {
+      var def = KINDS[f.kind];
+      Render.glow(c, f.x, f.y, f.r * 1.6, def.col, 0.5);
+      if (f.kind === 2) {
+        tile(c, f.x - f.r, f.y - f.r, f.r * 2, def.col, shade(def.col, 0.35), 'solid');
+        c.fillStyle = rgba('#07050E', 0.6);
+        c.fillRect(f.x - f.r * 0.5, f.y - 3, f.r * (f.hp / 3), 6);
+      } else {
+        drawShip(c, f.x, f.y + f.r, f.r, def.col, 0);
+      }
+    });
+
+    particles.draw(c);
+
+    if (!over) {
+      var blink = ship.inv > 0 && (Math.floor(ship.inv / 90) % 2 === 0);
+      if (!blink) {
+        Render.glow(c, ship.x, ship.y, SHIP_R * 2.6, ACCENT.ascent, 0.6);
+        drawShip(c, ship.x, ship.y, SHIP_R, ACCENT.ascent,
+          Input.down('up') ? 1 : 0.45);
+      }
+    }
+
+    c.restore();
+    c.restore();
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  function preview(c, w, h, t) {
+    var cx = w / 2 + Math.sin(t * 0.0016) * w * 0.22;
+    var sy = h * 0.74;
+    var r = Math.min(w, h) * 0.11;
+
+    /* two descending foes on staggered loops */
+    for (var i = 0; i < 2; i++) {
+      var ph = ((t * 0.00035) + i * 0.5) % 1;
+      var fx = w * (0.3 + i * 0.4);
+      var fy = lerp(-r, h * 0.62, ph);
+      var col = KINDS[i].col;
+      Render.glow(c, fx, fy, r * 1.6, col, 0.5);
+      drawShip(c, fx, fy + r, r * 0.8, col, 0);
+    }
+
+    /* bullet stream */
+    for (var b = 0; b < 3; b++) {
+      var by = sy - r - ((t * 0.35 + b * 46) % (h * 0.62));
+      c.globalAlpha = 0.9;
+      c.fillStyle = '#EFEDFF';
+      c.fillRect(cx - 1.5, by, 3, 10);
+    }
+    c.globalAlpha = 1;
+
+    Render.glow(c, cx, sy, r * 2.4, ACCENT.ascent, 0.6);
+    drawShip(c, cx, sy, r, ACCENT.ascent, 0.6 + Math.sin(t * 0.02) * 0.25);
+  }
+
+  return registerGame({
+    id: 'ascent',
+    title: 'ASCENT',
+    tag: 'Fly the gauntlet, climb the waves',
+    accent: ACCENT.ascent,
+    hint: 'D-PAD fly · A fire',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+  });
+})();
+
+/* ===== games/stack.js ============================================ */
+/*
+ * STACK — the tower builder. A slab sweeps across the top of the tower; drop
+ * it, and whatever hangs over the edge is sheared off. Miss entirely and the
+ * tower is done.
+ *
+ * Portrait is the whole point: the tower grows straight up the panel and the
+ * camera pans down to follow it.
+ *
+ * Controls: confirm to drop. That is the entire game.
+ */
+
+var STACK = (function () {
+  var ROW_H = 34;
+  var CUR_Y = 470;            /* the sweeping slab sits here, always */
+  var LEFT = 40, RIGHT = GW - 40;
+  var START_W = 300;
+  var VISIBLE = Math.ceil((GH - HUD_H) / ROW_H) + 2;
+
+  /* Palette cycles through the tetromino stops so the tower reads as a ramp. */
+  var RAMP = ['I', 'S', 'O', 'L', 'Z', 'T', 'J'];
+
+  var rows = [];              /* [{x, w, k}] bottom-first */
+  var cur = { x: 0, w: START_W, dir: 1, speed: 0.26, k: 0 };
+  var offset = 0;             /* camera easing after a placement */
+  var score = 0, streak = 0, best = 0, over = false;
+  var flashRow = -1, flashT = 0;
+  var shards = makePool(function () {
+    return { alive: false, x: 0, y: 0, w: 0, vx: 0, vy: 0, life: 0, max: 1, k: 0 };
+  }, 16);
+  var particles = makeParticles(48);
+
+  function colOf(k) {
+    var name = RAMP[((k % RAMP.length) + RAMP.length) % RAMP.length];
+    return PIECE_COL[name];
+  }
+
+  function speedFor(n) {
+    return Math.min(0.62, 0.26 + n * 0.011);
+  }
+
+  function start() {
+    rows.length = 0;
+    rows.push({ x: (GW - START_W) / 2, w: START_W, k: 0 });
+    cur.w = START_W;
+    cur.k = 1;
+    cur.dir = 1;
+    cur.speed = speedFor(0);
+    cur.x = LEFT;
+    offset = 0;
+    score = 0; streak = 0; over = false;
+    flashRow = -1; flashT = 0;
+    shards.clear();
+    particles.clear();
+  }
+
+  function rowY(i) {
+    /* Row i sits one row below the sweeping slab for each row above it. */
+    return CUR_Y + (rows.length - i) * ROW_H + offset;
+  }
+
+  function place() {
+    if (over) return;
+    var below = rows[rows.length - 1];
+    var l = Math.max(cur.x, below.x);
+    var r = Math.min(cur.x + cur.w, below.x + below.w);
+    var w = r - l;
+
+    if (w <= 0) {
+      over = true;
+      Audio2.sfx('over');
+      Input.rumble(0.9, 0.7, 300);
+      /* The whole slab falls away. */
+      shed(cur.x, cur.w, cur.k, 0);
+      Shell.gameOver(score);
+      return;
+    }
+
+    var perfect = Math.abs(cur.x - below.x) <= 2.5 && Math.abs(cur.w - w) <= 2.5;
+    if (perfect) {
+      streak++;
+      /* Reward a clean stack by giving a little width back. */
+      w = Math.min(below.w + 6, START_W);
+      l = below.x - (w - below.w) / 2;
+      score += 10 + streak * 5;
+      Audio2.sfx('powerup');
+      Input.rumble(0.25, 0.5, 90);
+      particles.burst(l + w / 2, CUR_Y + ROW_H / 2, 14, COL.a1,
+        { speed: 0.24, life: 480, size: 4 });
+    } else {
+      streak = 0;
+      score += 10;
+      Audio2.sfx('lock');
+      /* Shear the overhang and let it tumble. */
+      if (cur.x < l) shed(cur.x, l - cur.x, cur.k, -1);
+      if (cur.x + cur.w > r) shed(r, cur.x + cur.w - r, cur.k, 1);
+    }
+
+    rows.push({ x: l, w: w, k: cur.k });
+    if (rows.length > 400) rows.shift();
+    flashRow = rows.length - 1;
+    flashT = 160;
+
+    cur.k++;
+    cur.w = w;
+    cur.speed = speedFor(rows.length);
+    cur.dir = (rnd() < 0.5) ? 1 : -1;
+    cur.x = cur.dir > 0 ? LEFT : RIGHT - cur.w;
+    offset = -ROW_H;
+    if (score > best) best = score;
+  }
+
+  function shed(x, w, k, dir) {
+    var s = shards.spawn();
+    if (!s) return;
+    s.x = x; s.y = CUR_Y; s.w = w; s.k = k;
+    s.vx = dir * 0.12;
+    s.vy = -0.05;
+    s.max = 900; s.life = 900;
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0004);
+    offset = approach(offset, 0, 12, dt);
+    if (flashT > 0) flashT = Math.max(0, flashT - dt);
+
+    shards.forEach(function (s) {
+      s.life -= dt;
+      if (s.life <= 0) { s.alive = false; return; }
+      s.vy += 0.0022 * dt;
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+    });
+
+    if (over) return;
+
+    /* Sweep, bouncing off the walls. */
+    cur.x += cur.dir * cur.speed * dt;
+    if (cur.x <= LEFT) { cur.x = LEFT; cur.dir = 1; }
+    if (cur.x + cur.w >= RIGHT) { cur.x = RIGHT - cur.w; cur.dir = -1; }
+
+    if (Input.hit('confirm') || Input.hit('down')) place();
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function drawSlabRow(c, x, y, w, k, mode) {
+    var col = colOf(k);
+    slab(c, x, y, w, ROW_H - 3, col[0], col[1], mode);
+  }
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.stack);
+    gHud(ACCENT.stack, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'HEIGHT', value: pad(rows.length - 1, 3) },
+      { label: 'STREAK', value: pad(streak, 2), color: streak > 0 ? COL.a1 : COL.data },
+    ]);
+
+    c.save();
+    roundRect(c, 8, HUD_H - 4, GW - 16, GH - HUD_H - 4, COL.radius);
+    c.clip();
+
+    /* Only the rows that can actually be seen. */
+    var first = Math.max(0, rows.length - VISIBLE);
+    for (var i = first; i < rows.length; i++) {
+      var r = rows[i];
+      var y = rowY(i);
+      if (y > GH + ROW_H || y < HUD_H - ROW_H * 2) continue;
+      drawSlabRow(c, r.x, y, r.w, r.k, (i === flashRow && flashT > 0) ? 'flash' : 'solid');
+    }
+
+    shards.forEach(function (s) {
+      var a = clamp(s.life / s.max, 0, 1);
+      c.globalAlpha = a;
+      drawSlabRow(c, s.x, s.y, s.w, s.k, 'solid');
+      c.globalAlpha = 1;
+    });
+
+    particles.draw(c);
+
+    if (!over) {
+      drawSlabRow(c, cur.x, CUR_Y + offset, cur.w, cur.k, 'glow');
+      /* Drop guide down to the tower. */
+      c.globalAlpha = 0.16;
+      c.strokeStyle = ACCENT.stack;
+      c.lineWidth = 1;
+      c.beginPath();
+      c.moveTo(cur.x + cur.w / 2, CUR_Y + ROW_H);
+      c.lineTo(cur.x + cur.w / 2, rowY(rows.length - 1));
+      c.stroke();
+      c.globalAlpha = 1;
+    }
+
+    c.restore();
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  function preview(c, w, h, t) {
+    var rh = h / 7;
+    var baseW = w * 0.62;
+    /* four settled rows, each slightly narrower */
+    for (var i = 0; i < 4; i++) {
+      var rw = baseW - i * w * 0.06;
+      var col = colOf(i);
+      slab(c, (w - rw) / 2 + Math.sin(i * 1.3) * w * 0.03, h - (i + 1) * rh, rw, rh - 3,
+        col[0], col[1], 'solid');
+    }
+    /* sweeping slab on a 2s ping-pong */
+    var ph = (t % 2000) / 2000;
+    var tri = ph < 0.5 ? ph * 2 : (1 - ph) * 2;
+    var sw = baseW - 4 * w * 0.06;
+    var sx2 = lerp(w * 0.06, w - sw - w * 0.06, tri);
+    var scol = colOf(4);
+    slab(c, sx2, h - 5.6 * rh, sw, rh - 3, scol[0], scol[1], 'glow');
+  }
+
+  return registerGame({
+    id: 'stack',
+    title: 'STACK',
+    tag: 'Time the drop, build the tower',
+    accent: ACCENT.stack,
+    hint: 'A drop',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+  });
+})();
+
+/* ===== games/snake.js ============================================ */
+/*
+ * SNAKE — a tall 19x30 field, which changes the game: vertical runs are long
+ * and horizontal ones are tight, so the classic spiral strategy has to adapt.
+ *
+ * Direction changes are queued rather than applied immediately. At 60ms per
+ * step a player can easily press two directions inside one tick, and dropping
+ * the second one is the difference between "responsive" and "it ate my input".
+ *
+ * Controls: d-pad to turn.
+ */
+
+var SNAKE = (function () {
+  var COLS = 19, ROWS = 30, CELL = 28;
+  var X0 = Math.round((GW - COLS * CELL) / 2);
+  var Y0 = HUD_H + 24;
+
+  var DIRS = {
+    up: { x: 0, y: -1 }, down: { x: 0, y: 1 },
+    left: { x: -1, y: 0 }, right: { x: 1, y: 0 },
+  };
+
+  /* Body is a ring buffer of cell indices — no shift/unshift churn per tick. */
+  var body = new Int16Array(COLS * ROWS);
+  var head = 0, tail = 0, length = 0;
+  var occupied = new Uint8Array(COLS * ROWS);
+
+  var dir = DIRS.up, queued = [];
+  var food = -1, gold = -1, goldTimer = 0;
+  var stepMs = 140, acc = 0;
+  var score = 0, eaten = 0, over = false;
+  var eatFlash = 0;
+  var particles = makeParticles(48);
+
+  function idx(x, y) { return y * COLS + x; }
+  function cx(i) { return i % COLS; }
+  function cy(i) { return (i / COLS) | 0; }
+
+  function push(i) {
+    body[head] = i;
+    head = (head + 1) % body.length;
+    occupied[i] = 1;
+    length++;
+  }
+
+  function pop() {
+    var i = body[tail];
+    tail = (tail + 1) % body.length;
+    occupied[i] = 0;
+    length--;
+    return i;
+  }
+
+  function headCell() { return body[(head - 1 + body.length) % body.length]; }
+
+  function placeFood(exclude) {
+    /* Reservoir pick over free cells: uniform, and never loops forever when
+     * the board is nearly full. */
+    var chosen = -1, seen = 0;
+    for (var i = 0; i < COLS * ROWS; i++) {
+      if (occupied[i] || i === exclude) continue;
+      seen++;
+      if (rndInt(1, seen) === 1) chosen = i;
+    }
+    return chosen;
+  }
+
+  function start() {
+    head = 0; tail = 0; length = 0;
+    occupied = new Uint8Array(COLS * ROWS);
+    queued.length = 0;
+    dir = DIRS.up;
+    var sx2 = (COLS >> 1), sy2 = (ROWS >> 1) + 4;
+    push(idx(sx2, sy2 + 2));
+    push(idx(sx2, sy2 + 1));
+    push(idx(sx2, sy2));
+    food = placeFood(-1);
+    gold = -1; goldTimer = 9000;
+    stepMs = 140; acc = 0;
+    score = 0; eaten = 0; over = false;
+    eatFlash = 0;
+    particles.clear();
+  }
+
+  function turn(name) {
+    var d = DIRS[name];
+    if (!d) return;
+    /* Compare against the last queued direction, not the current one, so two
+     * quick turns in a row both land. */
+    var ref = queued.length ? queued[queued.length - 1] : dir;
+    if (d.x === -ref.x && d.y === -ref.y) return;   /* no 180s */
+    if (d.x === ref.x && d.y === ref.y) return;     /* no duplicates */
+    if (queued.length < 2) queued.push(d);
+  }
+
+  function die() {
+    if (over) return;
+    over = true;
+    var h = headCell();
+    particles.burst(X0 + cx(h) * CELL + CELL / 2, Y0 + cy(h) * CELL + CELL / 2,
+      18, ACCENT.snake, { speed: 0.3, life: 600, size: 5 });
+    Audio2.sfx('over');
+    Input.rumble(0.8, 0.6, 320);
+    Shell.gameOver(score);
+  }
+
+  function step() {
+    if (queued.length) dir = queued.shift();
+
+    var h = headCell();
+    var nx = cx(h) + dir.x;
+    var ny = cy(h) + dir.y;
+    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) { die(); return; }
+
+    var ni = idx(nx, ny);
+    var tailCell = body[tail];
+    /* Moving into the tail cell is legal — it vacates on this same tick. */
+    if (occupied[ni] && !(ni === tailCell && ni !== food && ni !== gold)) { die(); return; }
+
+    var ate = (ni === food), ateGold = (ni === gold);
+    if (!ate && !ateGold) pop();
+
+    push(ni);
+
+    if (ate) {
+      eaten++;
+      score += 10 + Math.floor(eaten / 5) * 5;
+      food = placeFood(ni);
+      stepMs = Math.max(60, 140 - eaten * 2.2);
+      eatFlash = 140;
+      Audio2.sfx('eat');
+      particles.burst(X0 + nx * CELL + CELL / 2, Y0 + ny * CELL + CELL / 2,
+        8, ACCENT.snake, { speed: 0.2, life: 340, size: 4 });
+      if (food < 0) { die(); return; }   /* board full: a perfect game */
+    } else if (ateGold) {
+      score += 100;
+      gold = -1;
+      goldTimer = 12000;
+      eatFlash = 220;
+      Audio2.sfx('powerup');
+      Input.rumble(0.4, 0.5, 120);
+      particles.burst(X0 + nx * CELL + CELL / 2, Y0 + ny * CELL + CELL / 2,
+        16, '#F0C64E', { speed: 0.28, life: 520, size: 5 });
+    }
+  }
+
+  function update(dt) {
+    particles.update(dt, 0.0003);
+    if (eatFlash > 0) eatFlash = Math.max(0, eatFlash - dt);
+    if (over) return;
+
+    if (Input.hit('up')) turn('up');
+    if (Input.hit('down')) turn('down');
+    if (Input.hit('left')) turn('left');
+    if (Input.hit('right')) turn('right');
+
+    /* Golden apple: appears for a while, then leaves. */
+    goldTimer -= dt;
+    if (goldTimer <= 0) {
+      if (gold >= 0) { gold = -1; goldTimer = 10000; }
+      else { gold = placeFood(food); goldTimer = 5000; }
+    }
+
+    acc += dt;
+    var guard = 0;
+    while (acc >= stepMs && !over && guard < 6) {
+      acc -= stepMs;
+      guard++;
+      step();
+    }
+    if (guard >= 6) acc = 0;
+  }
+
+  /* ------------------------------------------------------------ draw --- */
+
+  function draw() {
+    var c = gx;
+    gBackdrop(ACCENT.snake);
+    gHud(ACCENT.snake, [
+      { label: 'SCORE', value: fmtScore(score) },
+      { label: 'LENGTH', value: pad(length, 3) },
+      { label: 'SPEED', value: pad(Math.round(1000 / stepMs), 2) },
+    ]);
+
+    /* Field. */
+    panel(c, X0 - 8, Y0 - 8, COLS * CELL + 16, ROWS * CELL + 16, {
+      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.20), radius: 12,
+    });
+
+    c.globalAlpha = 0.045;
+    c.strokeStyle = COL.a1;
+    c.lineWidth = 1;
+    var i;
+    for (i = 1; i < COLS; i++) {
+      c.beginPath(); c.moveTo(X0 + i * CELL, Y0); c.lineTo(X0 + i * CELL, Y0 + ROWS * CELL); c.stroke();
+    }
+    for (i = 1; i < ROWS; i++) {
+      c.beginPath(); c.moveTo(X0, Y0 + i * CELL); c.lineTo(X0 + COLS * CELL, Y0 + i * CELL); c.stroke();
+    }
+    c.globalAlpha = 1;
+
+    /* Food. */
+    if (food >= 0) {
+      var fx = X0 + cx(food) * CELL, fy = Y0 + cy(food) * CELL;
+      Render.glow(c, fx + CELL / 2, fy + CELL / 2, CELL * 1.4, '#F0645E', 0.75);
+      tile(c, fx, fy, CELL, '#F0645E', '#F79E9A', 'solid');
+    }
+    if (gold >= 0) {
+      var gxp = X0 + cx(gold) * CELL, gyp = Y0 + cy(gold) * CELL;
+      var pulse = 0.6 + Math.sin(goldTimer * 0.006) * 0.3;
+      Render.glow(c, gxp + CELL / 2, gyp + CELL / 2, CELL * 1.8, '#F0C64E', pulse);
+      tile(c, gxp, gyp, CELL, '#F0C64E', '#F7DE93', 'solid');
+    }
+
+    /* Body, tail-to-head so the head paints last. */
+    var n = length;
+    for (var k = 0; k < n; k++) {
+      var ci = body[(tail + k) % body.length];
+      var isHead = (k === n - 1);
+      var f = n > 1 ? k / (n - 1) : 1;
+      var base = isHead ? shade(ACCENT.snake, 0.30) : ACCENT.snake;
+      var top = isHead ? shade(ACCENT.snake, 0.62) : shade(ACCENT.snake, 0.20 + f * 0.20);
+      var px = X0 + cx(ci) * CELL, py = Y0 + cy(ci) * CELL;
+      if (isHead) Render.glow(c, px + CELL / 2, py + CELL / 2, CELL * 1.6, ACCENT.snake, 0.7);
+      tile(c, px, py, CELL, base, top, (isHead && eatFlash > 0) ? 'flash' : 'solid');
+    }
+
+    particles.draw(c);
+  }
+
+  /* --------------------------------------------------------- preview --- */
+
+  /* A short looping path drawn as a snake crawling around the card. */
+  var PATH = [
+    [1, 4], [1, 3], [1, 2], [2, 2], [3, 2], [3, 3], [3, 4], [4, 4],
+    [5, 4], [5, 3], [5, 2], [5, 1],
+  ];
+
+  function preview(c, w, h, t) {
+    var cols = 7, rows2 = 6;
+    var s = Math.min(w / cols, h / rows2) * 0.86;
+    var ox = (w - cols * s) / 2, oy = (h - rows2 * s) / 2;
+    var lenS = 5;
+    var headI = Math.floor((t * 0.006) % PATH.length);
+
+    /* apple two steps ahead of the head */
+    var ai = (headI + 3) % PATH.length;
+    var ax = ox + PATH[ai][0] * s, ay = oy + PATH[ai][1] * s;
+    Render.glow(c, ax + s / 2, ay + s / 2, s * 1.4, '#F0645E', 0.7);
+    tile(c, ax, ay, s, '#F0645E', '#F79E9A', 'solid');
+
+    for (var k = 0; k < lenS; k++) {
+      var pi = (headI - (lenS - 1 - k) + PATH.length * 2) % PATH.length;
+      var px = ox + PATH[pi][0] * s, py = oy + PATH[pi][1] * s;
+      var isHead = (k === lenS - 1);
+      if (isHead) Render.glow(c, px + s / 2, py + s / 2, s * 1.5, ACCENT.snake, 0.7);
+      tile(c, px, py, s,
+        isHead ? shade(ACCENT.snake, 0.3) : ACCENT.snake,
+        shade(ACCENT.snake, isHead ? 0.6 : 0.25), 'solid');
+    }
+  }
+
+  return registerGame({
+    id: 'snake',
+    title: 'SNAKE',
+    tag: 'Long field, tight corners',
+    accent: ACCENT.snake,
+    hint: 'D-PAD turn',
+    start: start,
+    update: update,
+    draw: draw,
+    preview: preview,
+  });
+})();
+
+/* ===== core/shell.js ============================================= */
+/*
+ * The shell: boot, dashboard, game, pause, game over, high scores, settings,
+ * initials entry and attract mode.
+ *
+ * One state machine, one draw tree, one input consumer. Games know nothing
+ * about any of it beyond Shell.gameOver().
+ *
+ * Every screen is navigable with a d-pad and two buttons. There is no path
+ * through this front end that needs a keyboard — including shutting the
+ * cabinet down.
+ */
+
+var Shell = (function () {
+
+  /* ------------------------------------------------------------ layout --- */
+
+  var MARGIN = 40;
+  var GAP = 20;
+  var CARD_W = (SW - MARGIN * 2 - GAP) / 2;   /* 490 */
+  var CARD_H = 330;
+  var ACTION_H = 108;
+  var HEADER_H = 322;
+  var FOOTER_Y = SH - 94;
+  var VIEW_TOP = HEADER_H;
+  var VIEW_BOT = FOOTER_Y - 24;
+
+  /* ------------------------------------------------------------- state --- */
+
+  var state = 'boot';
+  var prevState = 'boot';
+  var t = 0;                  /* ms since boot */
+  var stateT = 0;             /* ms in current state */
+  var idleT = 0;              /* ms since last input, for attract mode */
+  var fade = 0;               /* 0..1 cross-fade on state change */
+
+  var cursor = { row: 0, col: 0 };
+  var scrollY = 0, scrollTarget = 0;
+  var rows = [];
+
+  var activeGame = null;
+  var lastScore = 0;
+  var lastRank = -1;
+
+  var pauseCursor = 0;
+  var overCursor = 0;
+  var scoresGame = 0;
+  var setCursor = 0;
+  var confirmBox = null;      /* {text, onYes, cursor} */
+  var toast = null;           /* {text, life} */
+  var lastPadsVersion = -1;
+
+  var ATTRACT_AFTER = 60000;
+  var attract = { game: null, timer: 0, index: 0 };
+
+  var initials = { chars: [0, 0, 0], pos: 0, gameId: '', score: 0 };
+
+  var ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+  /* --------------------------------------------------------- menu model --- */
+
+  function buildMenu() {
+    rows = [];
+    for (var i = 0; i < GAMES.length; i += 2) {
+      var row = [{ kind: 'game', game: GAMES[i], h: CARD_H }];
+      if (GAMES[i + 1]) row.push({ kind: 'game', game: GAMES[i + 1], h: CARD_H });
+      rows.push(row);
+    }
+    if (VERSUS_GAMES.length) {
+      var vrow = [];
+      for (var v = 0; v < VERSUS_GAMES.length && v < 2; v++) {
+        vrow.push({ kind: 'game', game: VERSUS_GAMES[v], h: CARD_H, versus: true });
+      }
+      rows.push(vrow);
+    }
+    rows.push([
+      { kind: 'action', id: 'scores', label: 'HIGH SCORES', icon: '★', h: ACTION_H },
+      { kind: 'action', id: 'settings', label: 'SETTINGS', icon: '⚙', h: ACTION_H },
+    ]);
+  }
+
+  /** Absolute y of a row inside the scrolling content. */
+  function rowY(index) {
+    var y = 0;
+    for (var i = 0; i < index && i < rows.length; i++) y += rows[i][0].h + GAP;
+    return y;
+  }
+
+  function contentHeight() {
+    if (!rows.length) return 0;
+    return rowY(rows.length - 1) + rows[rows.length - 1][0].h;
+  }
+
+  function entryRect(r, c) {
+    var row = rows[r];
+    if (!row) return null;
+    var e = row[c];
+    if (!e) return null;
+    return {
+      x: MARGIN + c * (CARD_W + GAP),
+      y: VIEW_TOP + rowY(r) - scrollY,
+      w: CARD_W,
+      h: e.h,
+    };
+  }
+
+  function currentEntry() {
+    var row = rows[cursor.row];
+    if (!row) return null;
+    return row[Math.min(cursor.col, row.length - 1)] || null;
+  }
+
+  /** Keep the selected row inside the viewport, easing rather than jumping. */
+  function ensureVisible() {
+    var top = rowY(cursor.row);
+    var h = rows[cursor.row] ? rows[cursor.row][0].h : CARD_H;
+    var viewH = VIEW_BOT - VIEW_TOP;
+    var maxScroll = Math.max(0, contentHeight() - viewH);
+    if (top < scrollTarget) scrollTarget = top;
+    else if (top + h > scrollTarget + viewH) scrollTarget = top + h - viewH;
+    scrollTarget = clamp(scrollTarget, 0, maxScroll);
+  }
+
+  /* ------------------------------------------------------ transitions --- */
+
+  function go(next) {
+    prevState = state;
+    state = next;
+    stateT = 0;
+    fade = 1;
+    Input.flush();
+  }
+
+  function say(msg) { toast = { text: String(msg), life: 2600 }; }
+
+  /* ------------------------------------------------------------- boot --- */
+
+  function bootUpdate(dt) {
+    if (stateT > 2200 || Input.hit('confirm') || Input.hit('pause')) {
+      buildMenu();
+      go('menu');
+      Audio2.sfx('start');
+    }
+  }
+
+  /* ------------------------------------------------------------- menu --- */
+
+  function startGame(game, versus) {
+    activeGame = game;
+    seedRng((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635);
+    try { game.start(); }
+    catch (e) { say('FAILED TO START'); go('menu'); return; }
+    go('game');
+    Audio2.sfx('start');
+  }
+
+  function menuUpdate(dt) {
+    var moved = false;
+    var stepsV = Input.repCount('down') - Input.repCount('up');
+    var stepsH = Input.repCount('right') - Input.repCount('left');
+
+    if (stepsV) {
+      cursor.row = clamp(cursor.row + stepsV, 0, rows.length - 1);
+      var row = rows[cursor.row];
+      cursor.col = clamp(cursor.col, 0, row.length - 1);
+      moved = true;
+    }
+    if (stepsH) {
+      var r2 = rows[cursor.row];
+      var nc = cursor.col + stepsH;
+      if (nc >= 0 && nc < r2.length) { cursor.col = nc; moved = true; }
+    }
+    if (moved) { Audio2.sfx('move'); ensureVisible(); }
+
+    if (Input.hit('confirm')) {
+      var e = currentEntry();
+      if (!e) return;
+      if (e.kind === 'game') startGame(e.game, e.versus);
+      else if (e.id === 'scores') { scoresGame = 0; go('scores'); Audio2.sfx('select'); }
+      else if (e.id === 'settings') { setCursor = 0; go('settings'); Audio2.sfx('select'); }
+    }
+
+    scrollY = approach(scrollY, scrollTarget, 14, dt);
+  }
+
+  /* ------------------------------------------------------------- game --- */
+
+  function gameUpdate(dt) {
+    if (Input.hit('pause')) { pauseCursor = 0; go('pause'); Audio2.sfx('back'); return; }
+    if (!activeGame) { go('menu'); return; }
+    try { activeGame.update(dt); }
+    catch (e) {
+      say('GAME ERROR — RETURNED TO MENU');
+      activeGame = null;
+      go('menu');
+    }
+  }
+
+  var PAUSE_ITEMS = ['RESUME', 'RESTART', 'QUIT TO MENU'];
+
+  function pauseUpdate(dt) {
+    var steps = Input.repCount('down') - Input.repCount('up');
+    if (steps) {
+      pauseCursor = (pauseCursor + steps + PAUSE_ITEMS.length * 4) % PAUSE_ITEMS.length;
+      Audio2.sfx('move');
+    }
+    if (Input.hit('back') || Input.hit('pause')) { go('game'); Audio2.sfx('back'); return; }
+    if (Input.hit('confirm')) {
+      Audio2.sfx('select');
+      if (pauseCursor === 0) go('game');
+      else if (pauseCursor === 1) { activeGame.start(); go('game'); }
+      else { activeGame = null; go('menu'); }
+    }
+  }
+
+  /* -------------------------------------------------------- game over --- */
+
+  /** Called by games. Never call this from inside draw(). */
+  function gameOver(score) {
+    lastScore = Math.max(0, Math.floor(num(score, 0)));
+    var id = activeGame ? activeGame.id : '';
+    lastRank = -1;
+    if (id && Scores.qualifies(id, lastScore)) {
+      initials.chars = [0, 0, 0];
+      initials.pos = 0;
+      initials.gameId = id;
+      initials.score = lastScore;
+      go('initials');
+      Audio2.sfx('highscore');
+    } else {
+      overCursor = 0;
+      go('over');
+    }
+  }
+
+  var OVER_ITEMS = ['PLAY AGAIN', 'QUIT TO MENU'];
+
+  function overUpdate(dt) {
+    /* A short lock-out so a button held at death does not skip the screen. */
+    if (stateT < 500) return;
+    var steps = Input.repCount('down') - Input.repCount('up');
+    if (steps) {
+      overCursor = (overCursor + steps + OVER_ITEMS.length * 4) % OVER_ITEMS.length;
+      Audio2.sfx('move');
+    }
+    if (Input.hit('confirm')) {
+      Audio2.sfx('select');
+      if (overCursor === 0 && activeGame) { activeGame.start(); go('game'); }
+      else { activeGame = null; go('menu'); }
+    } else if (Input.hit('back')) {
+      activeGame = null;
+      go('menu');
+      Audio2.sfx('back');
+    }
+  }
+
+  /* --------------------------------------------------- initials entry --- */
+
+  function initialsUpdate(dt) {
+    if (stateT < 320) return;
+    var v = Input.repCount('up') - Input.repCount('down');
+    if (v) {
+      initials.chars[initials.pos] =
+        (initials.chars[initials.pos] + v + ALPHA.length * 8) % ALPHA.length;
+      Audio2.sfx('move');
+    }
+    var h = Input.repCount('right') - Input.repCount('left');
+    if (h) {
+      initials.pos = clamp(initials.pos + h, 0, 2);
+      Audio2.sfx('move');
+    }
+    if (Input.hit('confirm')) {
+      if (initials.pos < 2) { initials.pos++; Audio2.sfx('select'); }
+      else { commitInitials(); }
+    }
+    if (Input.hit('back')) {
+      if (initials.pos > 0) { initials.pos--; Audio2.sfx('back'); }
+      else commitInitials();
+    }
+  }
+
+  function commitInitials() {
+    var name = ALPHA.charAt(initials.chars[0]) + ALPHA.charAt(initials.chars[1]) +
+      ALPHA.charAt(initials.chars[2]);
+    lastRank = Scores.submit(initials.gameId, initials.score, name,
+      Date.now ? Date.now() : t);
+    Audio2.sfx('coin');
+    overCursor = 0;
+    go('over');
+  }
+
+  /* -------------------------------------------------------- settings --- */
+
+  /**
+   * Settings rows. Each is a small descriptor rather than bespoke code so the
+   * screen stays uniform and every row is reachable with left/right/confirm.
+   */
+  function settingsItems() {
+    var s = Settings.all();
+    return [
+      { id: 'volume', label: 'VOLUME', type: 'range',
+        value: Math.round(s.volume * 100) + '%' },
+      { id: 'muted', label: 'MUTE', type: 'toggle', on: s.muted },
+      { id: 'layout', label: 'CONTROLLER', type: 'choice',
+        value: layoutLabel(s.layout) },
+      { id: 'crt', label: 'CRT VEIL', type: 'toggle', on: s.crt },
+      { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
+      { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
+      { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
+      { id: 'restart', label: 'RESTART', type: 'action', danger: true },
+      { id: 'shutdown', label: 'SHUT DOWN', type: 'action', danger: true },
+      { id: 'back', label: 'BACK', type: 'action' },
+    ];
+  }
+
+  function layoutLabel(v) {
+    if (v === 'xbox') return 'XBOX';
+    if (v === 'playstation') return 'PLAYSTATION';
+    if (v === 'nintendo') return 'NINTENDO';
+    return 'AUTO (' + Input.layoutOf(0).toUpperCase() + ')';
+  }
+
+  var LAYOUTS = ['auto', 'xbox', 'playstation', 'nintendo'];
+
+  function settingsUpdate(dt) {
+    if (confirmBox) { confirmUpdate(dt); return; }
+
+    var items = settingsItems();
+    var steps = Input.repCount('down') - Input.repCount('up');
+    if (steps) {
+      setCursor = (setCursor + steps + items.length * 8) % items.length;
+      Audio2.sfx('move');
+    }
+
+    var it = items[setCursor];
+    var h = Input.repCount('right') - Input.repCount('left');
+
+    if (h && it.type === 'range') {
+      var vol = clamp(Settings.get('volume') + h * 0.05, 0, 1);
+      Settings.set('volume', Math.round(vol * 20) / 20);
+      Audio2.sfx('move');
+    } else if (h && it.type === 'choice') {
+      var i = LAYOUTS.indexOf(Settings.get('layout'));
+      i = (i + h + LAYOUTS.length * 8) % LAYOUTS.length;
+      Settings.set('layout', LAYOUTS[i]);
+      Audio2.sfx('select');
+    } else if (h && it.type === 'toggle') {
+      Settings.set(it.id, !Settings.get(it.id));
+      Audio2.sfx('select');
+    }
+
+    if (Input.hit('confirm')) activate(it);
+    if (Input.hit('back')) { go('menu'); Audio2.sfx('back'); }
+  }
+
+  function activate(it) {
+    if (!it) return;
+    if (it.type === 'toggle') {
+      Settings.set(it.id, !Settings.get(it.id));
+      Audio2.sfx('select');
+      return;
+    }
+    if (it.type === 'choice') {
+      var i = LAYOUTS.indexOf(Settings.get('layout'));
+      Settings.set('layout', LAYOUTS[(i + 1) % LAYOUTS.length]);
+      Audio2.sfx('select');
+      return;
+    }
+    if (it.id === 'back') { go('menu'); Audio2.sfx('back'); return; }
+    if (it.id === 'reset') {
+      ask('ERASE ALL HIGH SCORES?', function () {
+        Scores.reset();
+        say('HIGH SCORES CLEARED');
+      });
+      return;
+    }
+    if (it.id === 'pairing') {
+      System.pair();
+      say('PAIRING MODE — HOLD SYNC ON THE PAD');
+      return;
+    }
+    if (it.id === 'restart') {
+      ask('RESTART THE CABINET?', function () {
+        say('RESTARTING…');
+        System.request('restart');
+      });
+      return;
+    }
+    if (it.id === 'shutdown') {
+      ask('SHUT DOWN THE CABINET?', function () {
+        say('SHUTTING DOWN — WAIT FOR THE GREEN LED TO STOP');
+        System.request('shutdown');
+      });
+      return;
+    }
+  }
+
+  function ask(text, onYes) {
+    confirmBox = { text: text, onYes: onYes, cursor: 1 };
+    Audio2.sfx('select');
+    Input.flush();
+  }
+
+  function confirmUpdate(dt) {
+    var h = Input.repCount('right') - Input.repCount('left');
+    if (h) { confirmBox.cursor = confirmBox.cursor ? 0 : 1; Audio2.sfx('move'); }
+    if (Input.hit('confirm')) {
+      var yes = confirmBox.cursor === 0;
+      var fn = confirmBox.onYes;
+      confirmBox = null;
+      Audio2.sfx(yes ? 'select' : 'back');
+      if (yes && fn) fn();
+    } else if (Input.hit('back')) {
+      confirmBox = null;
+      Audio2.sfx('back');
+    }
+  }
+
+  /* ---------------------------------------------------------- scores --- */
+
+  function scoresUpdate(dt) {
+    var steps = Input.repCount('right') - Input.repCount('left');
+    if (steps) {
+      scoresGame = (scoresGame + steps + GAMES.length * 8) % GAMES.length;
+      Audio2.sfx('move');
+    }
+    var v = Input.repCount('down') - Input.repCount('up');
+    if (v) {
+      scoresGame = (scoresGame + v + GAMES.length * 8) % GAMES.length;
+      Audio2.sfx('move');
+    }
+    if (Input.hit('back') || Input.hit('confirm')) { go('menu'); Audio2.sfx('back'); }
+  }
+
+  /* --------------------------------------------------------- attract --- */
+
+  function enterAttract() {
+    attract.index = (attract.index + 1) % Math.max(1, GAMES.length);
+    attract.game = GAMES[attract.index] || null;
+    attract.timer = 0;
+    if (attract.game) {
+      seedRng(0xA77AC7 + attract.index);
+      try { attract.game.start(); } catch (e) { attract.game = null; }
+    }
+    go('attract');
+  }
+
+  function attractUpdate(dt) {
+    /* Any input at all drops straight back to the dashboard. */
+    if (Input.consumeActivity()) {
+      attract.game = null;
+      idleT = 0;
+      go('menu');
+      Audio2.sfx('back');
+      return;
+    }
+    attract.timer += dt;
+    if (attract.game) {
+      /* The demo plays itself; if it dies or stalls, rotate to the next. */
+      try { attractDrive(dt); attract.game.update(dt); }
+      catch (e) { attract.game = null; }
+    }
+    if (attract.timer > 14000 || !attract.game) enterAttract();
+  }
+
+  /**
+   * The demo pilot. Deliberately mediocre — it exists to make the cabinet look
+   * alive from across a room, not to set records.
+   */
+  function attractDrive(dt) {
+    /* Nothing is injected into Input; games read Input directly, so the demo
+     * simply lets them run on gravity and timers. Games that need no input to
+     * be visually interesting (falling pieces, sweeping slabs, scrolling
+     * fields) carry the loop on their own. */
+  }
+
+  /* ------------------------------------------------------------ frame --- */
+
+  function update(dt) {
+    t += dt;
+    stateT += dt;
+    if (fade > 0) fade = Math.max(0, fade - dt / 260);
+
+    if (toast) {
+      toast.life -= dt;
+      if (toast.life <= 0) toast = null;
+    }
+
+    /* Hot-plug: the legends re-read glyphs every frame, so all that is needed
+     * here is to tell the player something changed. */
+    var pv = Input.padsVersion();
+    if (pv !== lastPadsVersion) {
+      /* -1 means "first frame": adopt whatever is plugged in at boot without
+       * announcing it. Every change after that is worth telling the player. */
+      if (lastPadsVersion !== -1) {
+        var n = Input.padCount();
+        say(n > 0 ? 'CONTROLLER ' + Input.kindOf(0).toUpperCase() + ' READY'
+          : 'CONTROLLER DISCONNECTED');
+      }
+      lastPadsVersion = pv;
+    }
+
+    /* Idle tracking for attract mode: only the dashboard idles. */
+    if (state === 'menu') {
+      if (Input.consumeActivity()) idleT = 0;
+      else idleT += dt;
+      if (idleT > ATTRACT_AFTER) { idleT = 0; enterAttract(); }
+    } else if (state !== 'attract') {
+      idleT = 0;
+      Input.consumeActivity();
+    }
+
+    switch (state) {
+      case 'boot': bootUpdate(dt); break;
+      case 'menu': menuUpdate(dt); break;
+      case 'game': gameUpdate(dt); break;
+      case 'pause': pauseUpdate(dt); break;
+      case 'over': overUpdate(dt); break;
+      case 'initials': initialsUpdate(dt); break;
+      case 'settings': settingsUpdate(dt); break;
+      case 'scores': scoresUpdate(dt); break;
+      case 'attract': attractUpdate(dt); break;
+    }
+  }
+
+  function accentOfState() {
+    if ((state === 'game' || state === 'pause' || state === 'over' ||
+      state === 'initials') && activeGame) return activeGame.accent;
+    if (state === 'attract' && attract.game) return attract.game.accent;
+    var e = currentEntry();
+    if (state === 'menu' && e && e.kind === 'game') return e.game.accent;
+    return null;
+  }
+
+  function draw(dt) {
+    var c = Render.beginFrame(dt, accentOfState());
+    if (!c) return;
+
+    switch (state) {
+      case 'boot': drawBoot(c); break;
+      case 'menu': drawMenu(c); break;
+      case 'game': drawGameState(c, false); break;
+      case 'pause': drawGameState(c, false); drawPause(c); break;
+      case 'over': drawGameState(c, true); drawOver(c); break;
+      case 'initials': drawGameState(c, true); drawInitials(c); break;
+      case 'settings': drawSettings(c); break;
+      case 'scores': drawScores(c); break;
+      case 'attract': drawAttract(c); break;
+    }
+
+    drawToast(c);
+
+    if (fade > 0) {
+      Render.enterShell();
+      c.globalAlpha = clamp(fade * 0.85, 0, 1);
+      c.fillStyle = '#07050E';
+      c.fillRect(0, 0, SW, SH);
+      c.globalAlpha = 1;
+    }
+
+    Render.endFrame();
+  }
+
+  /* ------------------------------------------------------------ chrome --- */
+
+  function wordmark(c, cx, cy, size) {
+    var w = text(c, 'ARCADE', cx, cy, {
+      size: size, weight: '700', track: size * 0.19, aurora: true,
+      align: 'center', baseline: 'middle',
+    });
+    text(c, 'OS', cx + w / 2 + size * 0.34, cy, {
+      size: size * 0.42, weight: '600', track: size * 0.10,
+      color: COL.dim, align: 'left', baseline: 'middle',
+    });
+  }
+
+  function drawBoot(c) {
+    var p = clamp(stateT / 1400, 0, 1);
+    var ease = 1 - Math.pow(1 - p, 3);
+    c.globalAlpha = clamp(ease, 0, 1);
+    wordmark(c, SW / 2, SH / 2 - 40, 96);
+    c.globalAlpha = clamp((stateT - 900) / 500, 0, 1);
+    text(c, 'INSERT NOTHING · PRESS START', SW / 2, SH / 2 + 60, {
+      size: 22, weight: '500', track: 5, color: COL.text2, align: 'center',
+    });
+    c.globalAlpha = 1;
+
+    /* Loading rule that fills as the boot completes. */
+    var bw = 420, bx = (SW - bw) / 2, by = SH / 2 + 130;
+    c.fillStyle = 'rgba(140,150,255,.10)';
+    c.fillRect(bx, by, bw, 3);
+    var g = c.createLinearGradient(bx, 0, bx + bw, 0);
+    g.addColorStop(0, COL.a1); g.addColorStop(0.5, COL.a2); g.addColorStop(1, COL.a3);
+    c.fillStyle = g;
+    c.fillRect(bx, by, bw * clamp(stateT / 2200, 0, 1), 3);
+  }
+
+  function drawHeader(c) {
+    wordmark(c, SW / 2, 120, 68);
+    text(c, 'SELECT A GAME', SW / 2, 196, {
+      size: 18, weight: '500', track: 6, color: COL.text2, align: 'center',
+    });
+
+    var n = Input.playerCount();
+    var label = n > 1 ? n + ' PLAYERS READY' : 'PRESS START TO JOIN P2';
+    text(c, label, SW / 2, 232, {
+      size: 15, weight: '500', track: 3, color: COL.dim, align: 'center',
+    });
+
+    /* Hairline under the header. */
+    c.fillStyle = 'rgba(140,150,255,.10)';
+    c.fillRect(MARGIN, HEADER_H - 42, SW - MARGIN * 2, 1);
+  }
+
+  function drawCard(c, e, rect, selected) {
+    var g = e.game;
+    var pulse = selected ? 0.5 + Math.sin(t * 0.004) * 0.18 : 0;
+
+    if (selected) {
+      Render.glow(c, rect.x + rect.w / 2, rect.y + rect.h / 2,
+        Math.max(rect.w, rect.h) * 0.75, g.accent, 0.55 + pulse * 0.3);
+    }
+
+    panel(c, rect.x, rect.y, rect.w, rect.h, {
+      fill: selected ? 'rgba(30,24,62,.66)' : COL.card,
+      stroke: selected ? rgba(g.accent, 0.55) : COL.cardLine,
+      lineWidth: selected ? 2 : 1,
+    });
+
+    /* Preview window. */
+    var pw = rect.w - 36, ph = rect.h - 132;
+    var px = rect.x + 18, py = rect.y + 18;
+    c.save();
+    roundRect(c, px, py, pw, ph, 12);
+    c.clip();
+    c.fillStyle = 'rgba(8,6,18,0.45)';
+    c.fillRect(px, py, pw, ph);
+    c.translate(px, py);
+    try { g.preview(c, pw, ph, t); }
+    catch (err) { /* a broken preview must not take the dashboard down */ }
+    c.restore();
+
+    if (e.versus) {
+      panel(c, rect.x + rect.w - 92, rect.y + 26, 62, 26, {
+        fill: rgba(g.accent, 0.18), stroke: rgba(g.accent, 0.5), radius: 8,
+      });
+      text(c, '2P', rect.x + rect.w - 61, rect.y + 44, {
+        size: 13, weight: '700', track: 1.5, color: COL.text, align: 'center',
+      });
+    }
+
+    text(c, g.title, rect.x + 20, rect.y + rect.h - 74, {
+      size: 30, weight: '700', track: 4.5,
+      color: selected ? COL.text : '#CFCBEC',
+    });
+    text(c, g.tag, rect.x + 20, rect.y + rect.h - 40, {
+      size: 16, weight: '400', track: 0.4, color: COL.text2,
+    });
+
+    var best = Scores.best(g.id);
+    if (best > 0) {
+      dataText(c, fmtScore(best), rect.x + rect.w - 20, rect.y + rect.h - 40, {
+        size: 16, align: 'right', color: rgba(g.accent, 0.95),
+      });
+    }
+  }
+
+  function drawAction(c, e, rect, selected) {
+    if (selected) {
+      Render.glow(c, rect.x + rect.w / 2, rect.y + rect.h / 2, rect.w * 0.6, COL.a2, 0.5);
+    }
+    panel(c, rect.x, rect.y, rect.w, rect.h, {
+      fill: selected ? 'rgba(30,24,62,.66)' : COL.card,
+      stroke: selected ? rgba(COL.a2, 0.5) : COL.cardLine,
+      lineWidth: selected ? 2 : 1,
+    });
+    text(c, e.icon, rect.x + 30, rect.y + rect.h / 2 + 1, {
+      size: 26, weight: '600', color: selected ? COL.a1 : COL.text2,
+      baseline: 'middle',
+    });
+    text(c, e.label, rect.x + 74, rect.y + rect.h / 2 + 1, {
+      size: 22, weight: '600', track: 3.5,
+      color: selected ? COL.text : COL.text2, baseline: 'middle',
+    });
+  }
+
+  function drawMenu(c) {
+    drawHeader(c);
+
+    c.save();
+    c.beginPath();
+    c.rect(0, VIEW_TOP - 6, SW, VIEW_BOT - VIEW_TOP + 12);
+    c.clip();
+
+    for (var r = 0; r < rows.length; r++) {
+      var row = rows[r];
+      for (var col = 0; col < row.length; col++) {
+        var rect = entryRect(r, col);
+        if (!rect) continue;
+        if (rect.y > VIEW_BOT + 40 || rect.y + rect.h < VIEW_TOP - 40) continue;
+        var sel = (r === cursor.row && col === Math.min(cursor.col, row.length - 1));
+        if (row[col].kind === 'game') drawCard(c, row[col], rect, sel);
+        else drawAction(c, row[col], rect, sel);
+      }
+    }
+    c.restore();
+
+    drawScrollbar(c);
+    drawFooter(c, [
+      { g: 'D-PAD', l: 'MOVE' },
+      { g: Input.glyphs(0).confirm, l: 'PLAY' },
+      { g: 'START', l: 'JOIN' },
+    ]);
+  }
+
+  function drawScrollbar(c) {
+    var viewH = VIEW_BOT - VIEW_TOP;
+    var total = contentHeight();
+    if (total <= viewH + 1) return;
+    var trackH = viewH;
+    var thumbH = Math.max(48, trackH * (viewH / total));
+    var maxScroll = total - viewH;
+    var p = maxScroll > 0 ? clamp(scrollY / maxScroll, 0, 1) : 0;
+    var x = SW - 18;
+    c.fillStyle = 'rgba(140,150,255,.08)';
+    c.fillRect(x, VIEW_TOP, 3, trackH);
+    c.fillStyle = rgba(COL.a2, 0.55);
+    c.fillRect(x, VIEW_TOP + (trackH - thumbH) * p, 3, thumbH);
+  }
+
+  /**
+   * Footer legend. Rebuilt from Input.glyphs() on every frame, which is why a
+   * controller swapped mid-session shows the right buttons immediately.
+   */
+  function drawFooter(c, hints) {
+    c.fillStyle = 'rgba(140,150,255,.10)';
+    c.fillRect(MARGIN, FOOTER_Y - 26, SW - MARGIN * 2, 1);
+
+    var total = 0, i;
+    for (i = 0; i < hints.length; i++) {
+      total += 46 + measure(c, hints[i].g, 0) + measure(c, hints[i].l, 2) + 54;
+    }
+    var x = (SW - total) / 2;
+    var y = FOOTER_Y + 16;
+    for (i = 0; i < hints.length; i++) {
+      var h = hints[i];
+      c.font = '600 15px ' + FONT_SANS;
+      var gw = Math.max(34, measure(c, h.g, 0) + 22);
+      panel(c, x, y - 20, gw, 30, {
+        fill: 'rgba(30,24,62,.7)', stroke: 'rgba(140,150,255,.18)', radius: 9,
+      });
+      text(c, h.g, x + gw / 2, y - 4, {
+        size: 14, weight: '700', color: COL.text, align: 'center',
+      });
+      x += gw + 10;
+      text(c, h.l, x, y - 4, { size: 14, weight: '500', track: 2, color: COL.dim });
+      x += measure(c, h.l, 2) + 30;
+    }
+  }
+
+  /* ------------------------------------------------------- game frames --- */
+
+  function drawGameState(c, dim) {
+    if (!activeGame) return;
+    Render.enterGame();
+    try { activeGame.draw(); }
+    catch (e) { /* a draw fault must not wedge the shell */ }
+    Render.enterShell();
+    if (dim) {
+      c.fillStyle = 'rgba(7,5,14,0.72)';
+      c.fillRect(0, 0, SW, SH);
+    }
+  }
+
+  function drawModal(c, title, w, h) {
+    var x = (SW - w) / 2, y = (SH - h) / 2;
+    c.fillStyle = 'rgba(7,5,14,0.66)';
+    c.fillRect(0, 0, SW, SH);
+    panel(c, x, y, w, h, {
+      fill: 'rgba(22,18,46,.94)', stroke: 'rgba(140,150,255,.20)', radius: 22,
+    });
+    if (title) {
+      text(c, title, SW / 2, y + 66, {
+        size: 30, weight: '700', track: 6, aurora: true, align: 'center',
+      });
+    }
+    return { x: x, y: y, w: w, h: h };
+  }
+
+  function drawList(c, items, selected, x, y, w, rowH) {
+    for (var i = 0; i < items.length; i++) {
+      var iy = y + i * rowH;
+      var sel = (i === selected);
+      if (sel) {
+        panel(c, x, iy, w, rowH - 8, {
+          fill: 'rgba(139,123,240,.16)', stroke: rgba(COL.a2, 0.45), radius: 12,
+        });
+      }
+      text(c, items[i], x + w / 2, iy + (rowH - 8) / 2 + 1, {
+        size: 22, weight: sel ? '700' : '500', track: 4,
+        color: sel ? COL.text : COL.text2, align: 'center', baseline: 'middle',
+      });
+    }
+  }
+
+  function drawPause(c) {
+    var m = drawModal(c, 'PAUSED', 620, 460);
+    drawList(c, PAUSE_ITEMS, pauseCursor, m.x + 60, m.y + 130, m.w - 120, 74);
+    var gl = Input.glyphs(0);
+    text(c, gl.confirm + ' SELECT   ' + gl.back + ' RESUME', SW / 2, m.y + m.h - 42, {
+      size: 15, weight: '500', track: 2.5, color: COL.dim, align: 'center',
+    });
+  }
+
+  function drawOver(c) {
+    var m = drawModal(c, 'GAME OVER', 660, 560);
+    var id = activeGame ? activeGame.id : '';
+
+    dataText(c, fmtScore(lastScore), SW / 2, m.y + 168, {
+      size: 62, align: 'center', color: COL.text,
+    });
+    text(c, 'SCORE', SW / 2, m.y + 202, {
+      size: 14, weight: '600', track: 5, color: COL.text2, align: 'center',
+    });
+
+    if (lastRank >= 0) {
+      text(c, 'NEW HIGH SCORE — RANK ' + (lastRank + 1), SW / 2, m.y + 248, {
+        size: 18, weight: '700', track: 3, color: COL.a1, align: 'center',
+      });
+    } else {
+      var b = Scores.best(id);
+      dataText(c, 'BEST  ' + fmtScore(b), SW / 2, m.y + 248, {
+        size: 18, align: 'center', color: COL.dim,
+      });
+    }
+
+    drawList(c, OVER_ITEMS, overCursor, m.x + 60, m.y + 300, m.w - 120, 74);
+    var gl = Input.glyphs(0);
+    text(c, gl.confirm + ' SELECT   ' + gl.back + ' MENU', SW / 2, m.y + m.h - 42, {
+      size: 15, weight: '500', track: 2.5, color: COL.dim, align: 'center',
+    });
+  }
+
+  function drawInitials(c) {
+    var m = drawModal(c, 'NEW HIGH SCORE', 660, 520);
+    dataText(c, fmtScore(initials.score), SW / 2, m.y + 150, {
+      size: 44, align: 'center', color: COL.a1,
+    });
+    text(c, 'ENTER YOUR INITIALS', SW / 2, m.y + 196, {
+      size: 15, weight: '500', track: 4, color: COL.text2, align: 'center',
+    });
+
+    var slotW = 96, gap = 26;
+    var totalW = slotW * 3 + gap * 2;
+    var sx0 = (SW - totalW) / 2;
+    for (var i = 0; i < 3; i++) {
+      var x = sx0 + i * (slotW + gap);
+      var y = m.y + 236;
+      var active = (i === initials.pos);
+      if (active) Render.glow(c, x + slotW / 2, y + 58, 120, COL.a2, 0.55);
+      panel(c, x, y, slotW, 116, {
+        fill: active ? 'rgba(30,24,62,.85)' : 'rgba(16,12,34,.6)',
+        stroke: active ? rgba(COL.a2, 0.7) : COL.cardLine,
+        lineWidth: active ? 2 : 1,
+      });
+      text(c, ALPHA.charAt(initials.chars[i]), x + slotW / 2, y + 58, {
+        size: 56, weight: '700', color: active ? COL.text : COL.text2,
+        align: 'center', baseline: 'middle',
+      });
+      if (active) {
+        /* Up/down arrows make the interaction obvious without instructions. */
+        var bob = Math.sin(t * 0.006) * 3;
+        text(c, '▲', x + slotW / 2, y - 14 - bob, {
+          size: 16, color: COL.a1, align: 'center', baseline: 'middle',
+        });
+        text(c, '▼', x + slotW / 2, y + 130 + bob, {
+          size: 16, color: COL.a1, align: 'center', baseline: 'middle',
+        });
+      }
+    }
+
+    var gl = Input.glyphs(0);
+    text(c, '▲▼ LETTER   ◀▶ SLOT   ' + gl.confirm + ' OK', SW / 2, m.y + m.h - 42, {
+      size: 15, weight: '500', track: 2.5, color: COL.dim, align: 'center',
+    });
+  }
+
+  /* ------------------------------------------------------ settings UI --- */
+
+  function drawSettings(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'SETTINGS', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+    });
+
+    var items = settingsItems();
+    var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
+    var y0 = 250, rowH = 92;
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var y = y0 + i * rowH;
+      var sel = (i === setCursor);
+      if (sel) {
+        panel(c, x, y, w, rowH - 12, {
+          fill: 'rgba(30,24,62,.72)',
+          stroke: rgba(it.danger ? COL.bad : COL.a2, 0.5), lineWidth: 2,
+        });
+      } else {
+        panel(c, x, y, w, rowH - 12, { fill: COL.card, stroke: COL.cardLine });
+      }
+
+      var cy = y + (rowH - 12) / 2 + 1;
+      text(c, it.label, x + 26, cy, {
+        size: 21, weight: sel ? '700' : '500', track: 3,
+        color: it.danger ? (sel ? COL.bad : rgba(COL.bad, 0.75)) : (sel ? COL.text : COL.text2),
+        baseline: 'middle',
+      });
+
+      if (it.type === 'toggle') {
+        drawToggle(c, x + w - 110, cy, it.on, sel);
+      } else if (it.type === 'range') {
+        drawSlider(c, x + w - 260, cy, 180, Settings.get('volume'), sel);
+        dataText(c, it.value, x + w - 26, cy, {
+          size: 18, align: 'right', baseline: 'middle',
+          color: sel ? COL.data : COL.dim,
+        });
+      } else if (it.type === 'choice') {
+        text(c, '◀', x + w - 240, cy, { size: 16, color: sel ? COL.a1 : COL.dim, baseline: 'middle' });
+        text(c, it.value, x + w - 130, cy, {
+          size: 17, weight: '600', track: 2, color: sel ? COL.data : COL.dim,
+          align: 'center', baseline: 'middle',
+        });
+        text(c, '▶', x + w - 34, cy, { size: 16, color: sel ? COL.a1 : COL.dim, align: 'right', baseline: 'middle' });
+      }
+    }
+
+    var y2 = y0 + items.length * rowH + 12;
+    text(c, Store.persistent()
+      ? 'SETTINGS AND SCORES ARE SAVED ON THIS CABINET'
+      : 'STORAGE UNAVAILABLE — CHANGES LAST FOR THIS SESSION ONLY',
+      SW / 2, y2 + 20, {
+        size: 14, weight: '500', track: 2,
+        color: Store.persistent() ? COL.dim : COL.warn, align: 'center',
+      });
+
+    var gl = Input.glyphs(0);
+    drawFooter(c, [
+      { g: 'D-PAD', l: 'ADJUST' },
+      { g: gl.confirm, l: 'SELECT' },
+      { g: gl.back, l: 'BACK' },
+    ]);
+
+    if (confirmBox) drawConfirm(c);
+  }
+
+  function drawToggle(c, x, cy, on, sel) {
+    var w = 64, h = 30;
+    var y = cy - h / 2;
+    roundRect(c, x, y, w, h, h / 2);
+    c.fillStyle = on ? rgba(COL.a1, 0.30) : 'rgba(110,106,160,.18)';
+    c.fill();
+    c.strokeStyle = on ? rgba(COL.a1, 0.7) : COL.cardLine;
+    c.lineWidth = 1;
+    c.stroke();
+    var kx = on ? x + w - h / 2 : x + h / 2;
+    c.beginPath();
+    c.arc(kx, cy, h / 2 - 4, 0, Math.PI * 2);
+    c.fillStyle = on ? COL.a1 : COL.dim;
+    c.fill();
+    if (sel) Render.glow(c, x + w / 2, cy, 70, on ? COL.a1 : COL.a2, 0.35);
+  }
+
+  function drawSlider(c, x, cy, w, v, sel) {
+    var val = clamp(num(v, 0), 0, 1);
+    c.fillStyle = 'rgba(110,106,160,.22)';
+    c.fillRect(x, cy - 2, w, 4);
+    var g = c.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, COL.a1); g.addColorStop(1, COL.a2);
+    c.fillStyle = g;
+    c.fillRect(x, cy - 2, w * val, 4);
+    c.beginPath();
+    c.arc(x + w * val, cy, sel ? 9 : 7, 0, Math.PI * 2);
+    c.fillStyle = COL.text;
+    c.fill();
+  }
+
+  function drawConfirm(c) {
+    var m = drawModal(c, null, 640, 300);
+    text(c, confirmBox.text, SW / 2, m.y + 90, {
+      size: 24, weight: '600', track: 2, color: COL.text, align: 'center',
+    });
+    var opts = ['YES', 'CANCEL'];
+    var bw = 220, gap = 30;
+    var x0 = (SW - (bw * 2 + gap)) / 2;
+    for (var i = 0; i < 2; i++) {
+      var x = x0 + i * (bw + gap);
+      var sel = (confirmBox.cursor === i);
+      var danger = (i === 0);
+      panel(c, x, m.y + 150, bw, 64, {
+        fill: sel ? (danger ? rgba(COL.bad, 0.22) : 'rgba(30,24,62,.85)') : COL.card,
+        stroke: sel ? (danger ? rgba(COL.bad, 0.7) : rgba(COL.a2, 0.5)) : COL.cardLine,
+        lineWidth: sel ? 2 : 1,
+      });
+      text(c, opts[i], x + bw / 2, m.y + 150 + 34, {
+        size: 20, weight: '700', track: 3,
+        color: sel ? (danger ? COL.bad : COL.text) : COL.text2,
+        align: 'center', baseline: 'middle',
+      });
+    }
+  }
+
+  /* -------------------------------------------------------- scores UI --- */
+
+  function drawScores(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'HIGH SCORES', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+    });
+
+    var g = GAMES[scoresGame] || GAMES[0];
+    if (!g) return;
+
+    /* Game selector. */
+    var selY = 246;
+    text(c, '◀', MARGIN + 30, selY, { size: 26, color: COL.a1, baseline: 'middle' });
+    text(c, g.title, SW / 2, selY, {
+      size: 40, weight: '700', track: 6, color: COL.text,
+      align: 'center', baseline: 'middle',
+    });
+    text(c, '▶', SW - MARGIN - 30, selY, {
+      size: 26, color: COL.a1, align: 'right', baseline: 'middle',
+    });
+    text(c, (scoresGame + 1) + ' / ' + GAMES.length, SW / 2, selY + 40, {
+      size: 14, weight: '500', track: 3, color: COL.dim, align: 'center',
+    });
+
+    var table = Scores.table(g.id);
+    var x = MARGIN + 40, w = SW - (MARGIN + 40) * 2;
+    var y0 = 340, rowH = 96;
+
+    for (var i = 0; i < TOP_N; i++) {
+      var e = table[i];
+      var y = y0 + i * rowH;
+      panel(c, x, y, w, rowH - 14, {
+        fill: e ? 'rgba(22,18,46,.62)' : 'rgba(22,18,46,.30)',
+        stroke: (i === 0 && e) ? rgba(g.accent, 0.45) : COL.cardLine,
+      });
+      var cy = y + (rowH - 14) / 2 + 1;
+
+      dataText(c, String(i + 1), x + 34, cy, {
+        size: 26, align: 'center', baseline: 'middle',
+        color: i === 0 ? g.accent : COL.dim,
+      });
+      text(c, e ? e.name : '- - -', x + 110, cy, {
+        size: 30, weight: '700', track: 8, baseline: 'middle',
+        color: e ? COL.text : COL.dim, mono: true,
+      });
+      dataText(c, e ? fmtScore(e.score) : '—', x + w - 30, cy, {
+        size: 28, align: 'right', baseline: 'middle',
+        color: e ? (i === 0 ? g.accent : COL.data) : COL.dim,
+      });
+    }
+
+    var gl = Input.glyphs(0);
+    drawFooter(c, [
+      { g: 'D-PAD', l: 'GAME' },
+      { g: gl.back, l: 'BACK' },
+    ]);
+  }
+
+  /* ------------------------------------------------------- attract UI --- */
+
+  function drawAttract(c) {
+    if (attract.game) {
+      Render.enterGame();
+      try { attract.game.draw(); }
+      catch (e) { /* ignore */ }
+      Render.enterShell();
+      c.fillStyle = 'rgba(7,5,14,0.55)';
+      c.fillRect(0, 0, SW, SH);
+    }
+
+    var pulse = 0.55 + Math.sin(t * 0.0022) * 0.45;
+    c.globalAlpha = clamp(0.55 + pulse * 0.45, 0, 1);
+    wordmark(c, SW / 2, SH * 0.36, 84);
+    c.globalAlpha = 1;
+
+    if (attract.game) {
+      text(c, attract.game.title, SW / 2, SH * 0.36 + 96, {
+        size: 24, weight: '600', track: 8,
+        color: rgba(attract.game.accent, 0.9), align: 'center',
+      });
+      text(c, attract.game.tag, SW / 2, SH * 0.36 + 136, {
+        size: 17, weight: '400', color: COL.text2, align: 'center',
+      });
+    }
+
+    c.globalAlpha = clamp(0.35 + Math.sin(t * 0.004) * 0.35, 0, 1);
+    text(c, 'PRESS ANY BUTTON', SW / 2, SH * 0.78, {
+      size: 26, weight: '600', track: 8, color: COL.text, align: 'center',
+    });
+    c.globalAlpha = 1;
+
+    /* Top-five ticker for the game on screen. */
+    if (attract.game) {
+      var tbl = Scores.table(attract.game.id);
+      for (var i = 0; i < tbl.length && i < 3; i++) {
+        dataText(c, (i + 1) + '.  ' + tbl[i].name + '   ' + fmtScore(tbl[i].score),
+          SW / 2, SH * 0.85 + i * 34, { size: 18, align: 'center', color: COL.dim });
+      }
+    }
+  }
+
+  /* ----------------------------------------------------------- toast --- */
+
+  function drawToast(c) {
+    if (!toast) return;
+    Render.enterShell();
+    var a = clamp(Math.min(toast.life / 400, 1), 0, 1);
+    c.font = '600 17px ' + FONT_SANS;
+    var w = measure(c, toast.text, 2) + 56;
+    var x = (SW - w) / 2, y = 40;
+    c.globalAlpha = a;
+    panel(c, x, y, w, 52, {
+      fill: 'rgba(30,24,62,.94)', stroke: rgba(COL.a1, 0.4), radius: 14,
+    });
+    text(c, toast.text, SW / 2, y + 27, {
+      size: 17, weight: '600', track: 2, color: COL.text,
+      align: 'center', baseline: 'middle',
+    });
+    c.globalAlpha = 1;
+  }
+
+  /* ------------------------------------------------------------- API --- */
+
+  return {
+    update: update,
+    draw: draw,
+    gameOver: gameOver,
+    buildMenu: buildMenu,
+    state: function () { return state; },
+    /** Test seams — the harness drives these to walk the state machine. */
+    _go: go,
+    _select: function (id) {
+      for (var r = 0; r < rows.length; r++) {
+        for (var c2 = 0; c2 < rows[r].length; c2++) {
+          var e = rows[r][c2];
+          if (e.kind === 'game' && e.game.id === id) {
+            cursor.row = r; cursor.col = c2; ensureVisible();
+            return true;
+          }
+        }
+      }
+      return false;
+    },
+    _startGame: startGame,
+    _activeGame: function () { return activeGame; },
+    _lastScore: function () { return lastScore; },
+    _rows: function () { return rows; },
+    _cursor: function () { return cursor; },
+    _toast: function () { return toast; },
+    _confirm: function () { return confirmBox; },
+    _setCursor: function (i) { setCursor = i; },
+    _settingsItems: settingsItems,
+    _idle: function () { return idleT; },
+    _forceIdle: function (ms) { idleT = ms; },
+    _reset: function () {
+      state = 'boot'; prevState = 'boot';
+      t = 0; stateT = 0; idleT = 0; fade = 0;
+      cursor.row = 0; cursor.col = 0;
+      scrollY = 0; scrollTarget = 0;
+      activeGame = null; lastScore = 0; lastRank = -1;
+      pauseCursor = 0; overCursor = 0; scoresGame = 0; setCursor = 0;
+      confirmBox = null; toast = null; lastPadsVersion = -1;
+      attract.game = null; attract.timer = 0; attract.index = 0;
+      buildMenu();
+    },
+  };
+})();
+
+/* ===== core/boot.js ============================================== */
+/*
+ * Entry point and the single requestAnimationFrame loop.
+ *
+ * One loop drives everything: poll input, update the shell, draw the shell.
+ * Games never register their own rAF callbacks, which is what keeps timing
+ * consistent and makes the whole front end drivable frame-by-frame from the
+ * headless test harness.
+ */
+
+var Loop = (function () {
+  var last = 0;
+  var running = false;
+  var rafId = 0;
+
+  /* Frame time is clamped rather than trusted. A Chromium tab that has been
+   * throttled (or a harness stepping in big jumps) would otherwise hand a
+   * game a 4-second dt and teleport everything through a wall. */
+  var MAX_DT = 50;
+
+  function frame(now) {
+    if (!running) return;
+    var t = num(now, last + 16);
+    var dt = last === 0 ? 16 : clamp(t - last, 0, MAX_DT);
+    last = t;
+    tick(dt);
+    rafId = requestAnimationFrame(frame);
+  }
+
+  /** One logical frame. Exposed so the harness can drive it directly. */
+  function tick(dt) {
+    Input.poll(dt);
+    Shell.update(dt);
+    Shell.draw(dt);
+  }
+
+  function start() {
+    if (running) return;
+    running = true;
+    last = 0;
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function stop() {
+    running = false;
+    if (rafId && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  return { start: start, stop: stop, tick: tick, running: function () { return running; } };
+})();
+
+function boot() {
+  var canvas = document.getElementById('screen');
+  if (!canvas) return;
+
+  Render.init(canvas);
+  Input.attach(window);
+
+  /* Seed from the clock so two cabinets do not play the same piece sequence,
+   * while tests can still pin it with seedRng(). */
+  seedRng((Date.now ? Date.now() : 1) & 0x7fffffff);
+
+  Shell.buildMenu();
+
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { Render.resize(); }, false);
+    /* Chromium fires this on rotation and on HDMI mode changes. */
+    if (window.matchMedia) {
+      try {
+        var mq = window.matchMedia('(orientation: portrait)');
+        if (mq.addEventListener) mq.addEventListener('change', function () { Render.resize(); });
+      } catch (e) { /* ignore */ }
+    }
+    /* Any first interaction unlocks audio. */
+    window.addEventListener('pointerdown', function () { Audio2.unlock(); }, false);
+  }
+
+  Loop.start();
+}
+
+/*
+ * Debug handle. The bundle is an IIFE, so without this there is no way to poke
+ * at the machine from a console on the Pi — or from the headless harness,
+ * which drives these exact objects rather than a parallel copy of them.
+ */
+if (typeof globalThis !== 'undefined') {
+  globalThis.ArcadeOS = {
+    Shell: Shell, Input: Input, Audio2: Audio2, Render: Render, Loop: Loop,
+    Store: Store, Settings: Settings, Scores: Scores, System: System,
+    GAMES: GAMES, VERSUS_GAMES: VERSUS_GAMES, gameById: gameById,
+    seedRng: seedRng, rnd: rnd, boot: boot,
+    COL: COL, ACCENT: ACCENT, ACTIONS: ACTIONS,
+    makeRepeater: makeRepeater, hexRgb: hexRgb, rgba: rgba, shade: shade,
+    fmtScore: fmtScore, TOP_N: TOP_N,
+    version: '1.0.0',
+  };
+}
+
+/* The bundle is injected at the end of <body>, so the DOM is already parsed;
+ * the readyState check is belt and braces for anyone opening src/ directly. */
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, false);
+  } else {
+    boot();
+  }
+}
+
+})();
+</script>
+</body>
+</html>

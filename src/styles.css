@@ -1,0 +1,41 @@
+/*
+ * ArcadeOS shell chrome.
+ *
+ * Deliberately tiny: the entire front end renders into one <canvas>. Keeping
+ * the DOM to a single element means one compositor layer, no CSS filters in
+ * the paint path, and no layout thrash — which is what buys us 60fps on a
+ * Pi 4. The page background matches the canvas backdrop so letterbox bars on
+ * a non-portrait display are seamless.
+ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #07050E;
+  /* Cabinet has no mouse. Hide it in case one is plugged in for setup. */
+  cursor: none;
+  /* System stacks only — the cabinet never touches a network. */
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "DejaVu Sans", Arial, sans-serif;
+  color: #EFEDFF;
+  /* Suppress mobile/touch affordances if someone opens this on a tablet. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+#screen {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* The canvas owns its own scaling; never let the browser resample it. */
+  image-rendering: auto;
+}
+
+/* Chromium draws a focus ring on the canvas when it takes keyboard focus. */
+#screen:focus { outline: none; }
