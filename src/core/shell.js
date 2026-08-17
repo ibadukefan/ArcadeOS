@@ -57,6 +57,8 @@ var Shell = (function () {
   for (var ftI = 0; ftI < FT_N; ftI++) frameTimes[ftI] = 16.667;
   var frameAt = 0;
   var worstFrame = 0;
+  var frameOps = 0;
+  var lastOps = 0;
 
   var ATTRACT_AFTER = 60000;
   var attract = { game: null, timer: 0, index: 0 };
@@ -323,6 +325,7 @@ var Shell = (function () {
       { id: 'crt', label: 'CRT VEIL', type: 'toggle', on: s.crt },
       { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
+      { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
@@ -500,6 +503,11 @@ var Shell = (function () {
     frameTimes[frameAt] = dt;
     frameAt = (frameAt + 1) % FT_N;
     if (dt > worstFrame) worstFrame = dt;
+    /* Delta, not a reset: the counter is monotonic so tests can sample it
+     * over a window without the shell clearing it underneath them. */
+    var opsNow = Render.fullScreenOps();
+    frameOps = opsNow - lastOps;
+    lastOps = opsNow;
     if (fade > 0) fade = Math.max(0, fade - dt / 260);
 
     if (toast) {
@@ -1162,18 +1170,44 @@ var Shell = (function () {
     var fps = mean > 0 ? 1000 / mean : 0;
     var bad = mean > 17.5;
 
-    panel(c, 16, SH - 96, 300, 64, {
-      fill: 'rgba(7,5,14,.86)', stroke: bad ? rgba(COL.warn, 0.6) : COL.cardLine,
+    panel(c, 16, SH - 330, 480, 144, {
+      fill: 'rgba(7,5,14,.88)', stroke: bad ? rgba(COL.warn, 0.6) : COL.cardLine,
       radius: 10,
     });
-    dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 68, {
+    dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 302, {
       size: 20, color: bad ? COL.warn : COL.a1,
     });
     dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) + 'ms',
-      32, SH - 46, { size: 14, color: COL.dim });
+      32, SH - 280, { size: 14, color: COL.dim });
+
+    /*
+     * The input half. These are the numbers that answer "does the controller
+     * feel right", which frame time alone cannot:
+     *
+     *   sample   how often we read the pads (should be ~250/s)
+     *   pad      how often the browser actually gives us fresh pad data
+     *   saved    presses that had already been released by the time the frame
+     *            ran — every one of these was silently dropped before
+     *            latching existed, so a rising number here is the feature
+     *            working, not a fault
+     */
+    var d = Input.diagnostics();
+    var elapsed = Math.max(1, t) / 1000;
+    dataText(c, 'sample ' + Math.round(d.samples / elapsed) + '/s' +
+      (d.sampling ? '' : ' (rAF only)'), 32, SH - 254, {
+      size: 14, color: d.sampling ? COL.dim : COL.warn,
+    });
+    dataText(c, 'pad ' + Math.round(d.padUpdates / elapsed) + '/s' +
+      '   audio ' + Audio2.latencyMs().toFixed(0) + 'ms' +
+      '   video ' + (Render.lowLatency() ? 'low-lat' : 'normal'),
+      32, SH - 232, { size: 14, color: COL.dim });
+    dataText(c, 'taps saved ' + d.tapsSaved +
+      '   fullscreen ops/f ' + (frameOps || 2), 32, SH - 210, {
+      size: 14, color: d.tapsSaved > 0 ? COL.a1 : COL.dim,
+    });
 
     /* A 16.7ms reference line, so "over budget" is visible not calculated. */
-    var bx = 176, bw = 124, by = SH - 78;
+    var bx = 340, bw = 140, by = SH - 312;
     c.fillStyle = 'rgba(110,106,160,.22)';
     c.fillRect(bx, by, bw, 26);
     for (var k = 0; k < FT_N; k++) {

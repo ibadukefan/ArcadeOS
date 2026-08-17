@@ -276,15 +276,27 @@ mkdir -p "\$PROFILE"
 #                               no pointer on a cabinet
 #   --disable-pinch/--overscroll no accidental zoom from an arcade encoder
 #   --ozone-platform=wayland    cage is a Wayland compositor
-#   --enable-features=...       keep GPU rasterisation on for canvas
 #   --disable-features=Translate,...  no dialogs, ever
 #   --check-for-update-interval large: an offline cabinet must never nag
+#
+# Latency flags. The front end draws into one desynchronized canvas, and
+# these keep the path from that canvas to the panel as short as the Pi allows:
+#   --ignore-gpu-blocklist      the VideoCore VI is blocklisted by default,
+#                               which silently drops you to software raster
+#   --enable-gpu-rasterization  raster on the GPU, not the CPU
+#   --enable-zero-copy          no extra texture copy on upload
+#   --canvas-oop-rasterization  canvas raster off the main thread
+#   --force-device-scale-factor=1  never resample a 1080x1920 panel
 exec "\$CHROMIUM" \\
   --kiosk \\
   --app="\$PAGE" \\
   --user-data-dir="\$PROFILE" \\
   --ozone-platform=wayland \\
-  --enable-features=VaapiVideoDecoder \\
+  --ignore-gpu-blocklist \\
+  --enable-gpu-rasterization \\
+  --enable-zero-copy \\
+  --canvas-oop-rasterization \\
+  --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\
   --disable-pinch \\
   --overscroll-history-navigation=0 \\
@@ -422,7 +434,16 @@ UNIT
   info "wire a momentary button between BCM${GPIO_PIN} and any GND pin"
 
   if [[ -n "$cfg" ]]; then
-    write_block "$cfg" "disable_splash=1"
+    write_block "$cfg" "$(cat <<'CFG'
+disable_splash=1
+# Full KMS driver: required for cage/Wayland and for GPU rasterisation.
+dtoverlay=vc4-kms-v3d
+# Two framebuffers rather than three keeps one less frame queued between
+# Chromium and the panel. On a cabinet, latency beats smoothing.
+max_framebuffers=2
+disable_overscan=1
+CFG
+)"
   fi
 }
 
@@ -453,7 +474,15 @@ install_splash() {
   if [[ -n "$cmdline" ]]; then
     local current; current="$(cat "$cmdline")"
     local wanted="$current"
-    for opt in quiet splash plymouth.ignore-serial-consoles logo.nologo vt.global_cursor_default=0; do
+    #
+    # usbhid.*poll=1 asks every USB input device for a report every 1ms
+    # instead of at its descriptor's default interval, which for cheap arcade
+    # encoders and many pads is 10ms. This is the largest single source of
+    # controller latency on a Pi and it is invisible from inside the browser.
+    #
+    for opt in quiet splash plymouth.ignore-serial-consoles logo.nologo \
+               vt.global_cursor_default=0 \
+               usbhid.jspoll=1 usbhid.kbpoll=1 usbhid.mousepoll=1; do
       grep -qw -- "$opt" <<<"$wanted" || wanted="$wanted $opt"
     done
     wanted="$(tr -s ' ' <<<"$wanted" | sed 's/^ *//; s/ *$//')"

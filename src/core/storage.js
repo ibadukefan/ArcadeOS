@@ -122,6 +122,9 @@ var SETTINGS_DEFAULTS = {
   /* On-cabinet frame timer. Off by default; the only way to confirm 60fps
    * on real hardware without attaching a debugger to a kiosk. */
   showFps: false,
+  /* Low-latency (desynchronized) canvas. On by default because it is the
+   * biggest single latency win; a setting because a few drivers tear. */
+  lowLatency: true,
 };
 
 var Settings = (function () {
@@ -139,6 +142,7 @@ var Settings = (function () {
     out.crt = raw.crt !== false;
     out.reducedMotion = raw.reducedMotion === true;
     out.showFps = raw.showFps === true;
+    out.lowLatency = raw.lowLatency !== false;
     return out;
   }
 
@@ -160,6 +164,7 @@ var Settings = (function () {
     s[name] = value;
     Store.set('settings', s);
     if (name === 'volume' || name === 'muted') audioRefresh();
+    if (name === 'lowLatency') renderRebuild();
     return value;
   }
 
@@ -170,9 +175,14 @@ var Settings = (function () {
     return all();
   }
 
-  /* Audio2 loads after storage in the bundle; only reachable post-boot. */
+  /* Audio2 and Render load after storage in the bundle; both of these are
+   * only reachable post-boot. */
   function audioRefresh() {
     if (typeof Audio2 !== 'undefined' && Audio2) Audio2.refresh();
+  }
+
+  function renderRebuild() {
+    if (typeof Render !== 'undefined' && Render && Render.rebuild) Render.rebuild();
   }
 
   return { all: all, get: get, set: set, reset: reset, _validate: validate };

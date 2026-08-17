@@ -55,6 +55,9 @@ function boot() {
 
   Render.init(canvas);
   Input.attach(window);
+  /* Sample controllers faster than the display refreshes, so a tap shorter
+   * than a frame is latched rather than lost. */
+  Input.startSampling();
 
   /* Seed from the clock so two cabinets do not play the same piece sequence,
    * while tests can still pin it with seedRng(). */

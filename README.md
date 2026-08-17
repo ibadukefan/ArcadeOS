@@ -252,7 +252,8 @@ Reachable from the dashboard with the d-pad.
 | **CONTROLLER** | `AUTO`, or force Xbox / PlayStation / Nintendo button layout |
 | **CRT VEIL** | The subtle scanline overlay |
 | **REDUCED MOTION** | Stills the drifting aurora and disables rumble |
-| **FRAME TIMER** | On-screen fps, mean/worst frame time, and a 16.7ms reference line |
+| **FRAME TIMER** | On-screen diagnostics: fps, mean/worst frame time, controller sample rate, audio latency, taps saved, full-screen ops |
+| **LOW LATENCY VIDEO** | Desynchronized canvas. On by default; turn off only if your panel tears |
 | **PAIR BLUETOOTH PAD** | Opens a two-minute pairing window |
 | **RESET HIGH SCORES** | Asks first |
 | **RESTART** / **SHUT DOWN** | Ask first, then do it properly |
@@ -498,10 +499,11 @@ it exists because of two real bugs:
 
 Both classes are now caught the moment they are drawn.
 
-Current coverage: 176 tests. Boot → dashboard → each game → pause → quit for
+Current coverage: 197 tests. Boot → dashboard → each game → pause → quit for
 all nine games; 1500+ randomised frames per game with varied `dt`; controller
 detection for Xbox, PlayStation, Nintendo and unknown pads; storage fresh,
-populated, corrupt and unavailable; per-frame draw budgets; and the Pi assets.
+populated, corrupt and unavailable; per-frame draw and full-screen-op budgets;
+sub-frame input latching; and the Pi assets.
 
 Failures reproduce: every random source is seeded.
 
@@ -589,6 +591,25 @@ Confirm the button is between the configured BCM pin and **ground**, and that
 you are holding it for a full second. Or switch to the kernel implementation,
 which is more robust: `sudo ./setup-arcade.sh --gpio-overlay && sudo reboot`.
 
+**The picture tears**
+
+Turn off **SETTINGS → LOW LATENCY VIDEO**. The desynchronized canvas skips a
+compositor hop, which is the single biggest latency win available, but a few
+driver and panel combinations will tear without that synchronisation. The
+setting takes effect immediately.
+
+**Controller feels laggy or drops inputs**
+
+Turn on **SETTINGS → FRAME TIMER** and read the input lines. `sample` should be
+around 250/s. If `pad` is much lower, USB polling is the limit — confirm
+`usbhid.jspoll=1` is in `cmdline.txt`, and prefer a wired pad or encoder over
+Bluetooth, which adds its own 10ms or so and cannot be tuned away.
+
+If inputs are dropped rather than late, check that `taps saved` is incrementing
+when you tap quickly. If it never moves and presses still go missing, the
+device is not reporting them at all — try another USB port, and avoid unpowered
+hubs.
+
 **Frame rate feels low**
 
 Turn on **SETTINGS → FRAME TIMER**. If the mean is above 16.7ms, try disabling
@@ -608,6 +629,64 @@ sudo ./setup-arcade.sh --uninstall && sudo reboot
 ```
 
 ---
+
+## Responsiveness
+
+The cabinet is built so that a press reaches the screen as fast as the
+hardware allows, and — more importantly — so that **no press is ever lost**.
+
+### Nothing is dropped
+
+`requestAnimationFrame` fires about 60 times a second. A button that goes down
+and back up between two callbacks is invisible to it, and an arcade microswitch
+contact can be well under 16ms. Measured on the original build, **every single
+sub-frame tap was dropped: 0 out of 20**, on both gamepad and keyboard.
+
+Two things fix that:
+
+- **Controllers are sampled at 250Hz**, on a timer independent of the display,
+  and every press is *latched* until a frame consumes it. A tap that is already
+  over by the time the frame runs still registers.
+- **Keyboard presses are latched in the event handler itself**, which is exact
+  and already timestamped by the browser. An arcade encoder in keyboard mode
+  needs no sampling at all.
+
+A held button still produces exactly one `hit`, and two taps inside one frame
+move a menu twice — because that is what the player did.
+
+The **taps saved** counter in the diagnostics overlay counts presses that had
+already been released by the time the frame ran. A rising number there is the
+latching working, not a fault.
+
+### Nothing arrives late
+
+| | |
+|---|---|
+| **Two full-screen operations per frame** | The backdrop is one opaque blit and the scanlines and vignette are baked into one 1:1 blit. It used to be five, which was ~10.4M pixel touches at 1080×1920 before a game drew anything. |
+| **Low-latency canvas** | `desynchronized` asks Chromium to skip a compositor hop. |
+| **`latencyHint: 'interactive'`** | The default WebAudio buffer can put 40–80ms between a press and its sound, which reads as input lag even when the frame was on time. |
+| **`usbhid.*poll=1`** | Asks every USB input device for a report every 1ms instead of its default, which for cheap encoders is often 10ms. This is the largest single source of controller latency on a Pi and is invisible from inside the browser. |
+| **`max_framebuffers=2`** | One less frame queued between Chromium and the panel. |
+| **GPU rasterization** | The VideoCore VI is on Chromium's blocklist by default, which silently drops you to software raster. `--ignore-gpu-blocklist` turns it back on. |
+
+### Measuring it yourself
+
+Turn on **SETTINGS → FRAME TIMER**. The overlay shows:
+
+```
+60.0 FPS
+avg 16.7  max 16.7ms
+sample 250/s
+pad 250/s   audio 12ms   video low-lat
+taps saved 3   fullscreen ops/f 2
+```
+
+- `sample` should be ~250/s. If it says `(rAF only)` the sampler did not start.
+- `pad` is how often the browser actually hands over fresh controller data. If
+  it is far below `sample`, the bottleneck is USB polling — check that
+  `usbhid.jspoll=1` made it into `cmdline.txt`.
+- `avg` above 16.7ms means frames are being missed; try turning off **CRT
+  VEIL** and turning on **REDUCED MOTION**.
 
 ## How it works
 
@@ -630,6 +709,10 @@ way, which took the dashboard from 362 `fillText` calls per frame to 4.
 auto-repeat is 360ms then 120ms; Tetris DAS is 170ms then 50ms; the rhythm
 game accumulates song position from `dt` rather than reading the audio clock,
 so it stays correct even when the audio context never starts.
+
+**Input is sampled faster than it is drawn.** The frame loop consumes latched
+presses rather than reading live button state, so the display rate sets how
+often you *see* the result, never whether the press was *noticed*.
 
 **Storage never breaks a game.** Every read and write goes through one wrapper
 with a try/catch and an in-memory fallback. A corrupt record costs you one row,

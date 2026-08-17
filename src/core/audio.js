@@ -26,7 +26,15 @@ var Audio2 = (function () {
       var AC = (typeof window !== 'undefined') &&
         (window.AudioContext || window.webkitAudioContext);
       if (!AC) { available = false; return null; }
-      ctx = new AC();
+      /*
+       * 'interactive' asks for the smallest buffer the device will give us.
+       * The default hint optimises for glitch-free playback with a fat
+       * buffer, which on a Pi can put 40-80ms between pressing a button and
+       * hearing it — enough to read as input lag even when the frame itself
+       * was on time.
+       */
+      try { ctx = new AC({ latencyHint: 'interactive' }); }
+      catch (e) { ctx = new AC(); }
       master = ctx.createGain();
       master.gain.value = level();
       master.connect(ctx.destination);
@@ -223,6 +231,14 @@ var Audio2 = (function () {
     now: now,
     /** Exposed for the rhythm game, which needs sample-accurate scheduling. */
     ctx: function () { return ensure(); },
+    /** Output latency in ms, for the diagnostics overlay. */
+    latencyMs: function () {
+      var c = ensure();
+      if (!c) return 0;
+      var base = (typeof c.baseLatency === 'number' && isFinite(c.baseLatency)) ? c.baseLatency : 0;
+      var out = (typeof c.outputLatency === 'number' && isFinite(c.outputLatency)) ? c.outputLatency : 0;
+      return (base + out) * 1000;
+    },
     available: function () { return available && !!ensure(); },
     _reset: function () { ctx = null; master = null; available = true; voices = 0; noiseBuf = null; },
   };

@@ -428,6 +428,9 @@ var SETTINGS_DEFAULTS = {
   /* On-cabinet frame timer. Off by default; the only way to confirm 60fps
    * on real hardware without attaching a debugger to a kiosk. */
   showFps: false,
+  /* Low-latency (desynchronized) canvas. On by default because it is the
+   * biggest single latency win; a setting because a few drivers tear. */
+  lowLatency: true,
 };
 
 var Settings = (function () {
@@ -445,6 +448,7 @@ var Settings = (function () {
     out.crt = raw.crt !== false;
     out.reducedMotion = raw.reducedMotion === true;
     out.showFps = raw.showFps === true;
+    out.lowLatency = raw.lowLatency !== false;
     return out;
   }
 
@@ -466,6 +470,7 @@ var Settings = (function () {
     s[name] = value;
     Store.set('settings', s);
     if (name === 'volume' || name === 'muted') audioRefresh();
+    if (name === 'lowLatency') renderRebuild();
     return value;
   }
 
@@ -476,9 +481,14 @@ var Settings = (function () {
     return all();
   }
 
-  /* Audio2 loads after storage in the bundle; only reachable post-boot. */
+  /* Audio2 and Render load after storage in the bundle; both of these are
+   * only reachable post-boot. */
   function audioRefresh() {
     if (typeof Audio2 !== 'undefined' && Audio2) Audio2.refresh();
+  }
+
+  function renderRebuild() {
+    if (typeof Render !== 'undefined' && Render && Render.rebuild) Render.rebuild();
   }
 
   return { all: all, get: get, set: set, reset: reset, _validate: validate };
@@ -615,7 +625,15 @@ var Audio2 = (function () {
       var AC = (typeof window !== 'undefined') &&
         (window.AudioContext || window.webkitAudioContext);
       if (!AC) { available = false; return null; }
-      ctx = new AC();
+      /*
+       * 'interactive' asks for the smallest buffer the device will give us.
+       * The default hint optimises for glitch-free playback with a fat
+       * buffer, which on a Pi can put 40-80ms between pressing a button and
+       * hearing it — enough to read as input lag even when the frame itself
+       * was on time.
+       */
+      try { ctx = new AC({ latencyHint: 'interactive' }); }
+      catch (e) { ctx = new AC(); }
       master = ctx.createGain();
       master.gain.value = level();
       master.connect(ctx.destination);
@@ -812,6 +830,14 @@ var Audio2 = (function () {
     now: now,
     /** Exposed for the rhythm game, which needs sample-accurate scheduling. */
     ctx: function () { return ensure(); },
+    /** Output latency in ms, for the diagnostics overlay. */
+    latencyMs: function () {
+      var c = ensure();
+      if (!c) return 0;
+      var base = (typeof c.baseLatency === 'number' && isFinite(c.baseLatency)) ? c.baseLatency : 0;
+      var out = (typeof c.outputLatency === 'number' && isFinite(c.outputLatency)) ? c.outputLatency : 0;
+      return (base + out) * 1000;
+    },
     available: function () { return available && !!ensure(); },
     _reset: function () { ctx = null; master = null; available = true; voices = 0; noiseBuf = null; },
   };
@@ -880,8 +906,16 @@ var Input = (function () {
     var s = {
       padIndex: -1,
       padId: '',
+      padStamp: -1,
       kind: 'keyboard',
       active: false,
+      /** Physical state as of the most recent sample. */
+      live: Object.create(null),
+      /** Presses latched since the last frame consumed them. See LATCHING. */
+      edge: Object.create(null),
+      /** Live state at the previous sample, for transition detection. */
+      sampled: Object.create(null),
+
       down: Object.create(null),
       prev: Object.create(null),
       hit: Object.create(null),
@@ -890,6 +924,7 @@ var Input = (function () {
     };
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
+      s.live[a] = false; s.edge[a] = 0; s.sampled[a] = false;
       s.down[a] = false; s.prev[a] = false; s.hit[a] = false;
       s.reps[a] = 0; s.timer[a] = 0;
     }
@@ -1000,7 +1035,15 @@ var Input = (function () {
     return out;
   }
 
+  /* Two reusable scratch maps: nothing in the sample path allocates. */
   var scratch = Object.create(null);
+  var padScratch = Object.create(null);
+
+  /* Diagnostics, surfaced by the on-cabinet overlay. */
+  var sampleCount = 0;
+  var padUpdates = 0;
+  var tapsSaved = 0;
+  var sampleTimer = 0;
 
   /**
    * Advance edge/repeat bookkeeping for one slot from its freshly-computed
@@ -1009,16 +1052,24 @@ var Input = (function () {
   function step(slot, dt) {
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
-      var isDown = !!slot.down[a];
+      var isDown = !!slot.live[a];
       var wasDown = !!slot.prev[a];
-      slot.hit[a] = isDown && !wasDown;
+      /* A press latched at ANY point since the last frame counts, even if the
+       * button is already back up by now. */
+      var presses = slot.edge[a] | 0;
+
+      slot.down[a] = isDown;
+      slot.hit[a] = presses > 0;
       slot.reps[a] = 0;
 
-      if (isDown && !wasDown) {
-        slot.reps[a] = 1;
+      if (presses > 0) {
+        /* Two taps inside one frame move a menu twice — that is what the
+         * player did, so that is what happens. */
+        slot.reps[a] = presses > 4 ? 4 : presses;
         slot.timer[a] = REPEAT_DELAY;
         activity = true;
-      } else if (isDown) {
+        if (!isDown) tapsSaved++;
+      } else if (isDown && wasDown) {
         slot.timer[a] -= dt;
         /* Cap the catch-up so a long stall cannot fire a hundred steps. */
         var guard = 0;
@@ -1028,10 +1079,12 @@ var Input = (function () {
           guard++;
         }
         if (guard >= 8) slot.timer[a] = REPEAT_RATE;
-      } else {
+      } else if (!isDown) {
         slot.timer[a] = 0;
       }
+
       slot.prev[a] = isDown;
+      slot.edge[a] = 0;
     }
   }
 
@@ -1066,14 +1119,91 @@ var Input = (function () {
   }
 
   /**
-   * Poll every device and recompute all action state. Called exactly once per
-   * frame by the shell, before any update().
+   * Read every device once and latch any new presses.
+   *
+   * This is deliberately separate from poll(): it runs on a fast timer as
+   * well as once per frame, because a display-rate poll physically cannot see
+   * a button that goes down and back up between two frames. An arcade
+   * microswitch contact can be well under 16ms, and a dropped press feels far
+   * worse than a late one.
    */
-  function poll(dt) {
-    var d = clamp(num(dt, 16), 0, 250);
+  function sample(checkHotplug) {
     var list = pads();
+    sampleCount++;
 
-    /* --- hot-plug: rebuild the signature and reconcile slots ---------- */
+    /* --- hot-plug: rebuild the signature and reconcile slots ----------
+     *
+     * Only on frame polls, never on the fast timer. Building the signature
+     * concatenates a string per connected pad, and doing that 250 times a
+     * second to notice something that happens once a week is pure garbage.
+     * Sixty checks a second is far more than enough to feel instant.
+     */
+    if (checkHotplug) hotplug(list);
+
+    /* --- per-slot live state, latching every 0->1 transition ---------- */
+    for (var pi = 0; pi < MAX_PLAYERS; pi++) {
+      var slot = players[pi];
+      var a, act;
+
+      for (a = 0; a < ACTIONS.length; a++) scratch[ACTIONS[a]] = false;
+
+      if (slot.active) {
+        /* Keyboard drives player 1 only. Its edges are latched in the
+         * keydown handler, which is earlier and exact; this only tracks the
+         * held state. */
+        if (pi === 0) {
+          for (var code in keys) {
+            if (!keys[code]) continue;
+            act = KEYMAP[code];
+            if (act) scratch[act] = true;
+          }
+        }
+
+        if (slot.padIndex !== -1) {
+          var g = list[slot.padIndex];
+          if (g && g.connected) {
+            readPad(g, layoutOf(slot), padScratch);
+            for (var b = 0; b < ACTIONS.length; b++) {
+              if (padScratch[ACTIONS[b]]) scratch[ACTIONS[b]] = true;
+            }
+            /* gamepad.timestamp only advances when the snapshot changes, so
+             * it measures how fast the browser is really giving us data. */
+            if (g.timestamp !== slot.padStamp) {
+              slot.padStamp = g.timestamp;
+              padUpdates++;
+            }
+          }
+        }
+      }
+
+      for (a = 0; a < ACTIONS.length; a++) {
+        act = ACTIONS[a];
+        var now = !!scratch[act];
+        /* Pad-driven edges only. Keyboard edges are latched on the event so
+         * that a tap between samples is never lost. */
+        if (now && !slot.sampled[act] && !(pi === 0 && keyboardHolds(act))) {
+          slot.edge[act]++;
+        }
+        slot.sampled[act] = now;
+        slot.live[act] = now;
+      }
+    }
+
+    /* --- unassigned pads: watch only for a Start press to join -------- */
+    for (var pk in pending) {
+      var idx = +pk;
+      var pg = list[idx];
+      if (!pg || !pg.connected) continue;
+      if (btn(pg, 9) || btn(pg, 0)) {
+        assign(idx, pg.id);
+        activity = true;
+        Audio2.sfx('coin');
+      }
+    }
+  }
+
+  /** Reconcile connected pads against player slots. Frame-rate, not sample-rate. */
+  function hotplug(list) {
     var sig = '';
     var seen = Object.create(null);
     for (var i = 0; i < list.length; i++) {
@@ -1108,54 +1238,39 @@ var Input = (function () {
         else pending[j] = true;
       }
     }
+  }
 
-    /* --- per-slot action state --------------------------------------- */
-    for (var pi = 0; pi < MAX_PLAYERS; pi++) {
-      var slot = players[pi];
-      for (var a = 0; a < ACTIONS.length; a++) slot.down[ACTIONS[a]] = false;
-      if (!slot.active) { step(slot, d); continue; }
-
-      /* Keyboard drives player 1 only. */
-      if (pi === 0) {
-        for (var code in keys) {
-          if (!keys[code]) continue;
-          var act = KEYMAP[code];
-          if (act) slot.down[act] = true;
-        }
-      }
-
-      if (slot.padIndex !== -1) {
-        var g = list[slot.padIndex];
-        if (g && g.connected) {
-          readPad(g, layoutOf(slot), scratch);
-          for (var b = 0; b < ACTIONS.length; b++) {
-            if (scratch[ACTIONS[b]]) slot.down[ACTIONS[b]] = true;
-          }
-        }
-      }
-      step(slot, d);
+  /** True when a currently-held key maps to this action on player 1. */
+  function keyboardHolds(action) {
+    for (var code in keys) {
+      if (keys[code] && KEYMAP[code] === action) return true;
     }
+    return false;
+  }
 
-    /* --- unassigned pads: watch only for a Start press to join -------- */
-    for (var pk in pending) {
-      var idx = +pk;
-      var pg = list[idx];
-      if (!pg || !pg.connected) continue;
-      if (btn(pg, 9) || btn(pg, 0)) {
-        assign(idx, pg.id);
-        activity = true;
-        Audio2.sfx('coin');
-      }
-    }
+  /**
+   * Consume one frame's worth of input. Called exactly once per frame by the
+   * loop, before any update(). Samples once more first so the frame acts on
+   * the freshest possible state.
+   */
+  function poll(dt) {
+    var d = clamp(num(dt, 16), 0, 250);
+    sample(true);
+
+    for (var pi = 0; pi < MAX_PLAYERS; pi++) step(players[pi], d);
 
     /* --- aggregate --------------------------------------------------- */
     for (var ai = 0; ai < ACTIONS.length; ai++) {
       var act2 = ACTIONS[ai];
-      var on = false;
+      var on = false, edges = 0;
       for (var q = 0; q < MAX_PLAYERS; q++) {
-        if (players[q].active && players[q].down[act2]) { on = true; break; }
+        if (!players[q].active) continue;
+        if (players[q].live[act2]) on = true;
+        /* players[] already had step() run, so read the hit it produced. */
+        if (players[q].hit[act2]) edges += players[q].reps[act2];
       }
-      any.down[act2] = on;
+      any.live[act2] = on;
+      any.edge[act2] = edges;
     }
     step(any, d);
   }
@@ -1200,7 +1315,9 @@ var Input = (function () {
         var act = ACTIONS[a];
         all[i].hit[act] = false;
         all[i].reps[act] = 0;
-        all[i].prev[act] = all[i].down[act];
+        all[i].edge[act] = 0;
+        all[i].prev[act] = all[i].live[act];
+        all[i].down[act] = all[i].live[act];
         all[i].timer[act] = REPEAT_DELAY;
       }
     }
@@ -1240,8 +1357,21 @@ var Input = (function () {
     if (!t || !t.addEventListener) return;
     t.addEventListener('keydown', function (e) {
       var code = e.code || e.key;
-      if (KEYMAP[code]) {
-        if (!keys[code]) activity = true;
+      var act = KEYMAP[code];
+      if (act) {
+        /*
+         * Latch the press here rather than waiting for the next sample. A
+         * key event is exact and already timestamped by the browser, so a
+         * tap shorter than a frame — or shorter than a sample interval —
+         * still registers. e.repeat is ignored: auto-repeat is ours to do.
+         */
+        if (!keys[code] && !e.repeat) {
+          if (!keyboardHolds(act)) players[0].edge[act]++;
+          keys[code] = true;
+          players[0].live[act] = true;
+          players[0].sampled[act] = true;
+          activity = true;
+        }
         keys[code] = true;
         if (e.preventDefault) e.preventDefault();
       }
@@ -1259,8 +1389,40 @@ var Input = (function () {
     t.addEventListener('gamepadconnected', function () { Audio2.unlock(); }, false);
   }
 
+  /* ------------------------------------------------------- sampling --- */
+
+  /*
+   * Sample faster than the display refreshes.
+   *
+   * requestAnimationFrame fires at ~60Hz, and a button pressed and released
+   * between two callbacks is invisible to it. Chromium updates its gamepad
+   * snapshot on its own thread well above 60Hz, so sampling on a short timer
+   * catches those transitions and latches them for the next frame to consume.
+   *
+   * SAMPLE_MS is a floor on how briefly a press can be held and still count.
+   * 4ms is comfortably shorter than any human tap or switch bounce, and the
+   * work per sample is a handful of array reads.
+   */
+  var SAMPLE_MS = 4;
+
+  function startSampling() {
+    if (sampleTimer || typeof setInterval !== 'function') return;
+    sampleTimer = setInterval(function () {
+      try { sample(); } catch (e) { /* never let the sampler die */ }
+    }, SAMPLE_MS);
+  }
+
+  function stopSampling() {
+    if (sampleTimer && typeof clearInterval === 'function') clearInterval(sampleTimer);
+    sampleTimer = 0;
+  }
+
   return {
     poll: poll,
+    sample: sample,
+    startSampling: startSampling,
+    stopSampling: stopSampling,
+    SAMPLE_MS: SAMPLE_MS,
     attach: attach,
     down: down,
     hit: hit,
@@ -1290,6 +1452,20 @@ var Input = (function () {
     /** Human-readable layout of a slot, for the settings screen. */
     layoutOf: function (i) { return layoutOf(players[i || 0]); },
     kindOf: function (i) { return (players[i || 0] || players[0]).kind; },
+    /**
+     * Input health, for the on-cabinet overlay. `tapsSaved` counts presses
+     * that were already released by the time the frame ran — every one of
+     * those would have been silently dropped before latching existed.
+     */
+    diagnostics: function () {
+      return {
+        samples: sampleCount,
+        padUpdates: padUpdates,
+        tapsSaved: tapsSaved,
+        sampling: !!sampleTimer,
+        intervalMs: SAMPLE_MS,
+      };
+    },
     _faceMap: faceMap,
     _glyphsFor: glyphsFor,
     _keymap: KEYMAP,
@@ -1302,6 +1478,7 @@ var Input = (function () {
       any = newSlot();
       pending = Object.create(null);
       padSignature = ''; padsVersion = 0; joinVersion = 0; activity = false;
+      sampleCount = 0; padUpdates = 0; tapsSaved = 0;
     },
   };
 })();
@@ -1343,14 +1520,34 @@ var Render = (function () {
   /* Game-space transform, relative to shell space. */
   var gScale = 1, gox = 0, goy = 0;
 
-  /* Offscreen layers. */
-  var plate = null, plateCtx = null;
-  var aurora = null, auroraCtx = null;
-  var vig = null, vigCtx = null;
-  var veil = null, veilPattern = null;
+  /*
+   * Offscreen layers.
+   *
+   * FULL-SCREEN OPERATIONS ARE THE BUDGET. At 1080x1920 each one touches
+   * 2.07M pixels, and on a Pi 4's VideoCore VI that — not draw-call count —
+   * is what decides whether frames land. This composites down to exactly two
+   * per frame:
+   *
+   *   backdrop   one opaque upscaled blit (gradient plate + aurora blobs,
+   *              composed together at quarter resolution)
+   *   overlay    one 1:1 alpha blit (scanlines + vignette, baked once)
+   *
+   * The earlier arrangement used five (an opaque clear, a plate blit, an
+   * aurora blit, a pattern fill for the scanlines, and a vignette blit),
+   * which was ~10.4M pixel touches before a single game drew anything.
+   */
+  var plate = null;                     /* static background gradient, low-res */
+  var backdrop = null, backdropCtx = null;  /* plate + blobs, composed, low-res */
+  var overlay = null;                   /* scanlines + vignette, full-res */
+  var overlayKey = '';                  /* invalidates when CRT setting flips */
 
   var LOWRES = 4;      /* backdrop buffers render at 1/4 linear scale */
   var auroraT = 0;
+  var backdropDirty = true;
+  var lastTint = null;
+
+  /* Counts the expensive ops, so a regression is measurable not felt. */
+  var fullScreenOps = 0;
 
   function makeCanvas(w, h) {
     var c;
@@ -1364,13 +1561,40 @@ var Render = (function () {
     return c;
   }
 
+  /**
+   * `desynchronized` asks Chromium for the low-latency canvas path, which can
+   * skip a compositor hop and take a frame off input-to-photon. It is the
+   * single biggest latency win available to a full-screen canvas, but on some
+   * drivers it can tear, so it is a setting rather than a hard-coded choice.
+   */
+  function contextAttrs() {
+    var low = true;
+    try { low = Settings.get('lowLatency') !== false; } catch (e) { low = true; }
+    return { alpha: false, desynchronized: low };
+  }
+
   function init(el) {
     canvas = el;
-    ctx = canvas.getContext('2d', { alpha: false });
+    ctx = canvas.getContext('2d', contextAttrs());
     gx = ctx;
     sx = ctx;
     resize();
     return ctx;
+  }
+
+  /**
+   * Context attributes are fixed once a context exists, so changing the
+   * low-latency setting means a new canvas element. Cheap, and it means the
+   * setting applies immediately rather than "after a reboot".
+   */
+  function rebuild() {
+    if (!canvas || typeof document === 'undefined') return;
+    var fresh = document.createElement('canvas');
+    fresh.id = canvas.id;
+    if (canvas.parentNode && canvas.parentNode.replaceChild) {
+      canvas.parentNode.replaceChild(fresh, canvas);
+    }
+    init(fresh);
   }
 
   function resize() {
@@ -1410,12 +1634,10 @@ var Render = (function () {
     var lh = Math.max(2, Math.floor(H / LOWRES));
 
     plate = makeCanvas(lw, lh);
-    aurora = makeCanvas(lw, lh);
-    vig = makeCanvas(lw, lh);
-    if (!plate || !aurora || !vig) return;
-    plateCtx = plate.getContext('2d');
-    auroraCtx = aurora.getContext('2d');
-    vigCtx = vig.getContext('2d');
+    backdrop = makeCanvas(lw, lh);
+    if (!plate || !backdrop) return;
+    var plateCtx = plate.getContext('2d');
+    backdropCtx = backdrop.getContext('2d');
 
     /* radial-gradient(125% 80% at 50% -10%, #1D1748, #0D0A1F 55%, #07050E) */
     if (plateCtx) {
@@ -1429,33 +1651,56 @@ var Render = (function () {
       plateCtx.fillRect(0, 0, lw, lh);
     }
 
-    if (vigCtx) {
-      vigCtx.clearRect(0, 0, lw, lh);
-      var vr = Math.max(lw, lh) * 0.78;
-      var vg = vigCtx.createRadialGradient(lw / 2, lh / 2, vr * 0.42, lw / 2, lh / 2, vr);
-      vg.addColorStop(0, 'rgba(0,0,0,0)');
-      vg.addColorStop(1, 'rgba(0,0,0,0.55)');
-      vigCtx.fillStyle = vg;
-      vigCtx.fillRect(0, 0, lw, lh);
-    }
-
-    buildVeil();
+    overlayKey = '';
+    backdropDirty = true;
+    buildOverlay();
   }
 
-  /** Scanline veil as a 1x4 repeating pattern — one fill, no per-line loop. */
-  function buildVeil() {
-    veil = makeCanvas(1, 4);
-    veilPattern = null;
-    if (!veil) return;
-    var vc = veil.getContext('2d');
-    if (!vc) return;
-    vc.clearRect(0, 0, 1, 4);
-    vc.fillStyle = 'rgba(0,0,0,0.16)';
-    vc.fillRect(0, 0, 1, 1);
-    vc.fillStyle = 'rgba(0,0,0,0.06)';
-    vc.fillRect(0, 1, 1, 1);
-    try { veilPattern = ctx ? ctx.createPattern(veil, 'repeat') : null; }
-    catch (e) { veilPattern = null; }
+  /**
+   * Bake the scanline veil and the vignette into one full-resolution layer.
+   *
+   * Built once per resize (and when the CRT setting flips) so the per-frame
+   * cost is a single 1:1 blit instead of a repeating-pattern fill plus a
+   * scaled blit. Pattern fills are markedly slower than straight blits.
+   */
+  function buildOverlay() {
+    var crt = true;
+    try { crt = Settings.get('crt') !== false; } catch (e) { crt = true; }
+    var key = W + 'x' + H + (crt ? ':crt' : ':plain');
+    if (key === overlayKey && overlay) return;
+    overlayKey = key;
+
+    overlay = makeCanvas(W, H);
+    if (!overlay) return;
+    var oc = overlay.getContext('2d');
+    if (!oc) return;
+    oc.clearRect(0, 0, W, H);
+
+    if (crt) {
+      /* Two-tone scanlines on a 4px pitch, matching the previous veil. */
+      var veil = makeCanvas(1, 4);
+      if (veil) {
+        var vc = veil.getContext('2d');
+        if (vc) {
+          vc.clearRect(0, 0, 1, 4);
+          vc.fillStyle = 'rgba(0,0,0,0.16)';
+          vc.fillRect(0, 0, 1, 1);
+          vc.fillStyle = 'rgba(0,0,0,0.06)';
+          vc.fillRect(0, 1, 1, 1);
+          try {
+            var pat = oc.createPattern(veil, 'repeat');
+            if (pat) { oc.fillStyle = pat; oc.fillRect(0, 0, W, H); }
+          } catch (e) { /* no pattern support: skip the veil */ }
+        }
+      }
+    }
+
+    var vr = Math.max(W, H) * 0.78;
+    var vg = oc.createRadialGradient(W / 2, H / 2, vr * 0.42, W / 2, H / 2, vr);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    oc.fillStyle = vg;
+    oc.fillRect(0, 0, W, H);
   }
 
   /**
@@ -1469,10 +1714,16 @@ var Render = (function () {
     { c: COL.a3, x: 0.42, y: 0.80, r: 0.58, sx: 0.048, sy: 0.033, px: 0.15, py: 0.07, a: 0.24 },
   ];
 
-  function drawAurora(t, tint) {
-    if (!auroraCtx || !aurora) return;
-    var lw = aurora.width, lh = aurora.height;
-    auroraCtx.clearRect(0, 0, lw, lh);
+  /**
+   * Compose the gradient plate and the drifting blobs into one opaque
+   * low-resolution buffer. Blending the blobs straight onto the plate here is
+   * visually identical to compositing two full-screen layers, and costs one
+   * upscaled blit instead of two.
+   */
+  function composeBackdrop(t, tint) {
+    if (!backdropCtx || !backdrop || !plate) return;
+    var lw = backdrop.width, lh = backdrop.height;
+    backdropCtx.drawImage(plate, 0, 0);
     var sec = t / 1000;
     for (var i = 0; i < BLOBS.length; i++) {
       var b = BLOBS[i];
@@ -1481,12 +1732,12 @@ var Render = (function () {
       var br = b.r * Math.min(lw, lh);
       if (!isFinite(bx) || !isFinite(by) || br <= 0) continue;
       var col = (tint && i === 1) ? tint : b.c;
-      var g = auroraCtx.createRadialGradient(bx, by, 0, bx, by, br);
+      var g = backdropCtx.createRadialGradient(bx, by, 0, bx, by, br);
       g.addColorStop(0, rgba(col, b.a));
       g.addColorStop(0.5, rgba(col, b.a * 0.35));
       g.addColorStop(1, rgba(col, 0));
-      auroraCtx.fillStyle = g;
-      auroraCtx.fillRect(0, 0, lw, lh);
+      backdropCtx.fillStyle = g;
+      backdropCtx.fillRect(0, 0, lw, lh);
     }
   }
 
@@ -1498,18 +1749,28 @@ var Render = (function () {
     if (!ctx) return null;
     var reduced = false;
     try { reduced = !!Settings.get('reducedMotion'); } catch (e) { reduced = false; }
-    if (!reduced) auroraT += num(dt, 16);
+    if (!reduced) { auroraT += num(dt, 16); backdropDirty = true; }
+    if (tint !== lastTint) { lastTint = tint; backdropDirty = true; }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = COL.bgBot;
-    ctx.fillRect(0, 0, W, H);
 
-    if (plate) ctx.drawImage(plate, 0, 0, W, H);
-    drawAurora(auroraT, tint);
-    if (aurora) {
-      ctx.globalAlpha = 1;
-      ctx.drawImage(aurora, 0, 0, W, H);
+    /* With reduced motion the blobs are still, so the buffer only needs
+     * rebuilding when something else changed. */
+    if (backdropDirty) {
+      composeBackdrop(auroraT, tint);
+      backdropDirty = false;
+    }
+
+    /* Full-screen op 1 of 2. Opaque, so no per-pixel blend, and it covers
+     * the frame completely — there is nothing to clear first. */
+    if (backdrop) {
+      ctx.drawImage(backdrop, 0, 0, W, H);
+      fullScreenOps++;
+    } else {
+      ctx.fillStyle = COL.bgBot;
+      ctx.fillRect(0, 0, W, H);
+      fullScreenOps++;
     }
 
     /* Enter shell space. */
@@ -1523,13 +1784,12 @@ var Render = (function () {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
 
-    var crt = true;
-    try { crt = Settings.get('crt') !== false; } catch (e) { crt = true; }
-    if (crt && veilPattern) {
-      ctx.fillStyle = veilPattern;
-      ctx.fillRect(0, 0, W, H);
+    /* Full-screen op 2 of 2: scanlines and vignette in a single 1:1 blit. */
+    buildOverlay();
+    if (overlay) {
+      ctx.drawImage(overlay, 0, 0);
+      fullScreenOps++;
     }
-    if (vig) ctx.drawImage(vig, 0, 0, W, H);
 
     /* Letterbox bars, in case the panel is not 9:16. */
     if (ox > 0.5 || oy > 0.5) {
@@ -1619,6 +1879,15 @@ var Render = (function () {
     ctx: function () { return ctx; },
     size: function () { return { w: W, h: H, scale: scale, ox: ox, oy: oy }; },
     gameRect: function () { return { x: gox, y: goy, w: GW * gScale, h: GH * gScale, s: gScale }; },
+    /** Force the low-latency context setting to take effect now. */
+    rebuild: rebuild,
+    lowLatency: function () {
+      try { return !!(ctx && ctx.getContextAttributes &&
+        ctx.getContextAttributes().desynchronized); } catch (e) { return false; }
+    },
+    /** Full-screen blits/fills issued since the last reset. Two per frame. */
+    fullScreenOps: function () { return fullScreenOps; },
+    _resetOps: function () { fullScreenOps = 0; },
     _clearGlow: function () { glowCache = Object.create(null); glowKeys = []; },
     _cacheSizes: function () {
       return { glow: glowKeys.length, text: textKeys.length };
@@ -5751,6 +6020,8 @@ var Shell = (function () {
   for (var ftI = 0; ftI < FT_N; ftI++) frameTimes[ftI] = 16.667;
   var frameAt = 0;
   var worstFrame = 0;
+  var frameOps = 0;
+  var lastOps = 0;
 
   var ATTRACT_AFTER = 60000;
   var attract = { game: null, timer: 0, index: 0 };
@@ -6017,6 +6288,7 @@ var Shell = (function () {
       { id: 'crt', label: 'CRT VEIL', type: 'toggle', on: s.crt },
       { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
+      { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
@@ -6194,6 +6466,11 @@ var Shell = (function () {
     frameTimes[frameAt] = dt;
     frameAt = (frameAt + 1) % FT_N;
     if (dt > worstFrame) worstFrame = dt;
+    /* Delta, not a reset: the counter is monotonic so tests can sample it
+     * over a window without the shell clearing it underneath them. */
+    var opsNow = Render.fullScreenOps();
+    frameOps = opsNow - lastOps;
+    lastOps = opsNow;
     if (fade > 0) fade = Math.max(0, fade - dt / 260);
 
     if (toast) {
@@ -6856,18 +7133,44 @@ var Shell = (function () {
     var fps = mean > 0 ? 1000 / mean : 0;
     var bad = mean > 17.5;
 
-    panel(c, 16, SH - 96, 300, 64, {
-      fill: 'rgba(7,5,14,.86)', stroke: bad ? rgba(COL.warn, 0.6) : COL.cardLine,
+    panel(c, 16, SH - 330, 480, 144, {
+      fill: 'rgba(7,5,14,.88)', stroke: bad ? rgba(COL.warn, 0.6) : COL.cardLine,
       radius: 10,
     });
-    dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 68, {
+    dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 302, {
       size: 20, color: bad ? COL.warn : COL.a1,
     });
     dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) + 'ms',
-      32, SH - 46, { size: 14, color: COL.dim });
+      32, SH - 280, { size: 14, color: COL.dim });
+
+    /*
+     * The input half. These are the numbers that answer "does the controller
+     * feel right", which frame time alone cannot:
+     *
+     *   sample   how often we read the pads (should be ~250/s)
+     *   pad      how often the browser actually gives us fresh pad data
+     *   saved    presses that had already been released by the time the frame
+     *            ran — every one of these was silently dropped before
+     *            latching existed, so a rising number here is the feature
+     *            working, not a fault
+     */
+    var d = Input.diagnostics();
+    var elapsed = Math.max(1, t) / 1000;
+    dataText(c, 'sample ' + Math.round(d.samples / elapsed) + '/s' +
+      (d.sampling ? '' : ' (rAF only)'), 32, SH - 254, {
+      size: 14, color: d.sampling ? COL.dim : COL.warn,
+    });
+    dataText(c, 'pad ' + Math.round(d.padUpdates / elapsed) + '/s' +
+      '   audio ' + Audio2.latencyMs().toFixed(0) + 'ms' +
+      '   video ' + (Render.lowLatency() ? 'low-lat' : 'normal'),
+      32, SH - 232, { size: 14, color: COL.dim });
+    dataText(c, 'taps saved ' + d.tapsSaved +
+      '   fullscreen ops/f ' + (frameOps || 2), 32, SH - 210, {
+      size: 14, color: d.tapsSaved > 0 ? COL.a1 : COL.dim,
+    });
 
     /* A 16.7ms reference line, so "over budget" is visible not calculated. */
-    var bx = 176, bw = 124, by = SH - 78;
+    var bx = 340, bw = 140, by = SH - 312;
     c.fillStyle = 'rgba(110,106,160,.22)';
     c.fillRect(bx, by, bw, 26);
     for (var k = 0; k < FT_N; k++) {
@@ -7015,6 +7318,9 @@ function boot() {
 
   Render.init(canvas);
   Input.attach(window);
+  /* Sample controllers faster than the display refreshes, so a tap shorter
+   * than a frame is latched rather than lost. */
+  Input.startSampling();
 
   /* Seed from the clock so two cabinets do not play the same piece sequence,
    * while tests can still pin it with seedRng(). */

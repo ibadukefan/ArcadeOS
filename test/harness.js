@@ -226,9 +226,16 @@ class MockCanvas {
     this.width = 300;
     this.height = 150;
     this.style = {};
+    this.id = '';
+    this.parentNode = null;
+    /** Whatever attributes the app requested, for the low-latency tests. */
+    this.contextAttrs = null;
     this._ctx = new MockContext(this, stats);
   }
-  getContext() { return this._ctx; }
+  getContext(type, attrs) {
+    if (attrs) this.contextAttrs = attrs;
+    return this._ctx;
+  }
   addEventListener() {}
   removeEventListener() {}
   focus() {}
@@ -254,13 +261,28 @@ function makeEnv(opts = {}) {
     return c;
   }
 
-  const screen = newCanvas();
+  let screen = newCanvas();
+  /* Minimal parent so Render.rebuild() can swap the canvas element the way
+   * it does in a real DOM. */
+  const parent = {
+    replaceChild(fresh, old) {
+      fresh.parentNode = parent;
+      old.parentNode = null;
+      screen = fresh;
+    },
+  };
+  screen.parentNode = parent;
+  screen.id = 'screen';
 
   const document = {
     readyState: 'complete',
     getElementById: (id) => (id === 'screen' ? screen : null),
     createElement: (tag) => {
-      if (String(tag).toLowerCase() === 'canvas') return newCanvas();
+      if (String(tag).toLowerCase() === 'canvas') {
+        const c = newCanvas();
+        c.parentNode = parent;
+        return c;
+      }
       return { style: {}, addEventListener() {}, appendChild() {} };
     },
     addEventListener() {},
@@ -305,7 +327,10 @@ function makeEnv(opts = {}) {
     removeEventListener() {},
     matchMedia: () => ({ matches: true, addEventListener() {} }),
     /* No AudioContext: exercises the silent-degradation path by default. */
-    AudioContext: opts.audio ? function FakeAudioContext() {
+    AudioContext: opts.audio ? function FakeAudioContext(options) {
+      sandbox.__audioLatencyHint = options && options.latencyHint;
+      this.baseLatency = 0.005;
+      this.outputLatency = 0.010;
       this.currentTime = 0;
       this.sampleRate = 48000;
       this.state = 'running';
@@ -333,6 +358,14 @@ function makeEnv(opts = {}) {
     cancelAnimationFrame: () => {},
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (h) => clearTimeout(h),
+    /* The input sampler runs on an interval. Tests that start it must stop
+     * it; timers are unref'd so a leak cannot hold the process open. */
+    setInterval: (fn, ms) => {
+      const h = setInterval(fn, ms);
+      if (h && h.unref) h.unref();
+      return h;
+    },
+    clearInterval: (h) => clearInterval(h),
     console,
     Math, JSON, Date, Object, Array, String, Number, Boolean, Error,
     Int8Array, Int16Array, Uint8Array, Uint8ClampedArray, Int32Array,
@@ -347,11 +380,21 @@ function makeEnv(opts = {}) {
   const code = bundleJs();
   vm.runInContext(code, sandbox, { filename: 'dist/arcade.bundle.js' });
 
+  /*
+   * boot() starts the 250Hz input sampler. Leave it running and every test
+   * environment would keep a live timer firing between assertions, making the
+   * suite nondeterministic and slow. Tests drive Input.sample() explicitly
+   * instead; pass {sampling: true} to exercise the timer itself.
+   */
+  if (!opts.sampling && sandbox.ArcadeOS && sandbox.ArcadeOS.Input) {
+    sandbox.ArcadeOS.Input.stopSampling();
+  }
+
   return {
     sandbox,
     stats,
     canvases,
-    screen,
+    get screen() { return screen; },
     listeners,
     fireKey(code2, isDown) {
       const type = isDown ? 'keydown' : 'keyup';

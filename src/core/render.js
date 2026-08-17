@@ -34,14 +34,34 @@ var Render = (function () {
   /* Game-space transform, relative to shell space. */
   var gScale = 1, gox = 0, goy = 0;
 
-  /* Offscreen layers. */
-  var plate = null, plateCtx = null;
-  var aurora = null, auroraCtx = null;
-  var vig = null, vigCtx = null;
-  var veil = null, veilPattern = null;
+  /*
+   * Offscreen layers.
+   *
+   * FULL-SCREEN OPERATIONS ARE THE BUDGET. At 1080x1920 each one touches
+   * 2.07M pixels, and on a Pi 4's VideoCore VI that — not draw-call count —
+   * is what decides whether frames land. This composites down to exactly two
+   * per frame:
+   *
+   *   backdrop   one opaque upscaled blit (gradient plate + aurora blobs,
+   *              composed together at quarter resolution)
+   *   overlay    one 1:1 alpha blit (scanlines + vignette, baked once)
+   *
+   * The earlier arrangement used five (an opaque clear, a plate blit, an
+   * aurora blit, a pattern fill for the scanlines, and a vignette blit),
+   * which was ~10.4M pixel touches before a single game drew anything.
+   */
+  var plate = null;                     /* static background gradient, low-res */
+  var backdrop = null, backdropCtx = null;  /* plate + blobs, composed, low-res */
+  var overlay = null;                   /* scanlines + vignette, full-res */
+  var overlayKey = '';                  /* invalidates when CRT setting flips */
 
   var LOWRES = 4;      /* backdrop buffers render at 1/4 linear scale */
   var auroraT = 0;
+  var backdropDirty = true;
+  var lastTint = null;
+
+  /* Counts the expensive ops, so a regression is measurable not felt. */
+  var fullScreenOps = 0;
 
   function makeCanvas(w, h) {
     var c;
@@ -55,13 +75,40 @@ var Render = (function () {
     return c;
   }
 
+  /**
+   * `desynchronized` asks Chromium for the low-latency canvas path, which can
+   * skip a compositor hop and take a frame off input-to-photon. It is the
+   * single biggest latency win available to a full-screen canvas, but on some
+   * drivers it can tear, so it is a setting rather than a hard-coded choice.
+   */
+  function contextAttrs() {
+    var low = true;
+    try { low = Settings.get('lowLatency') !== false; } catch (e) { low = true; }
+    return { alpha: false, desynchronized: low };
+  }
+
   function init(el) {
     canvas = el;
-    ctx = canvas.getContext('2d', { alpha: false });
+    ctx = canvas.getContext('2d', contextAttrs());
     gx = ctx;
     sx = ctx;
     resize();
     return ctx;
+  }
+
+  /**
+   * Context attributes are fixed once a context exists, so changing the
+   * low-latency setting means a new canvas element. Cheap, and it means the
+   * setting applies immediately rather than "after a reboot".
+   */
+  function rebuild() {
+    if (!canvas || typeof document === 'undefined') return;
+    var fresh = document.createElement('canvas');
+    fresh.id = canvas.id;
+    if (canvas.parentNode && canvas.parentNode.replaceChild) {
+      canvas.parentNode.replaceChild(fresh, canvas);
+    }
+    init(fresh);
   }
 
   function resize() {
@@ -101,12 +148,10 @@ var Render = (function () {
     var lh = Math.max(2, Math.floor(H / LOWRES));
 
     plate = makeCanvas(lw, lh);
-    aurora = makeCanvas(lw, lh);
-    vig = makeCanvas(lw, lh);
-    if (!plate || !aurora || !vig) return;
-    plateCtx = plate.getContext('2d');
-    auroraCtx = aurora.getContext('2d');
-    vigCtx = vig.getContext('2d');
+    backdrop = makeCanvas(lw, lh);
+    if (!plate || !backdrop) return;
+    var plateCtx = plate.getContext('2d');
+    backdropCtx = backdrop.getContext('2d');
 
     /* radial-gradient(125% 80% at 50% -10%, #1D1748, #0D0A1F 55%, #07050E) */
     if (plateCtx) {
@@ -120,33 +165,56 @@ var Render = (function () {
       plateCtx.fillRect(0, 0, lw, lh);
     }
 
-    if (vigCtx) {
-      vigCtx.clearRect(0, 0, lw, lh);
-      var vr = Math.max(lw, lh) * 0.78;
-      var vg = vigCtx.createRadialGradient(lw / 2, lh / 2, vr * 0.42, lw / 2, lh / 2, vr);
-      vg.addColorStop(0, 'rgba(0,0,0,0)');
-      vg.addColorStop(1, 'rgba(0,0,0,0.55)');
-      vigCtx.fillStyle = vg;
-      vigCtx.fillRect(0, 0, lw, lh);
-    }
-
-    buildVeil();
+    overlayKey = '';
+    backdropDirty = true;
+    buildOverlay();
   }
 
-  /** Scanline veil as a 1x4 repeating pattern — one fill, no per-line loop. */
-  function buildVeil() {
-    veil = makeCanvas(1, 4);
-    veilPattern = null;
-    if (!veil) return;
-    var vc = veil.getContext('2d');
-    if (!vc) return;
-    vc.clearRect(0, 0, 1, 4);
-    vc.fillStyle = 'rgba(0,0,0,0.16)';
-    vc.fillRect(0, 0, 1, 1);
-    vc.fillStyle = 'rgba(0,0,0,0.06)';
-    vc.fillRect(0, 1, 1, 1);
-    try { veilPattern = ctx ? ctx.createPattern(veil, 'repeat') : null; }
-    catch (e) { veilPattern = null; }
+  /**
+   * Bake the scanline veil and the vignette into one full-resolution layer.
+   *
+   * Built once per resize (and when the CRT setting flips) so the per-frame
+   * cost is a single 1:1 blit instead of a repeating-pattern fill plus a
+   * scaled blit. Pattern fills are markedly slower than straight blits.
+   */
+  function buildOverlay() {
+    var crt = true;
+    try { crt = Settings.get('crt') !== false; } catch (e) { crt = true; }
+    var key = W + 'x' + H + (crt ? ':crt' : ':plain');
+    if (key === overlayKey && overlay) return;
+    overlayKey = key;
+
+    overlay = makeCanvas(W, H);
+    if (!overlay) return;
+    var oc = overlay.getContext('2d');
+    if (!oc) return;
+    oc.clearRect(0, 0, W, H);
+
+    if (crt) {
+      /* Two-tone scanlines on a 4px pitch, matching the previous veil. */
+      var veil = makeCanvas(1, 4);
+      if (veil) {
+        var vc = veil.getContext('2d');
+        if (vc) {
+          vc.clearRect(0, 0, 1, 4);
+          vc.fillStyle = 'rgba(0,0,0,0.16)';
+          vc.fillRect(0, 0, 1, 1);
+          vc.fillStyle = 'rgba(0,0,0,0.06)';
+          vc.fillRect(0, 1, 1, 1);
+          try {
+            var pat = oc.createPattern(veil, 'repeat');
+            if (pat) { oc.fillStyle = pat; oc.fillRect(0, 0, W, H); }
+          } catch (e) { /* no pattern support: skip the veil */ }
+        }
+      }
+    }
+
+    var vr = Math.max(W, H) * 0.78;
+    var vg = oc.createRadialGradient(W / 2, H / 2, vr * 0.42, W / 2, H / 2, vr);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    oc.fillStyle = vg;
+    oc.fillRect(0, 0, W, H);
   }
 
   /**
@@ -160,10 +228,16 @@ var Render = (function () {
     { c: COL.a3, x: 0.42, y: 0.80, r: 0.58, sx: 0.048, sy: 0.033, px: 0.15, py: 0.07, a: 0.24 },
   ];
 
-  function drawAurora(t, tint) {
-    if (!auroraCtx || !aurora) return;
-    var lw = aurora.width, lh = aurora.height;
-    auroraCtx.clearRect(0, 0, lw, lh);
+  /**
+   * Compose the gradient plate and the drifting blobs into one opaque
+   * low-resolution buffer. Blending the blobs straight onto the plate here is
+   * visually identical to compositing two full-screen layers, and costs one
+   * upscaled blit instead of two.
+   */
+  function composeBackdrop(t, tint) {
+    if (!backdropCtx || !backdrop || !plate) return;
+    var lw = backdrop.width, lh = backdrop.height;
+    backdropCtx.drawImage(plate, 0, 0);
     var sec = t / 1000;
     for (var i = 0; i < BLOBS.length; i++) {
       var b = BLOBS[i];
@@ -172,12 +246,12 @@ var Render = (function () {
       var br = b.r * Math.min(lw, lh);
       if (!isFinite(bx) || !isFinite(by) || br <= 0) continue;
       var col = (tint && i === 1) ? tint : b.c;
-      var g = auroraCtx.createRadialGradient(bx, by, 0, bx, by, br);
+      var g = backdropCtx.createRadialGradient(bx, by, 0, bx, by, br);
       g.addColorStop(0, rgba(col, b.a));
       g.addColorStop(0.5, rgba(col, b.a * 0.35));
       g.addColorStop(1, rgba(col, 0));
-      auroraCtx.fillStyle = g;
-      auroraCtx.fillRect(0, 0, lw, lh);
+      backdropCtx.fillStyle = g;
+      backdropCtx.fillRect(0, 0, lw, lh);
     }
   }
 
@@ -189,18 +263,28 @@ var Render = (function () {
     if (!ctx) return null;
     var reduced = false;
     try { reduced = !!Settings.get('reducedMotion'); } catch (e) { reduced = false; }
-    if (!reduced) auroraT += num(dt, 16);
+    if (!reduced) { auroraT += num(dt, 16); backdropDirty = true; }
+    if (tint !== lastTint) { lastTint = tint; backdropDirty = true; }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = COL.bgBot;
-    ctx.fillRect(0, 0, W, H);
 
-    if (plate) ctx.drawImage(plate, 0, 0, W, H);
-    drawAurora(auroraT, tint);
-    if (aurora) {
-      ctx.globalAlpha = 1;
-      ctx.drawImage(aurora, 0, 0, W, H);
+    /* With reduced motion the blobs are still, so the buffer only needs
+     * rebuilding when something else changed. */
+    if (backdropDirty) {
+      composeBackdrop(auroraT, tint);
+      backdropDirty = false;
+    }
+
+    /* Full-screen op 1 of 2. Opaque, so no per-pixel blend, and it covers
+     * the frame completely — there is nothing to clear first. */
+    if (backdrop) {
+      ctx.drawImage(backdrop, 0, 0, W, H);
+      fullScreenOps++;
+    } else {
+      ctx.fillStyle = COL.bgBot;
+      ctx.fillRect(0, 0, W, H);
+      fullScreenOps++;
     }
 
     /* Enter shell space. */
@@ -214,13 +298,12 @@ var Render = (function () {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
 
-    var crt = true;
-    try { crt = Settings.get('crt') !== false; } catch (e) { crt = true; }
-    if (crt && veilPattern) {
-      ctx.fillStyle = veilPattern;
-      ctx.fillRect(0, 0, W, H);
+    /* Full-screen op 2 of 2: scanlines and vignette in a single 1:1 blit. */
+    buildOverlay();
+    if (overlay) {
+      ctx.drawImage(overlay, 0, 0);
+      fullScreenOps++;
     }
-    if (vig) ctx.drawImage(vig, 0, 0, W, H);
 
     /* Letterbox bars, in case the panel is not 9:16. */
     if (ox > 0.5 || oy > 0.5) {
@@ -310,6 +393,15 @@ var Render = (function () {
     ctx: function () { return ctx; },
     size: function () { return { w: W, h: H, scale: scale, ox: ox, oy: oy }; },
     gameRect: function () { return { x: gox, y: goy, w: GW * gScale, h: GH * gScale, s: gScale }; },
+    /** Force the low-latency context setting to take effect now. */
+    rebuild: rebuild,
+    lowLatency: function () {
+      try { return !!(ctx && ctx.getContextAttributes &&
+        ctx.getContextAttributes().desynchronized); } catch (e) { return false; }
+    },
+    /** Full-screen blits/fills issued since the last reset. Two per frame. */
+    fullScreenOps: function () { return fullScreenOps; },
+    _resetOps: function () { fullScreenOps = 0; },
     _clearGlow: function () { glowCache = Object.create(null); glowKeys = []; },
     _cacheSizes: function () {
       return { glow: glowKeys.length, text: textKeys.length };

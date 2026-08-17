@@ -60,8 +60,16 @@ var Input = (function () {
     var s = {
       padIndex: -1,
       padId: '',
+      padStamp: -1,
       kind: 'keyboard',
       active: false,
+      /** Physical state as of the most recent sample. */
+      live: Object.create(null),
+      /** Presses latched since the last frame consumed them. See LATCHING. */
+      edge: Object.create(null),
+      /** Live state at the previous sample, for transition detection. */
+      sampled: Object.create(null),
+
       down: Object.create(null),
       prev: Object.create(null),
       hit: Object.create(null),
@@ -70,6 +78,7 @@ var Input = (function () {
     };
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
+      s.live[a] = false; s.edge[a] = 0; s.sampled[a] = false;
       s.down[a] = false; s.prev[a] = false; s.hit[a] = false;
       s.reps[a] = 0; s.timer[a] = 0;
     }
@@ -180,7 +189,15 @@ var Input = (function () {
     return out;
   }
 
+  /* Two reusable scratch maps: nothing in the sample path allocates. */
   var scratch = Object.create(null);
+  var padScratch = Object.create(null);
+
+  /* Diagnostics, surfaced by the on-cabinet overlay. */
+  var sampleCount = 0;
+  var padUpdates = 0;
+  var tapsSaved = 0;
+  var sampleTimer = 0;
 
   /**
    * Advance edge/repeat bookkeeping for one slot from its freshly-computed
@@ -189,16 +206,24 @@ var Input = (function () {
   function step(slot, dt) {
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
-      var isDown = !!slot.down[a];
+      var isDown = !!slot.live[a];
       var wasDown = !!slot.prev[a];
-      slot.hit[a] = isDown && !wasDown;
+      /* A press latched at ANY point since the last frame counts, even if the
+       * button is already back up by now. */
+      var presses = slot.edge[a] | 0;
+
+      slot.down[a] = isDown;
+      slot.hit[a] = presses > 0;
       slot.reps[a] = 0;
 
-      if (isDown && !wasDown) {
-        slot.reps[a] = 1;
+      if (presses > 0) {
+        /* Two taps inside one frame move a menu twice — that is what the
+         * player did, so that is what happens. */
+        slot.reps[a] = presses > 4 ? 4 : presses;
         slot.timer[a] = REPEAT_DELAY;
         activity = true;
-      } else if (isDown) {
+        if (!isDown) tapsSaved++;
+      } else if (isDown && wasDown) {
         slot.timer[a] -= dt;
         /* Cap the catch-up so a long stall cannot fire a hundred steps. */
         var guard = 0;
@@ -208,10 +233,12 @@ var Input = (function () {
           guard++;
         }
         if (guard >= 8) slot.timer[a] = REPEAT_RATE;
-      } else {
+      } else if (!isDown) {
         slot.timer[a] = 0;
       }
+
       slot.prev[a] = isDown;
+      slot.edge[a] = 0;
     }
   }
 
@@ -246,14 +273,91 @@ var Input = (function () {
   }
 
   /**
-   * Poll every device and recompute all action state. Called exactly once per
-   * frame by the shell, before any update().
+   * Read every device once and latch any new presses.
+   *
+   * This is deliberately separate from poll(): it runs on a fast timer as
+   * well as once per frame, because a display-rate poll physically cannot see
+   * a button that goes down and back up between two frames. An arcade
+   * microswitch contact can be well under 16ms, and a dropped press feels far
+   * worse than a late one.
    */
-  function poll(dt) {
-    var d = clamp(num(dt, 16), 0, 250);
+  function sample(checkHotplug) {
     var list = pads();
+    sampleCount++;
 
-    /* --- hot-plug: rebuild the signature and reconcile slots ---------- */
+    /* --- hot-plug: rebuild the signature and reconcile slots ----------
+     *
+     * Only on frame polls, never on the fast timer. Building the signature
+     * concatenates a string per connected pad, and doing that 250 times a
+     * second to notice something that happens once a week is pure garbage.
+     * Sixty checks a second is far more than enough to feel instant.
+     */
+    if (checkHotplug) hotplug(list);
+
+    /* --- per-slot live state, latching every 0->1 transition ---------- */
+    for (var pi = 0; pi < MAX_PLAYERS; pi++) {
+      var slot = players[pi];
+      var a, act;
+
+      for (a = 0; a < ACTIONS.length; a++) scratch[ACTIONS[a]] = false;
+
+      if (slot.active) {
+        /* Keyboard drives player 1 only. Its edges are latched in the
+         * keydown handler, which is earlier and exact; this only tracks the
+         * held state. */
+        if (pi === 0) {
+          for (var code in keys) {
+            if (!keys[code]) continue;
+            act = KEYMAP[code];
+            if (act) scratch[act] = true;
+          }
+        }
+
+        if (slot.padIndex !== -1) {
+          var g = list[slot.padIndex];
+          if (g && g.connected) {
+            readPad(g, layoutOf(slot), padScratch);
+            for (var b = 0; b < ACTIONS.length; b++) {
+              if (padScratch[ACTIONS[b]]) scratch[ACTIONS[b]] = true;
+            }
+            /* gamepad.timestamp only advances when the snapshot changes, so
+             * it measures how fast the browser is really giving us data. */
+            if (g.timestamp !== slot.padStamp) {
+              slot.padStamp = g.timestamp;
+              padUpdates++;
+            }
+          }
+        }
+      }
+
+      for (a = 0; a < ACTIONS.length; a++) {
+        act = ACTIONS[a];
+        var now = !!scratch[act];
+        /* Pad-driven edges only. Keyboard edges are latched on the event so
+         * that a tap between samples is never lost. */
+        if (now && !slot.sampled[act] && !(pi === 0 && keyboardHolds(act))) {
+          slot.edge[act]++;
+        }
+        slot.sampled[act] = now;
+        slot.live[act] = now;
+      }
+    }
+
+    /* --- unassigned pads: watch only for a Start press to join -------- */
+    for (var pk in pending) {
+      var idx = +pk;
+      var pg = list[idx];
+      if (!pg || !pg.connected) continue;
+      if (btn(pg, 9) || btn(pg, 0)) {
+        assign(idx, pg.id);
+        activity = true;
+        Audio2.sfx('coin');
+      }
+    }
+  }
+
+  /** Reconcile connected pads against player slots. Frame-rate, not sample-rate. */
+  function hotplug(list) {
     var sig = '';
     var seen = Object.create(null);
     for (var i = 0; i < list.length; i++) {
@@ -288,54 +392,39 @@ var Input = (function () {
         else pending[j] = true;
       }
     }
+  }
 
-    /* --- per-slot action state --------------------------------------- */
-    for (var pi = 0; pi < MAX_PLAYERS; pi++) {
-      var slot = players[pi];
-      for (var a = 0; a < ACTIONS.length; a++) slot.down[ACTIONS[a]] = false;
-      if (!slot.active) { step(slot, d); continue; }
-
-      /* Keyboard drives player 1 only. */
-      if (pi === 0) {
-        for (var code in keys) {
-          if (!keys[code]) continue;
-          var act = KEYMAP[code];
-          if (act) slot.down[act] = true;
-        }
-      }
-
-      if (slot.padIndex !== -1) {
-        var g = list[slot.padIndex];
-        if (g && g.connected) {
-          readPad(g, layoutOf(slot), scratch);
-          for (var b = 0; b < ACTIONS.length; b++) {
-            if (scratch[ACTIONS[b]]) slot.down[ACTIONS[b]] = true;
-          }
-        }
-      }
-      step(slot, d);
+  /** True when a currently-held key maps to this action on player 1. */
+  function keyboardHolds(action) {
+    for (var code in keys) {
+      if (keys[code] && KEYMAP[code] === action) return true;
     }
+    return false;
+  }
 
-    /* --- unassigned pads: watch only for a Start press to join -------- */
-    for (var pk in pending) {
-      var idx = +pk;
-      var pg = list[idx];
-      if (!pg || !pg.connected) continue;
-      if (btn(pg, 9) || btn(pg, 0)) {
-        assign(idx, pg.id);
-        activity = true;
-        Audio2.sfx('coin');
-      }
-    }
+  /**
+   * Consume one frame's worth of input. Called exactly once per frame by the
+   * loop, before any update(). Samples once more first so the frame acts on
+   * the freshest possible state.
+   */
+  function poll(dt) {
+    var d = clamp(num(dt, 16), 0, 250);
+    sample(true);
+
+    for (var pi = 0; pi < MAX_PLAYERS; pi++) step(players[pi], d);
 
     /* --- aggregate --------------------------------------------------- */
     for (var ai = 0; ai < ACTIONS.length; ai++) {
       var act2 = ACTIONS[ai];
-      var on = false;
+      var on = false, edges = 0;
       for (var q = 0; q < MAX_PLAYERS; q++) {
-        if (players[q].active && players[q].down[act2]) { on = true; break; }
+        if (!players[q].active) continue;
+        if (players[q].live[act2]) on = true;
+        /* players[] already had step() run, so read the hit it produced. */
+        if (players[q].hit[act2]) edges += players[q].reps[act2];
       }
-      any.down[act2] = on;
+      any.live[act2] = on;
+      any.edge[act2] = edges;
     }
     step(any, d);
   }
@@ -380,7 +469,9 @@ var Input = (function () {
         var act = ACTIONS[a];
         all[i].hit[act] = false;
         all[i].reps[act] = 0;
-        all[i].prev[act] = all[i].down[act];
+        all[i].edge[act] = 0;
+        all[i].prev[act] = all[i].live[act];
+        all[i].down[act] = all[i].live[act];
         all[i].timer[act] = REPEAT_DELAY;
       }
     }
@@ -420,8 +511,21 @@ var Input = (function () {
     if (!t || !t.addEventListener) return;
     t.addEventListener('keydown', function (e) {
       var code = e.code || e.key;
-      if (KEYMAP[code]) {
-        if (!keys[code]) activity = true;
+      var act = KEYMAP[code];
+      if (act) {
+        /*
+         * Latch the press here rather than waiting for the next sample. A
+         * key event is exact and already timestamped by the browser, so a
+         * tap shorter than a frame — or shorter than a sample interval —
+         * still registers. e.repeat is ignored: auto-repeat is ours to do.
+         */
+        if (!keys[code] && !e.repeat) {
+          if (!keyboardHolds(act)) players[0].edge[act]++;
+          keys[code] = true;
+          players[0].live[act] = true;
+          players[0].sampled[act] = true;
+          activity = true;
+        }
         keys[code] = true;
         if (e.preventDefault) e.preventDefault();
       }
@@ -439,8 +543,40 @@ var Input = (function () {
     t.addEventListener('gamepadconnected', function () { Audio2.unlock(); }, false);
   }
 
+  /* ------------------------------------------------------- sampling --- */
+
+  /*
+   * Sample faster than the display refreshes.
+   *
+   * requestAnimationFrame fires at ~60Hz, and a button pressed and released
+   * between two callbacks is invisible to it. Chromium updates its gamepad
+   * snapshot on its own thread well above 60Hz, so sampling on a short timer
+   * catches those transitions and latches them for the next frame to consume.
+   *
+   * SAMPLE_MS is a floor on how briefly a press can be held and still count.
+   * 4ms is comfortably shorter than any human tap or switch bounce, and the
+   * work per sample is a handful of array reads.
+   */
+  var SAMPLE_MS = 4;
+
+  function startSampling() {
+    if (sampleTimer || typeof setInterval !== 'function') return;
+    sampleTimer = setInterval(function () {
+      try { sample(); } catch (e) { /* never let the sampler die */ }
+    }, SAMPLE_MS);
+  }
+
+  function stopSampling() {
+    if (sampleTimer && typeof clearInterval === 'function') clearInterval(sampleTimer);
+    sampleTimer = 0;
+  }
+
   return {
     poll: poll,
+    sample: sample,
+    startSampling: startSampling,
+    stopSampling: stopSampling,
+    SAMPLE_MS: SAMPLE_MS,
     attach: attach,
     down: down,
     hit: hit,
@@ -470,6 +606,20 @@ var Input = (function () {
     /** Human-readable layout of a slot, for the settings screen. */
     layoutOf: function (i) { return layoutOf(players[i || 0]); },
     kindOf: function (i) { return (players[i || 0] || players[0]).kind; },
+    /**
+     * Input health, for the on-cabinet overlay. `tapsSaved` counts presses
+     * that were already released by the time the frame ran — every one of
+     * those would have been silently dropped before latching existed.
+     */
+    diagnostics: function () {
+      return {
+        samples: sampleCount,
+        padUpdates: padUpdates,
+        tapsSaved: tapsSaved,
+        sampling: !!sampleTimer,
+        intervalMs: SAMPLE_MS,
+      };
+    },
     _faceMap: faceMap,
     _glyphsFor: glyphsFor,
     _keymap: KEYMAP,
@@ -482,6 +632,7 @@ var Input = (function () {
       any = newSlot();
       pending = Object.create(null);
       padSignature = ''; padsVersion = 0; joinVersion = 0; activity = false;
+      sampleCount = 0; padUpdates = 0; tapsSaved = 0;
     },
   };
 })();
