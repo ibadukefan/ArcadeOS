@@ -216,6 +216,15 @@ var Shell = (function () {
 
   /** Called by games. Never call this from inside draw(). */
   function gameOver(score) {
+    /*
+     * A demo dying in attract mode must not drag the cabinet onto a game-over
+     * card — nobody is there to dismiss it. Rotate to the next demo instead,
+     * and never record an attract score.
+     */
+    if (state === 'attract') {
+      attract.timer = 99999;
+      return;
+    }
     lastScore = Math.max(0, Math.floor(num(score, 0)));
     var id = activeGame ? activeGame.id : '';
     lastRank = -1;
