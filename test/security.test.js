@@ -95,9 +95,34 @@ describe('setup script', () => {
   });
 
   it('validates ARCADE_USER before interpolating it into unit files', () => {
-    /* It comes from the environment and is pasted into systemd units and
-     * chown arguments. */
-    assert.ok(/\[\[ "\$ARCADE_USER" =~ \^\[a-z_\]\[a-z0-9_-\]\*\[\$\]\?\$/.test(SETUP));
+    /*
+     * It comes from the environment and is pasted into systemd units and chown
+     * arguments. Run the real script rather than matching the regex as text:
+     * this check is the first thing that happens on a cabinet, so a username
+     * it wrongly rejects blocks the entire install.
+     */
+    const run = (user) => {
+      try {
+        execFileSync('bash', [path.join(ROOT, 'setup-arcade.sh')], {
+          env: Object.assign({}, process.env, { ARCADE_USER: user, SUDO_USER: user }),
+          stdio: 'pipe',
+        });
+        return '';
+      } catch (e) {
+        return String(e.stderr || '') + String(e.stdout || '');
+      }
+    };
+    const REJECTED = /is not a valid username/;
+
+    /* Anything that could break out of a unit file or a shell word. */
+    /* An empty value is not in this list on purpose: it falls back to `pi`. */
+    for (const bad of ['pi;reboot', 'pi user', 'pi$(id)', 'pi|sh', '../root', 'pi%i']) {
+      assert.ok(REJECTED.test(run(bad)), JSON.stringify(bad) + ' should be rejected');
+    }
+    /* Anything useradd would actually accept. */
+    for (const good of ['pi', 'robbie', 'arcade-user', 'bad_user', 'Robbie', 'j.doe']) {
+      assert.ok(!REJECTED.test(run(good)), JSON.stringify(good) + ' must not be rejected');
+    }
   });
 
   it('generates the agent token from the kernel CSPRNG', () => {

@@ -121,9 +121,14 @@ PURGE="${PURGE:-0}"
 [[ "$ROTATE" =~ ^(0|90|180|270)$ ]] || die "--rotate must be 0, 90, 180 or 270"
 [[ "$GPIO_PIN" =~ ^[0-9]+$ ]] || die "--gpio-pin must be a number"
 # ARCADE_USER is interpolated straight into systemd units and chown arguments.
-# It comes from the environment, so pin it to the shape POSIX allows for a
-# username before any of that happens.
-[[ "$ARCADE_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ && ${#ARCADE_USER} -le 32 ]] \
+# It comes from the environment, so pin its shape before any of that happens.
+#
+# Deliberately as wide as useradd allows rather than as narrow as Debian's
+# default NAME_REGEX: rejecting a username the system itself accepts would
+# block the whole install, and the point of this check is to keep shell and
+# systemd metacharacters out — whitespace, ; & | $ ` quotes / and %, none of
+# which can appear below.
+[[ "$ARCADE_USER" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*[$]?$ && ${#ARCADE_USER} -le 32 ]] \
   || die "ARCADE_USER '$ARCADE_USER' is not a valid username"
 [[ $EUID -eq 0 ]] || die "run with sudo"
 
