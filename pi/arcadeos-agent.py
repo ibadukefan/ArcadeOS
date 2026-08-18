@@ -4,21 +4,44 @@ arcadeos-agent — the only thing standing between a player and a yanked power
 lead.
 
 Chromium in a kiosk cannot power the machine down, so the settings screen asks
-this service to do it. It binds to 127.0.0.1 ONLY, accepts exactly three fixed
-commands, and takes no parameters of any kind. There is no path through it
-that runs arbitrary input, and nothing off-machine can reach it.
+this service to do it. It binds to 127.0.0.1 ONLY, accepts a fixed set of
+commands, and takes no parameters of any kind.
 
-  POST /shutdown   clean poweroff
-  POST /restart    clean reboot
-  POST /pair       open a Bluetooth pairing window
+  POST /shutdown   clean poweroff        (authorised)
+  POST /restart    clean reboot          (authorised)
+  POST /pair       Bluetooth pairing     (authorised)
+  POST /alive      liveness heartbeat    (authorised)
+  POST /log        diagnostic line       (authorised)
+  GET  /           status, read only     (local, no token)
+
+WHY THERE IS AN AUTHORISATION CHECK AT ALL
+
+Binding to loopback keeps the network out; it does NOT keep web pages out. A
+cross-origin POST with no custom headers is a CORS "simple request": the
+browser sends it and only withholds the *response* from the caller. So before
+this check existed, any web page opened in any browser on this machine could
+POST /shutdown and power the cabinet off, and a DNS-rebinding attack could do
+the same from a page the user merely visited. Verified, not theorised.
+
+Three layers, cheapest first:
+
+  1. Host must be loopback         — defeats DNS rebinding.
+  2. Origin must be absent or null — the kiosk page is file://, so a real web
+                                     origin means a website is calling us.
+  3. A shared token                — set up alongside the kiosk, so other
+                                     local processes cannot power off the box
+                                     either. Skipped (loudly) if unconfigured,
+                                     so a hand-run dist/arcade.html still works.
 
 Standard library only. Runs as root because poweroff requires it; the
 correspondingly small attack surface is the point of keeping it this dumb.
 """
 
+import hmac
 import http.server
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -47,6 +70,20 @@ STALL_SECONDS = 30
 GRACE_SECONDS = 90
 KIOSK_UNIT = "arcadeos.service"
 
+# Shared secret, written by setup-arcade.sh and baked into the installed
+# arcade.html. Absent in development, where the checks below still block the
+# cross-origin and rebinding cases.
+TOKEN_FILE = "/etc/arcadeos/agent.token"
+TOKEN = ""
+
+# Hosts we will answer to. Anything else is a rebinding attempt.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
+
+# Control characters are stripped from anything that reaches the journal: a
+# log line carrying ANSI escapes can clear or recolour the terminal of whoever
+# is reading `journalctl`, which is a cheap way to hide or fake a message.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
 # Fixed command table. Nothing here is ever built from request data.
 COMMANDS = {
     "shutdown": ["/sbin/poweroff"],
@@ -57,6 +94,20 @@ COMMANDS = {
 def log(msg):
     sys.stdout.write("arcadeos-agent: %s\n" % msg)
     sys.stdout.flush()
+
+
+def load_token():
+    """Read the shared token, if setup installed one."""
+    try:
+        with open(TOKEN_FILE, "r") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def clean_text(text, limit=500):
+    """Make caller-supplied text safe to print into the journal."""
+    return CONTROL_CHARS.sub(" ", str(text))[:limit]
 
 
 class Liveness:
@@ -202,6 +253,30 @@ def run_pairing():
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "arcadeos-agent/1.0"
+    # Do not let a client that opens a connection and then says nothing hold a
+    # worker thread indefinitely.
+    timeout = 5
+
+    def _authorised(self, need_token):
+        """
+        Decide whether to act on a request. See the module docstring for why
+        loopback binding alone is not enough.
+        """
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in LOOPBACK_HOSTS:
+            return False, "host %s" % clean_text(host, 60)
+
+        origin = self.headers.get("Origin")
+        if origin not in (None, "", "null"):
+            return False, "origin %s" % clean_text(origin, 60)
+
+        if need_token and TOKEN:
+            supplied = self.headers.get("X-ArcadeOS-Token") or ""
+            # Constant time: this is a secret comparison, however local.
+            if not hmac.compare_digest(supplied, TOKEN):
+                return False, "bad token"
+
+        return True, ""
 
     def _reply(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -209,8 +284,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         # The kiosk page is loaded from file://, whose origin is "null".
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", "null")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "X-ArcadeOS-Token")
+        self.send_header("Access-Control-Max-Age", "600")
+        if getattr(self, "send_header_extra", False):
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -220,9 +300,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return urllib.parse.unquote(path).strip("/").lower()
 
     def do_OPTIONS(self):  # noqa: N802 - required by BaseHTTPRequestHandler
+        # The preflight is the one chance to stop a browser sending a request
+        # that carries our custom header, so it gets the same origin check.
+        ok, why = self._authorised(need_token=False)
+        if not ok:
+            log("refused preflight: %s" % why)
+            self._reply(403, {"ok": False, "error": "forbidden"})
+            return
+        # Chromium's Private Network Access check applies to a page reaching
+        # loopback. It only ever asks on the preflight, and the request is
+        # already past the host, origin and (on the POST) token checks by the
+        # time we answer, so granting it widens nothing.
+        if self.headers.get("Access-Control-Request-Private-Network") == "true":
+            self.send_header_extra = True
         self._reply(204, {})
 
     def do_GET(self):  # noqa: N802
+        # Read only, so no token — `curl http://127.0.0.1:8127/` stays a usable
+        # health check over SSH — but still loopback and same-origin only.
+        ok, why = self._authorised(need_token=False)
+        if not ok:
+            log("refused status: %s" % why)
+            self._reply(403, {"ok": False, "error": "forbidden"})
+            return
         if self._command() in ("", "status", "health"):
             state = LIVENESS.snapshot()
             self._reply(200, {
@@ -248,6 +348,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return ""
 
     def do_POST(self):  # noqa: N802
+        ok, why = self._authorised(need_token=True)
+        if not ok:
+            # Never echo the rejected command back; just say no.
+            log("refused request: %s" % why)
+            self._reply(403, {"ok": False, "error": "forbidden"})
+            return
+
         command = self._command()
 
         # Heartbeat and log are hot-ish paths and deliberately do no work
@@ -257,10 +364,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(200, {"ok": True})
             return
         if command == "log":
-            # Front-end text. Printed as data on one line; it reaches journald
-            # and nothing else, and is never interpreted as a command.
-            text = self._body().replace("\n", " ").replace("\r", " ")
-            log("frontend: %s" % text[:500])
+            # Front-end text. Stripped of every control character before it is
+            # printed: ANSI escapes in a log line can clear or recolour the
+            # terminal of whoever runs `journalctl`.
+            log("frontend: %s" % clean_text(self._body()))
             self._reply(200, {"ok": True})
             return
 
@@ -294,6 +401,14 @@ class Server(http.server.ThreadingHTTPServer):
 def main():
     if os.geteuid() != 0:
         log("warning: not running as root; poweroff and reboot will fail")
+    global TOKEN
+    TOKEN = load_token()
+    if TOKEN:
+        log("shared token loaded from %s" % TOKEN_FILE)
+    else:
+        log("WARNING: no token at %s — any local process may issue commands"
+            % TOKEN_FILE)
+
     server = Server((HOST, PORT), Handler)
     threading.Thread(target=LIVENESS.watch, daemon=True).start()
     log("listening on http://%s:%d (loopback only)" % (HOST, PORT))

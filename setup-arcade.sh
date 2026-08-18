@@ -27,6 +27,8 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="/opt/arcadeos"
 DATA_DIR="/var/lib/arcadeos"
 THEME_DIR="/usr/share/plymouth/themes/arcadeos"
+CONF_DIR="/etc/arcadeos"
+TOKEN_FILE="/etc/arcadeos/agent.token"
 DATA_LABEL="ARCADEDATA"
 
 ARCADE_USER="${SUDO_USER:-${ARCADE_USER:-pi}}"
@@ -118,6 +120,11 @@ PURGE="${PURGE:-0}"
 
 [[ "$ROTATE" =~ ^(0|90|180|270)$ ]] || die "--rotate must be 0, 90, 180 or 270"
 [[ "$GPIO_PIN" =~ ^[0-9]+$ ]] || die "--gpio-pin must be a number"
+# ARCADE_USER is interpolated straight into systemd units and chown arguments.
+# It comes from the environment, so pin it to the shape POSIX allows for a
+# username before any of that happens.
+[[ "$ARCADE_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ && ${#ARCADE_USER} -le 32 ]] \
+  || die "ARCADE_USER '$ARCADE_USER' is not a valid username"
 [[ $EUID -eq 0 ]] || die "run with sudo"
 
 # ------------------------------------------------------------- utilities ---
@@ -234,6 +241,54 @@ find_chromium() {
   return 1
 }
 
+# ------------------------------------------------------------------ token ---
+#
+# The agent runs as root and can power the cabinet off, so it must be able to
+# tell the kiosk apart from anything else on the machine. Loopback alone does
+# not do that: a cross-origin POST with no custom headers is a CORS "simple
+# request", so without a secret any web page in any local browser could shut
+# the cabinet down, and a DNS-rebinding page could too.
+#
+# So: one random secret, readable only by root (the agent) and the kiosk user
+# (through the page). It is generated once and reused on every re-run, because
+# rotating it would leave a running agent and a cached page disagreeing.
+
+ensure_token() {
+  install -d -m 0755 "$CONF_DIR"
+  if [[ -s "$TOKEN_FILE" ]]; then
+    info "reusing agent token"
+  else
+    local tmp
+    tmp="$(mktemp)"
+    chmod 0600 "$tmp"
+    # 32 hex characters from the kernel CSPRNG. No openssl dependency.
+    od -An -tx1 -N16 /dev/urandom | tr -d ' \n' > "$tmp"
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; die "could not read /dev/urandom"; }
+    install -m 0600 -o root -g root "$tmp" "$TOKEN_FILE"
+    rm -f "$tmp"
+    info "generated agent token"
+  fi
+  AGENT_TOKEN="$(cat "$TOKEN_FILE")"
+  [[ "$AGENT_TOKEN" =~ ^[0-9a-f]{16,}$ ]] || die "agent token is malformed; delete $TOKEN_FILE and re-run"
+}
+
+# Install the bundle with the token baked in above it. The build output itself
+# stays a pure single file with no secret in it — the secret only exists on the
+# cabinet, and only in a file the player's browser profile cannot read.
+install_page() {
+  ensure_token
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf '<script>window.ARCADEOS_AGENT_TOKEN=%s;</script>\n' "\"$AGENT_TOKEN\""
+    cat "$SRC_DIR/dist/arcade.html"
+  } > "$tmp"
+  # 0640 root:$ARCADE_USER — the kiosk reads it, nothing else on the box does.
+  install -m 0640 -o root -g "$ARCADE_USER" "$tmp" "$APP_DIR/arcade.html"
+  rm -f "$tmp"
+  info "installed arcade.html (token bound)"
+}
+
 install_app() {
   step "Installing ArcadeOS to ${APP_DIR}"
 
@@ -246,7 +301,7 @@ install_app() {
   [[ -f "$SRC_DIR/dist/arcade.html" ]] || die "dist/arcade.html missing — run 'npm run build' first"
 
   install -d -m 0755 "$APP_DIR"
-  install -m 0644 "$SRC_DIR/dist/arcade.html" "$APP_DIR/arcade.html"
+  install_page
   install -d -m 0755 "$DATA_DIR"
   chown -R "$ARCADE_USER":"$ARCADE_USER" "$DATA_DIR"
 
@@ -628,6 +683,9 @@ uninstall() {
 
   rm -rf "$APP_DIR"
   info "removed ${APP_DIR}"
+
+  rm -rf "$CONF_DIR"
+  info "removed ${CONF_DIR}"
 
   if [[ "$PURGE" -eq 1 ]]; then
     rm -rf "$DATA_DIR"

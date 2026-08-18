@@ -430,7 +430,7 @@ describe('agent watchdog', () => {
   });
 
   it('never interprets relayed log text as a command', () => {
-    assert.ok(/log\("frontend: %s" % text\[:500\]\)/.test(src),
+    assert.ok(/log\("frontend: %s" % clean_text\(self\._body\(\)\)\)/.test(src),
       'log text is printed as data and nothing else');
   });
 

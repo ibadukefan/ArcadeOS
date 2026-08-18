@@ -42,6 +42,13 @@ var Store = (function () {
   var backend = undefined;
   var lastError = null;
   var migrated = 0;
+  /*
+   * A backend that answers the boot-time canary can still refuse every write
+   * later — a full card, or a quota the profile grew into. Settings said
+   * "SAVED ON THIS CABINET" the whole time while nothing was being saved. So
+   * track what writes actually do, not what the probe once did.
+   */
+  var writesFailing = false;
 
   function key(name, version) {
     return NS + ':v' + (version === undefined ? VERSION : version) + ':' + name;
@@ -120,8 +127,15 @@ var Store = (function () {
   function writeRaw(name, str) {
     var b = be();
     if (!b) return false;
-    try { b.setItem(key(name), str); return true; }
-    catch (e) { lastError = e; return false; }
+    try {
+      b.setItem(key(name), str);
+      writesFailing = false;
+      return true;
+    } catch (e) {
+      lastError = e;
+      writesFailing = true;
+      return false;
+    }
   }
 
   /**
@@ -165,12 +179,13 @@ var Store = (function () {
     set: set,
     remove: remove,
     /** True when writes actually survive a reboot. Surfaced in settings. */
-    persistent: function () { return !!be(); },
+    persistent: function () { return !!be() && !writesFailing; },
     lastError: function () { return lastError; },
     /** How many records were upgraded from an older schema this session. */
     migrated: function () { return migrated; },
     _reset: function () {
       mem = Object.create(null); backend = undefined; lastError = null; migrated = 0;
+      writesFailing = false;
     },
     _key: key,
     _migrations: MIGRATIONS,
@@ -346,6 +361,12 @@ var Faults = (function () {
 var TOP_N = 5;
 
 var Scores = (function () {
+  /*
+   * No game here can score a billion; a crafted or corrupted record can. An
+   * unbounded number renders as "1e+308" and paints 300 characters across the
+   * scores screen, so bound it where the display does — nine digits.
+   */
+  var MAX_SCORE = 999999999;
   var cache = null;
 
   /** A name is exactly three A-Z characters. Anything else is repaired. */
@@ -361,7 +382,7 @@ var Scores = (function () {
     if (!isFinite(score) || score < 0) return null;
     return {
       name: cleanName(e.name),
-      score: Math.floor(score),
+      score: Math.min(Math.floor(score), MAX_SCORE),
       at: (typeof e.at === 'number' && isFinite(e.at)) ? e.at : 0,
     };
   }
@@ -370,10 +391,14 @@ var Scores = (function () {
    * Validate the whole table. Partial records are dropped individually rather
    * than discarding an entire game's history — a truncated write should cost
    * you one row, not the leaderboard.
+   *
+   * The map has a null prototype: game ids come out of a file the player can
+   * edit, and `{}["constructor"]` is a function, not a missing entry. With no
+   * prototype every lookup answers about the data and nothing else.
    */
   function validate(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-    var out = {};
+    var out = Object.create(null);
     for (var id in raw) {
       if (!Object.prototype.hasOwnProperty.call(raw, id)) continue;
       var list = raw[id];
@@ -390,7 +415,7 @@ var Scores = (function () {
   }
 
   function all() {
-    if (!cache) cache = Store.get('scores', {}, validate) || {};
+    if (!cache) cache = Store.get('scores', Object.create(null), validate) || Object.create(null);
     return cache;
   }
 
@@ -406,7 +431,7 @@ var Scores = (function () {
 
   /** True when `score` would earn a place in the table. */
   function qualifies(gameId, score) {
-    var s = Math.floor(num(score, 0));
+    var s = Math.min(Math.floor(num(score, 0)), MAX_SCORE);
     if (s <= 0) return false;
     var t = table(gameId);
     if (t.length < TOP_N) return true;
@@ -415,7 +440,7 @@ var Scores = (function () {
 
   /** Insert and persist. Returns the 0-based rank, or -1 if it did not place. */
   function submit(gameId, score, name, now) {
-    var s = Math.floor(num(score, 0));
+    var s = Math.min(Math.floor(num(score, 0)), MAX_SCORE);
     if (s <= 0) return -1;
     var t = table(gameId).slice();
     t.push({ name: cleanName(name), score: s, at: num(now, 0) });
@@ -431,13 +456,14 @@ var Scores = (function () {
   }
 
   function reset() {
-    cache = {};
+    cache = Object.create(null);
     Store.set('scores', {});
   }
 
   return {
     all: all, table: table, best: best, qualifies: qualifies,
     submit: submit, reset: reset, _validate: validate, _cleanName: cleanName,
+    MAX_SCORE: MAX_SCORE,
     /** Test seam. */
     _drop: function () { cache = null; },
   };

@@ -26,6 +26,7 @@ black screen  →  ARCADE wordmark  →  dashboard
 - [Wiring arcade buttons to a USB encoder](#wiring-arcade-buttons-to-a-usb-encoder)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
+- [Security](#security)
 - [How it works](#how-it-works)
 
 ---
@@ -89,6 +90,7 @@ update the cabinet after pulling changes.
 | Path | Purpose |
 |---|---|
 | `/opt/arcadeos/` | `arcade.html`, the kiosk launcher, the helper scripts |
+| `/etc/arcadeos/agent.token` | Shared secret between the page and the control agent (root only, 0600) |
 | `/var/lib/arcadeos/chromium` | Chromium profile — this is where high scores live |
 | `/etc/systemd/system/arcadeos.service` | The kiosk: `cage` + Chromium |
 | `/etc/systemd/system/arcadeos-agent.service` | Loopback control agent (shutdown / restart / pairing) |
@@ -600,6 +602,19 @@ systemctl status arcadeos-agent
 curl http://127.0.0.1:8127/       # should answer {"ok": true, ...}
 ```
 
+If the status endpoint answers but SETTINGS still reports a failure, the page
+and the agent disagree about the shared token — usually because the bundle was
+copied into `/opt/arcadeos/` by hand instead of installed:
+
+```bash
+journalctl -u arcadeos-agent | grep refused    # says which check failed
+head -c 60 /opt/arcadeos/arcade.html           # should start with the token script
+sudo ./setup-arcade.sh                         # re-binds the page to the token
+```
+
+Deleting `/etc/arcadeos/agent.token` and re-running the installer mints a new
+one; restart `arcadeos-agent` afterwards so it picks the new value up.
+
 **GPIO button does nothing**
 
 ```bash
@@ -784,8 +799,87 @@ is caught underneath that by the Pi's hardware watchdog.
 **Nothing leaves the machine.** No CDN, no fonts, no telemetry, no network
 calls of any kind. The build fails if a URL appears in the output. The one
 exception is the loopback agent on `127.0.0.1`, which exists so the settings
-screen can power the cabinet down — it binds nowhere else and accepts exactly
-three fixed commands.
+screen can power the cabinet down — it binds nowhere else, accepts a fixed set
+of commands that take no parameters, and requires a shared secret. See
+[Security](#security).
+
+---
+
+## Security
+
+The cabinet has no accounts, no network services and nothing worth stealing.
+The one thing worth protecting is the control agent, because it runs as root
+and can power the machine off.
+
+### Why loopback is not enough on its own
+
+`arcadeos-agent` binds to `127.0.0.1` only. That keeps the network out. It does
+**not** keep other software on the same machine out, and specifically it does
+not keep web pages out:
+
+- A cross-origin `POST` with no custom headers is a CORS *simple request*. The
+  browser sends it and only withholds the *response* from the caller. Any page
+  open in any browser on the cabinet could therefore have posted `/shutdown`.
+- A DNS-rebinding page resolves its own hostname to `127.0.0.1` and then talks
+  to the agent from what the browser considers its own origin.
+
+Both were reproduced against a running agent before they were fixed, not
+inferred from documentation.
+
+### What the agent checks
+
+Every request, cheapest check first:
+
+| Check | Stops |
+|---|---|
+| `Host` must be a loopback name | DNS rebinding |
+| `Origin` must be absent or `null` | Any real web page — the kiosk is `file://` |
+| `X-ArcadeOS-Token` must match, compared in constant time | Other local software |
+
+`GET /` — the read-only status endpoint — is exempt from the token so that
+`curl http://127.0.0.1:8127/` over SSH stays the first useful debugging step.
+It is still loopback-and-same-origin only.
+
+Sending a custom header is *also* what forces the browser to preflight the
+request, and a hostile page cannot forge a preflight the agent will accept.
+
+### The token
+
+`setup-arcade.sh` generates 128 bits from `/dev/urandom` on first install and
+writes `/etc/arcadeos/agent.token` as `0600 root:root`. It then installs the
+page as `/opt/arcadeos/arcade.html`, mode `0640 root:<kiosk user>`, with the
+secret prepended as a one-line `<script>`. Re-running the installer reuses the
+existing token — rotating it would leave a running agent and a loaded page
+disagreeing.
+
+The token never appears in `dist/arcade.html`. The build output stays a pure
+single file with no secret in it; the secret only exists on a cabinet.
+
+`sudo ./setup-arcade.sh --uninstall` removes it.
+
+A hand-run `dist/arcade.html` has no token, and a hand-run agent with no token
+file demands none — development still works, with the host and origin checks
+still active.
+
+### Untrusted input
+
+Two places take input that is not ours:
+
+- **Relayed log lines.** A fault message reaches `journalctl`. Control
+  characters are replaced with spaces at *both* ends, because an ANSI escape
+  in a log tail can paint a convincing fake root warning on an
+  administrator's terminal. (This one was demonstrated, too.)
+- **The stored records.** Everything read back from `localStorage` is a file
+  the player can edit. Scores are bounded and floored, names are coerced to
+  three letters, and the per-game table is a null-prototype object so that
+  `constructor` is a missing entry rather than a function.
+
+### What is deliberately not defended
+
+Anything running as the kiosk user can read the token, and anyone with a
+keyboard and physical access can already pull the power. The threat model is
+"a web page or a stray process should not be able to switch the cabinet off",
+not "resist a local attacker with a shell".
 
 ---
 
