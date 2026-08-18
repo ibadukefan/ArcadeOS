@@ -31,6 +31,22 @@ HOST = "127.0.0.1"
 PORT = 8127
 PAIR_SECONDS = 120
 
+# --- liveness watchdog -------------------------------------------------------
+#
+# systemd's Restart=always catches a crash. It does nothing for a hang: a
+# wedged GPU or a stuck script leaves Chromium alive, the unit "active", and a
+# frozen picture on the cabinet indefinitely.
+#
+# The front end posts /alive at the end of every frame, so the beats stop the
+# moment frames stop. If they go quiet for STALL_SECONDS the kiosk is
+# restarted. The watchdog only arms after the first beat, so a machine with the
+# front end disabled, or one still booting, is never touched.
+STALL_SECONDS = 30
+# After a restart, wait this long before judging again — Chromium needs time to
+# come back before its silence means anything.
+GRACE_SECONDS = 90
+KIOSK_UNIT = "arcadeos.service"
+
 # Fixed command table. Nothing here is ever built from request data.
 COMMANDS = {
     "shutdown": ["/sbin/poweroff"],
@@ -41,6 +57,60 @@ COMMANDS = {
 def log(msg):
     sys.stdout.write("arcadeos-agent: %s\n" % msg)
     sys.stdout.flush()
+
+
+class Liveness:
+    """Tracks front-end heartbeats and restarts the kiosk if they stop."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last = 0.0
+        self.armed = False
+        self.restarts = 0
+        self.next_check = time.monotonic() + GRACE_SECONDS
+
+    def beat(self):
+        with self.lock:
+            if not self.armed:
+                log("front end is alive; watchdog armed")
+            self.armed = True
+            self.last = time.monotonic()
+
+    def snapshot(self):
+        with self.lock:
+            age = (time.monotonic() - self.last) if self.armed else None
+            return {"armed": self.armed, "age": age, "restarts": self.restarts}
+
+    def watch(self):
+        while True:
+            time.sleep(5)
+            now = time.monotonic()
+            with self.lock:
+                if not self.armed or now < self.next_check:
+                    continue
+                stalled = (now - self.last) > STALL_SECONDS
+                if not stalled:
+                    continue
+                self.restarts += 1
+                self.next_check = now + GRACE_SECONDS
+                # Require a fresh beat before judging again, so a kiosk that
+                # never comes back is not restarted every 30 seconds forever.
+                self.armed = False
+                count = self.restarts
+
+            log("no frames for %ds — restarting %s (restart #%d)"
+                % (STALL_SECONDS, KIOSK_UNIT, count))
+            binary = resolve("systemctl")
+            if not binary:
+                log("systemctl not found; cannot restart")
+                continue
+            try:
+                subprocess.Popen([binary, "restart", KIOSK_UNIT], close_fds=True)
+            except Exception as exc:  # noqa: BLE001
+                log("restart failed: %s" % exc)
+
+
+LIVENESS = Liveness()
 
 
 def resolve(path):
@@ -154,12 +224,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self._command() in ("", "status", "health"):
-            self._reply(200, {"ok": True, "service": "arcadeos-agent"})
+            state = LIVENESS.snapshot()
+            self._reply(200, {
+                "ok": True,
+                "service": "arcadeos-agent",
+                "frontend": "alive" if state["armed"] else "not seen",
+                "last_beat_s": round(state["age"], 1) if state["age"] is not None else None,
+                "kiosk_restarts": state["restarts"],
+            })
         else:
             self._reply(405, {"ok": False, "error": "use POST"})
 
+    def _body(self, limit=600):
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), limit)
+        except (TypeError, ValueError):
+            return ""
+        if n <= 0:
+            return ""
+        try:
+            return self.rfile.read(n).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return ""
+
     def do_POST(self):  # noqa: N802
         command = self._command()
+
+        # Heartbeat and log are hot-ish paths and deliberately do no work
+        # beyond a timestamp and a print.
+        if command == "alive":
+            LIVENESS.beat()
+            self._reply(200, {"ok": True})
+            return
+        if command == "log":
+            # Front-end text. Printed as data on one line; it reaches journald
+            # and nothing else, and is never interpreted as a command.
+            text = self._body().replace("\n", " ").replace("\r", " ")
+            log("frontend: %s" % text[:500])
+            self._reply(200, {"ok": True})
+            return
+
         if command in COMMANDS:
             log("accepted %s" % command)
             self._reply(200, {"ok": True, "command": command})
@@ -191,7 +295,10 @@ def main():
     if os.geteuid() != 0:
         log("warning: not running as root; poweroff and reboot will fail")
     server = Server((HOST, PORT), Handler)
+    threading.Thread(target=LIVENESS.watch, daemon=True).start()
     log("listening on http://%s:%d (loopback only)" % (HOST, PORT))
+    log("kiosk watchdog: restart %s after %ds without frames"
+        % (KIOSK_UNIT, STALL_SECONDS))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

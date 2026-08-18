@@ -134,6 +134,8 @@ var Shell = (function () {
   /* ------------------------------------------------------ transitions --- */
 
   function go(next) {
+    /* Leaving attract by any route hands input back to the player. */
+    if (state === 'attract' && next !== 'attract') Input.setDemo(null);
     prevState = state;
     state = next;
     stateT = 0;
@@ -142,6 +144,29 @@ var Shell = (function () {
   }
 
   function say(msg) { toast = { text: String(msg), life: 2600 }; }
+
+  /**
+   * Substitute {A}/{B}/{X} in a game's hint with the glyphs of the controller
+   * actually in the player's hands, so a DualSense reads "✕ SLAM" and a Switch
+   * Pro reads "A SLAM" — matching the button they are about to press.
+   */
+  function formatHint(hint, playerIndex) {
+    var g = Input.glyphs(playerIndex || 0);
+    return String(hint == null ? '' : hint)
+      .replace(/\{A\}/g, g.confirm)
+      .replace(/\{B\}/g, g.back)
+      .replace(/\{X\}/g, g.alt);
+  }
+
+  /**
+   * Record a fault so it outlives its toast. Draw and preview faults fire once
+   * per frame while broken, so Faults.record() collapses repeats into a count
+   * rather than letting one bad game evict the whole history.
+   */
+  function fault(err, where) {
+    try { Faults.record(err, where, Date.now ? Date.now() : t); }
+    catch (e) { /* the error reporter must never be the thing that throws */ }
+  }
 
   /* ------------------------------------------------------------- boot --- */
 
@@ -155,11 +180,26 @@ var Shell = (function () {
 
   /* ------------------------------------------------------------- menu --- */
 
-  function startGame(game, versus) {
+  /**
+   * Seed for the next run. Normally the clock, so two cabinets do not play the
+   * same piece sequence — but pinnable, because a test that cannot reproduce
+   * its own failure is not much of a test.
+   */
+  var forcedSeed = null;
+
+  function startGame(game, versus, seed) {
     activeGame = game;
-    seedRng((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635);
+    var s = (seed !== undefined && seed !== null) ? seed
+      : (forcedSeed !== null ? forcedSeed
+        : ((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635));
+    seedRng(s);
     try { game.start(); }
-    catch (e) { say('FAILED TO START'); go('menu'); return; }
+    catch (e) {
+      fault(e, game.id + '.start');
+      say('FAILED TO START — SEE SETTINGS');
+      go('menu');
+      return;
+    }
     go('game');
     Audio2.sfx('start');
   }
@@ -200,7 +240,8 @@ var Shell = (function () {
     if (!activeGame) { go('menu'); return; }
     try { activeGame.update(dt); }
     catch (e) {
-      say('GAME ERROR — RETURNED TO MENU');
+      fault(e, activeGame.id + '.update');
+      say('GAME ERROR — SEE SETTINGS');
       activeGame = null;
       go('menu');
     }
@@ -327,6 +368,9 @@ var Shell = (function () {
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
       { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
+      { id: 'faults', label: 'DIAGNOSTICS', type: 'action',
+        value: Faults.count() ? Faults.count() + ' FAULT' + (Faults.count() === 1 ? '' : 'S') : 'NONE',
+        warn: Faults.count() > 0 },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
       { id: 'shutdown', label: 'SHUT DOWN', type: 'action', danger: true },
@@ -388,6 +432,7 @@ var Shell = (function () {
       return;
     }
     if (it.id === 'back') { go('menu'); Audio2.sfx('back'); return; }
+    if (it.id === 'faults') { go('faults'); Audio2.sfx('select'); return; }
     if (it.id === 'reset') {
       ask('ERASE ALL HIGH SCORES?', function () {
         Scores.reset();
@@ -437,6 +482,91 @@ var Shell = (function () {
     }
   }
 
+  /* --------------------------------------------------------- faults --- */
+
+  function faultsUpdate(dt) {
+    if (confirmBox) { confirmUpdate(dt); return; }
+    if (Input.hit('back')) { go('settings'); Audio2.sfx('back'); return; }
+    if (Input.hit('confirm') && Faults.count()) {
+      ask('CLEAR THE FAULT LOG?', function () {
+        Faults.clear();
+        say('FAULT LOG CLEARED');
+      });
+    }
+  }
+
+  function drawFaults(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'DIAGNOSTICS', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+      cache: true,
+    });
+
+    var list = Faults.all();
+    var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
+
+    /* Build state first: this is the screen someone reads over SSH's shoulder. */
+    var lines = [
+      ['STORAGE', Store.persistent() ? 'PERSISTENT' : 'SESSION ONLY',
+        Store.persistent() ? COL.good : COL.warn],
+      ['SCHEMA', 'v' + Store.VERSION +
+        (Store.migrated() ? '  (' + Store.migrated() + ' MIGRATED)' : ''), COL.data],
+      ['VIDEO', Render.lowLatency() ? 'LOW LATENCY' : 'NORMAL', COL.data],
+      ['CONTROLLERS', String(Input.padCount()) + ' PAD' +
+        (Input.padCount() === 1 ? '' : 'S') + ', ' +
+        Input.kindOf(0).toUpperCase(), COL.data],
+      ['INPUT SAMPLING', Input.diagnostics().sampling
+        ? Input.diagnostics().intervalMs + 'ms' : 'FRAME ONLY',
+        Input.diagnostics().sampling ? COL.good : COL.warn],
+    ];
+    var y = 240;
+    for (var i = 0; i < lines.length; i++) {
+      panel(c, x, y, w, 56, { fill: COL.card, stroke: COL.cardLine });
+      text(c, lines[i][0], x + 24, y + 34, {
+        size: 16, weight: '500', track: 2, color: COL.text2,
+      });
+      dataText(c, lines[i][1], x + w - 24, y + 34, {
+        size: 17, align: 'right', color: lines[i][2],
+      });
+      y += 64;
+    }
+
+    y += 30;
+    text(c, list.length ? 'RECENT FAULTS' : 'NO FAULTS RECORDED', x + 24, y, {
+      size: 15, weight: '600', track: 3,
+      color: list.length ? COL.bad : COL.good,
+    });
+    y += 18;
+
+    for (var f = 0; f < list.length && f < 6; f++) {
+      var e = list[f];
+      panel(c, x, y, w, 74, {
+        fill: 'rgba(240,100,94,.08)', stroke: rgba(COL.bad, 0.28),
+      });
+      text(c, e.where || 'shell', x + 20, y + 28, {
+        size: 15, weight: '700', track: 1.5, color: COL.warn,
+      });
+      if (e.n > 1) {
+        dataText(c, 'x' + e.n, x + w - 20, y + 28, {
+          size: 15, align: 'right', color: COL.bad,
+        });
+      }
+      /* Truncate rather than wrap: the point is recognising it, not reading it. */
+      var msg = e.msg.length > 58 ? e.msg.slice(0, 57) + '…' : e.msg;
+      text(c, msg, x + 20, y + 54, {
+        size: 14, weight: '400', color: COL.text2, mono: true,
+      });
+      y += 82;
+    }
+
+    var gl = Input.glyphs(0);
+    drawFooter(c, list.length
+      ? [{ g: gl.confirm, l: 'CLEAR' }, { g: gl.back, l: 'BACK' }]
+      : [{ g: gl.back, l: 'BACK' }]);
+
+    if (confirmBox) drawConfirm(c);
+  }
+
   /* ---------------------------------------------------------- scores --- */
 
   function scoresUpdate(dt) {
@@ -456,6 +586,7 @@ var Shell = (function () {
   /* --------------------------------------------------------- attract --- */
 
   function enterAttract() {
+    Input.setDemo(null);
     attract.index = (attract.index + 1) % Math.max(1, GAMES.length);
     attract.game = GAMES[attract.index] || null;
     attract.timer = 0;
@@ -467,32 +598,51 @@ var Shell = (function () {
   }
 
   function attractUpdate(dt) {
-    /* Any input at all drops straight back to the dashboard. */
+    /* Any real input at all drops straight back to the dashboard. The demo's
+     * own presses are excluded from activity, so this cannot self-trigger. */
     if (Input.consumeActivity()) {
-      attract.game = null;
-      idleT = 0;
+      leaveAttract();
       go('menu');
       Audio2.sfx('back');
       return;
     }
     attract.timer += dt;
     if (attract.game) {
-      /* The demo plays itself; if it dies or stalls, rotate to the next. */
-      try { attractDrive(dt); attract.game.update(dt); }
-      catch (e) { attract.game = null; }
+      try { attract.game.update(dt); }
+      catch (e) { fault(e, attract.game.id + '.update'); attract.game = null; }
     }
+    /* Drive the NEXT frame. Input.poll runs before Shell.update, so the map
+     * set here is consumed one frame later — invisible, and it keeps the
+     * demo reading its own freshly-updated state. */
+    attractDrive();
     if (attract.timer > 14000 || !attract.game) enterAttract();
   }
 
   /**
-   * The demo pilot. Deliberately mediocre — it exists to make the cabinet look
-   * alive from across a room, not to set records.
+   * The demo pilot.
+   *
+   * Each game supplies its own tiny policy via an optional demo() method,
+   * because only the game knows where its ball or its food is. Games without
+   * one simply run on gravity, which is what every game did before — SNAKE
+   * died in 2.8 seconds and PULSE in 8.5, then sat as a frozen board for the
+   * rest of the slot, which reads as a crashed cabinet from across a room.
+   *
+   * Deliberately mediocre policies: a demo that never loses looks canned.
    */
-  function attractDrive(dt) {
-    /* Nothing is injected into Input; games read Input directly, so the demo
-     * simply lets them run on gravity and timers. Games that need no input to
-     * be visually interesting (falling pieces, sweeping slabs, scrolling
-     * fields) carry the loop on their own. */
+  function attractDrive() {
+    var map = null;
+    if (attract.game && typeof attract.game.demo === 'function') {
+      try { map = attract.game.demo(); }
+      catch (e) { fault(e, attract.game.id + '.demo'); map = null; }
+    }
+    Input.setDemo(map);
+  }
+
+  /** Hand input back to the player and stop driving. */
+  function leaveAttract() {
+    Input.setDemo(null);
+    attract.game = null;
+    idleT = 0;
   }
 
   /* ------------------------------------------------------------ frame --- */
@@ -548,6 +698,7 @@ var Shell = (function () {
       case 'initials': initialsUpdate(dt); break;
       case 'settings': settingsUpdate(dt); break;
       case 'scores': scoresUpdate(dt); break;
+      case 'faults': faultsUpdate(dt); break;
       case 'attract': attractUpdate(dt); break;
     }
   }
@@ -574,6 +725,7 @@ var Shell = (function () {
       case 'initials': drawGameState(c, true); drawInitials(c); break;
       case 'settings': drawSettings(c); break;
       case 'scores': drawScores(c); break;
+      case 'faults': drawFaults(c); break;
       case 'attract': drawAttract(c); break;
     }
 
@@ -669,7 +821,7 @@ var Shell = (function () {
     c.fillRect(px, py, pw, ph);
     c.translate(px, py);
     try { g.preview(c, pw, ph, t); }
-    catch (err) { /* a broken preview must not take the dashboard down */ }
+    catch (err) { fault(err, g.id + '.preview'); }
     c.restore();
 
     if (e.versus) {
@@ -695,6 +847,16 @@ var Shell = (function () {
       dataText(c, fmtScore(best), rect.x + rect.w - 20, rect.y + rect.h - 40, {
         size: 16, align: 'right', color: rgba(g.accent, 0.95),
       });
+    }
+
+    /* Controls, on the selected card only — teaching without clutter. */
+    if (selected && g.hint) {
+      var hy = rect.y + rect.h - 14;
+      c.globalAlpha = 0.9;
+      text(c, formatHint(g.hint), rect.x + 20, hy, {
+        size: 13, weight: '500', track: 1.2, color: rgba(g.accent, 0.85),
+      });
+      c.globalAlpha = 1;
     }
   }
 
@@ -795,12 +957,37 @@ var Shell = (function () {
 
   /* ------------------------------------------------------- game frames --- */
 
+  /** How long the controls banner stays up after a game starts. */
+  var HINT_MS = 3200;
+
   function drawGameState(c, dim) {
     if (!activeGame) return;
     Render.enterGame();
     try { activeGame.draw(); }
-    catch (e) { /* a draw fault must not wedge the shell */ }
+    catch (e) { fault(e, activeGame.id + '.draw'); }
     Render.enterShell();
+
+    /*
+     * Controls banner for the first few seconds of a run. Someone walks up to
+     * a cabinet cold; they should not have to guess, and they should not have
+     * to look at it once they know.
+     */
+    if (!dim && state === 'game' && activeGame.hint && stateT < HINT_MS) {
+      var a = stateT < HINT_MS - 600 ? 1 : (HINT_MS - stateT) / 600;
+      c.globalAlpha = clamp(a, 0, 1);
+      var label = formatHint(activeGame.hint);
+      c.font = '500 20px ' + FONT_SANS;
+      var w = measure(c, label, 1.6) + 56;
+      var bx = (SW - w) / 2;
+      panel(c, bx, SH - 150, w, 52, {
+        fill: 'rgba(7,5,14,.82)', stroke: rgba(activeGame.accent, 0.35), radius: 14,
+      });
+      text(c, label, SW / 2, SH - 124, {
+        size: 20, weight: '500', track: 1.6, color: COL.text,
+        align: 'center', baseline: 'middle',
+      });
+      c.globalAlpha = 1;
+    }
     if (dim) {
       c.fillStyle = 'rgba(7,5,14,0.72)';
       c.fillRect(0, 0, SW, SH);
@@ -839,10 +1026,21 @@ var Shell = (function () {
   }
 
   function drawPause(c) {
-    var m = drawModal(c, 'PAUSED', 620, 460);
+    var m = drawModal(c, 'PAUSED', 620, 500);
     drawList(c, PAUSE_ITEMS, pauseCursor, m.x + 60, m.y + 130, m.w - 120, 74);
+
+    /* Pause is where a stuck player looks, so put the controls here. */
+    if (activeGame && activeGame.hint) {
+      c.fillStyle = 'rgba(140,150,255,.10)';
+      c.fillRect(m.x + 60, m.y + m.h - 96, m.w - 120, 1);
+      text(c, formatHint(activeGame.hint), SW / 2, m.y + m.h - 70, {
+        size: 14, weight: '500', track: 1.2,
+        color: rgba(activeGame.accent, 0.9), align: 'center',
+      });
+    }
+
     var gl = Input.glyphs(0);
-    text(c, gl.confirm + ' SELECT   ' + gl.back + ' RESUME', SW / 2, m.y + m.h - 42, {
+    text(c, gl.confirm + ' SELECT   ' + gl.back + ' RESUME', SW / 2, m.y + m.h - 38, {
       size: 15, weight: '500', track: 2.5, color: COL.dim, align: 'center',
     });
   }
@@ -1265,6 +1463,8 @@ var Shell = (function () {
       return false;
     },
     _startGame: startGame,
+    /** Pin the seed every future run uses. null restores clock seeding. */
+    _seedRuns: function (seed) { forcedSeed = seed; },
     _activeGame: function () { return activeGame; },
     _lastScore: function () { return lastScore; },
     _rows: function () { return rows; },
@@ -1273,6 +1473,7 @@ var Shell = (function () {
     _confirm: function () { return confirmBox; },
     _setCursor: function (i) { setCursor = i; },
     _settingsItems: settingsItems,
+    _formatHint: formatHint,
     _idle: function () { return idleT; },
     _frameStats: function () {
       var sum = 0, worst = 0;
@@ -1292,6 +1493,7 @@ var Shell = (function () {
       pauseCursor = 0; overCursor = 0; scoresGame = 0; setCursor = 0;
       confirmBox = null; toast = null; lastPadsVersion = -1;
       attract.game = null; attract.timer = 0; attract.index = 0;
+      Input.setDemo(null);
       buildMenu();
     },
   };

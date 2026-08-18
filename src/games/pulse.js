@@ -450,7 +450,25 @@ var PULSE = (function () {
     title: 'PULSE',
     tag: 'Four lanes, one d-pad',
     accent: ACCENT.pulse,
-    hint: 'D-PAD hit the lanes',
+    hint: '◀▼▲▶ HIT THE FOUR LANES',
+    /**
+     * Attract-mode pilot: press a lane when its next note is inside the
+     * perfect window. Deliberately not frame-perfect on every note — a demo
+     * that never misses looks canned.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      for (var i = 0; i < notes.length; i++) {
+        var n = notes[i];
+        if (n.judged >= 0) continue;
+        var d = n.time - songT;
+        if (d > 60) break;
+        if (d > -30) out[LANE_ACTION[n.lane]] = true;
+      }
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,

@@ -143,11 +143,14 @@ describe('persistence across a reboot', () => {
     env1.api().Scores.submit('snake', 200, 'BBB', 2);
     env1.api().Scores.submit('snake', 300, 'CCC', 3);
 
-    /* Corrupt exactly one row, as a partial flush would. */
+    /* Corrupt exactly one row, as a partial flush would. Key is derived from
+     * the live schema version so a future bump does not silently turn this
+     * into a test of the migration path instead. */
     const snap = snapshot(env1);
-    const parsed = JSON.parse(snap['arcadeos:v1:scores']);
+    const scoresKey = env1.api().Store._key('scores');
+    const parsed = JSON.parse(snap[scoresKey]);
     parsed.snake[1] = { name: null, score: 'corrupted' };
-    snap['arcadeos:v1:scores'] = JSON.stringify(parsed);
+    snap[scoresKey] = JSON.stringify(parsed);
 
     const env2 = makeEnv({ storage: snap });
     const t = env2.api().Scores.table('snake');

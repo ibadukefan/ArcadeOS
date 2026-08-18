@@ -221,7 +221,19 @@ var STACK = (function () {
     title: 'STACK',
     tag: 'Time the drop, build the tower',
     accent: ACCENT.stack,
-    hint: 'A drop',
+    hint: '{A} DROP THE SLAB',
+    /** Attract-mode pilot: drop when the slab lines up with the row below. */
+    demo: function () {
+      var out = {};
+      if (over || !rows.length) return out;
+      var below = rows[rows.length - 1];
+      var slabMid = cur.x + cur.w / 2;
+      var belowMid = below.x + below.w / 2;
+      /* A little slack so it shaves the tower rather than playing perfectly. */
+      if (Math.abs(slabMid - belowMid) < 6) out.confirm = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,

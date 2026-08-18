@@ -82,6 +82,8 @@ var Input = (function () {
       edge: Object.create(null),
       /** Live state at the previous sample, for transition detection. */
       sampled: Object.create(null),
+      /** Real-device state at the previous sample, for activity detection. */
+      realPrev: Object.create(null),
 
       down: Object.create(null),
       prev: Object.create(null),
@@ -92,6 +94,7 @@ var Input = (function () {
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
       s.live[a] = false; s.edge[a] = 0; s.sampled[a] = false;
+      s.realPrev[a] = false;
       s.down[a] = false; s.prev[a] = false; s.hit[a] = false;
       s.reps[a] = 0; s.timer[a] = 0;
     }
@@ -219,6 +222,19 @@ var Input = (function () {
   var scratch = Object.create(null);
   var padScratch = Object.create(null);
 
+  /*
+   * DEMO CHANNEL
+   *
+   * Attract mode needs the games to actually play. The demo's presses are OR'd
+   * into player 1 so games read them through the ordinary Input API and need
+   * no special case — but they are deliberately excluded from the `activity`
+   * flag. If they were not, the demo's first button press would register as a
+   * player touching the cabinet and attract mode would wake itself instantly.
+   */
+  var demoMap = null;
+
+  function setDemo(map) { demoMap = map || null; }
+
   /* Diagnostics, surfaced by the on-cabinet overlay. */
   var sampleCount = 0;
   var padUpdates = 0;
@@ -247,7 +263,8 @@ var Input = (function () {
          * player did, so that is what happens. */
         slot.reps[a] = presses > 4 ? 4 : presses;
         slot.timer[a] = REPEAT_DELAY;
-        activity = true;
+        /* NB: activity is set in sample() from real devices only, so that a
+         * demo press does not read as somebody touching the cabinet. */
         if (!isDown) tapsSaved++;
       } else if (isDown && wasDown) {
         slot.timer[a] -= dt;
@@ -355,6 +372,24 @@ var Input = (function () {
               padUpdates++;
             }
           }
+        }
+      }
+
+      /*
+       * Activity is judged on real hardware only, BEFORE the demo is mixed in.
+       * This is what lets the demo drive a game while attract mode still
+       * treats the cabinet as untouched.
+       */
+      for (a = 0; a < ACTIONS.length; a++) {
+        act = ACTIONS[a];
+        var real = !!scratch[act];
+        if (real && !slot.realPrev[act]) activity = true;
+        slot.realPrev[act] = real;
+      }
+
+      if (demoMap && pi === 0) {
+        for (a = 0; a < ACTIONS.length; a++) {
+          if (demoMap[ACTIONS[a]]) scratch[ACTIONS[a]] = true;
         }
       }
 
@@ -602,6 +637,9 @@ var Input = (function () {
   return {
     poll: poll,
     sample: sample,
+    /** Attract mode's synthetic input. Pass null to hand control back. */
+    setDemo: setDemo,
+    demoActive: function () { return !!demoMap; },
     startSampling: startSampling,
     stopSampling: stopSampling,
     SAMPLE_MS: SAMPLE_MS,
@@ -660,7 +698,7 @@ var Input = (function () {
       any = newSlot();
       pending = Object.create(null);
       padSignature = ''; padsVersion = 0; joinVersion = 0; activity = false;
-      sampleCount = 0; padUpdates = 0; tapsSaved = 0;
+      sampleCount = 0; padUpdates = 0; tapsSaved = 0; demoMap = null;
     },
   };
 })();

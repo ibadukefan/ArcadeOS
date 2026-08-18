@@ -92,6 +92,35 @@ var SNAKE = (function () {
     if (queued.length < 2) queued.push(d);
   }
 
+  /**
+   * How many cells are reachable from `from`, capped so it stays cheap. Used
+   * only by the attract pilot, to avoid sealing itself into a pocket.
+   */
+  var reachSeen = new Uint8Array(COLS * ROWS);
+  var reachQueue = new Int16Array(COLS * ROWS);
+  function freeSpaceFrom(from) {
+    reachSeen.fill(0);
+    var head2 = 0, tail2 = 0, count = 0;
+    reachQueue[head2++] = from;
+    reachSeen[from] = 1;
+    var CAP = COLS * ROWS;
+    while (tail2 < head2 && count < CAP) {
+      var i = reachQueue[tail2++];
+      count++;
+      var x = cx(i), y = cy(i);
+      for (var d = 0; d < 4; d++) {
+        var nx = x + [0, 0, -1, 1][d];
+        var ny = y + [-1, 1, 0, 0][d];
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        var ni = idx(nx, ny);
+        if (reachSeen[ni] || occupied[ni]) continue;
+        reachSeen[ni] = 1;
+        reachQueue[head2++] = ni;
+      }
+    }
+    return count;
+  }
+
   function die() {
     if (over) return;
     over = true;
@@ -264,7 +293,54 @@ var SNAKE = (function () {
     title: 'SNAKE',
     tag: 'Long field, tight corners',
     accent: ACCENT.snake,
-    hint: 'D-PAD turn',
+    hint: 'D-PAD TURN',
+    /**
+     * Attract-mode pilot.
+     *
+     * Survival first, food second. A purely greedy walk toward the apple
+     * looks fine for a few seconds and then corners itself — it died on one
+     * seed in eight at exactly the 2.8s mark, the same time the game used to
+     * die with no input at all.
+     *
+     * So every legal move is scored by how much open space it leaves (a flood
+     * fill from the new head), and the apple only breaks ties. That is enough
+     * to keep it alive indefinitely without looking like a solver.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var h = headCell();
+      var hx = cx(h), hy = cy(h);
+      var target = food >= 0 ? food : gold;
+      var tx = target >= 0 ? cx(target) : hx;
+      var ty = target >= 0 ? cy(target) : hy;
+
+      var names = ['up', 'down', 'left', 'right'];
+      var bestName = null, bestSpace = -1, bestDist = 1e9;
+
+      for (var i = 0; i < names.length; i++) {
+        var d = DIRS[names[i]];
+        if (d.x === -dir.x && d.y === -dir.y) continue;   /* no reversing */
+        var nx = hx + d.x, ny = hy + d.y;
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        var ni = idx(nx, ny);
+        if (occupied[ni] && ni !== body[tail]) continue;
+
+        var space = freeSpaceFrom(ni);
+        var dist = Math.abs(nx - tx) + Math.abs(ny - ty);
+        /* Prefer room to move; among equally roomy moves, head for the food.
+         * The tolerance keeps it from dithering over one-cell differences. */
+        if (space > bestSpace + 2 ||
+            (space > bestSpace - 3 && dist < bestDist)) {
+          if (space > bestSpace) bestSpace = space;
+          bestDist = dist;
+          bestName = names[i];
+        }
+      }
+
+      if (bestName) out[bestName] = true;
+      return out;
+    },
     start: start,
     update: update,
     draw: draw,

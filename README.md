@@ -190,6 +190,16 @@ If you have an unrecognised pad and the buttons feel backwards, set
 Controllers can be plugged and unplugged at any time. The on-screen prompts
 update immediately.
 
+### Learning a game's controls
+
+You should never have to guess. Each game's controls appear in three places,
+always showing the buttons on the controller actually in your hands — a
+DualSense reads `✕`, a Switch Pro reads `A`, a keyboard reads `ENTER`:
+
+- under the game's name on the dashboard, when it is selected
+- as a banner for the first few seconds of a run, which then fades
+- in the pause menu, which is where a stuck player looks
+
 ---
 
 ## The games
@@ -236,8 +246,16 @@ under `/var/lib/arcadeos/chromium`.
 ### Attract mode
 
 Leave the dashboard alone for sixty seconds and the cabinet starts cycling
-demos behind the wordmark, with the top scores for whatever is on screen. Any
-input at all returns instantly.
+**self-playing demos** behind the wordmark, with the top scores for whatever is
+on screen. Any input at all returns instantly.
+
+The demos really play — the snake hunts food while avoiding trapping itself,
+the paddle tracks the ball, the rhythm game hits its notes. Each game supplies
+its own small pilot, because only the game knows where its ball is. They are
+deliberately imperfect: a demo that never loses looks canned.
+
+Demo input is excluded from the idle timer, so the cabinet cannot wake itself
+up by playing.
 
 ---
 
@@ -254,6 +272,7 @@ Reachable from the dashboard with the d-pad.
 | **REDUCED MOTION** | Stills the drifting aurora and disables rumble |
 | **FRAME TIMER** | On-screen diagnostics: fps, mean/worst frame time, controller sample rate, audio latency, taps saved, full-screen ops |
 | **LOW LATENCY VIDEO** | Desynchronized canvas. On by default; turn off only if your panel tears |
+| **DIAGNOSTICS** | Storage, schema version, video mode, controllers, and any recorded faults |
 | **PAIR BLUETOOTH PAD** | Opens a two-minute pairing window |
 | **RESET HIGH SCORES** | Asks first |
 | **RESTART** / **SHUT DOWN** | Ask first, then do it properly |
@@ -499,7 +518,7 @@ it exists because of two real bugs:
 
 Both classes are now caught the moment they are drawn.
 
-Current coverage: 197 tests. Boot → dashboard → each game → pause → quit for
+Current coverage: 234 tests. Boot → dashboard → each game → pause → quit for
 all nine games; 1500+ randomised frames per game with varied `dt`; controller
 detection for Xbox, PlayStation, Nintendo and unknown pads; storage fresh,
 populated, corrupt and unavailable; per-frame draw and full-screen-op budgets;
@@ -616,6 +635,42 @@ Turn on **SETTINGS → FRAME TIMER**. If the mean is above 16.7ms, try disabling
 **CRT VEIL** and enabling **REDUCED MOTION**, which are the two most expensive
 optional effects. Check nothing else is competing: `top`.
 
+**Something crashed and I want to know what**
+
+**SETTINGS → DIAGNOSTICS.** Faults are recorded with the game and function that
+threw, repeats collapse into a count, and they survive a reboot. The same lines
+are relayed to the local agent, so they also appear in the journal:
+
+```bash
+journalctl -u arcadeos-agent | grep frontend
+```
+
+**The screen froze and nothing recovers it**
+
+It should recover itself within about thirty seconds. The front end sends a
+heartbeat to the agent at the end of every frame, so the beats stop the instant
+frames do; the agent then restarts the kiosk. Check whether that happened:
+
+```bash
+curl http://127.0.0.1:8127/       # shows frontend state and restart count
+journalctl -u arcadeos-agent | grep -E "watchdog|no frames"
+```
+
+A wedged *kernel* is a different failure, and is covered by the Pi's hardware
+watchdog — systemd stops petting it and the board resets after 20 seconds.
+
+**I upgraded and my high scores vanished**
+
+They should not have. Scores are stored under a versioned key and migrated
+forward on read; **SETTINGS → DIAGNOSTICS** shows the schema version and how
+many records were migrated this session. If the count is zero and the scores
+are gone, the old keys are still on disk — nothing is ever deleted by a
+migration — so please file the contents of:
+
+```bash
+grep -o 'arcadeos:[^"]*' /var/lib/arcadeos/chromium/Local\ Storage/leveldb/* 2>/dev/null | sort -u
+```
+
 **I need a console back**
 
 ```bash
@@ -716,7 +771,15 @@ often you *see* the result, never whether the press was *noticed*.
 
 **Storage never breaks a game.** Every read and write goes through one wrapper
 with a try/catch and an in-memory fallback. A corrupt record costs you one row,
-not the leaderboard.
+not the leaderboard. Keys are versioned and migrated forward on read, and the
+old key is never deleted — a bad upgrade should cost you scores at worst, never
+a cabinet that will not boot.
+
+**Two layers of hang detection.** `Restart=always` catches a crash but does
+nothing for a hang, where Chromium is alive, the unit is "active", and the
+picture is frozen. The front end heartbeats the agent from the frame loop, so
+the beats stop when frames do and the agent restarts the kiosk. A wedged kernel
+is caught underneath that by the Pi's hardware watchdog.
 
 **Nothing leaves the machine.** No CDN, no fonts, no telemetry, no network
 calls of any kind. The build fails if a URL appears in the output. The one

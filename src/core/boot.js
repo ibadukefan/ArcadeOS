@@ -27,10 +27,15 @@ var Loop = (function () {
   }
 
   /** One logical frame. Exposed so the harness can drive it directly. */
+  var clock = 0;
+
   function tick(dt) {
+    clock += num(dt, 16);
     Input.poll(dt);
     Shell.update(dt);
     Shell.draw(dt);
+    /* Last thing in the frame: proof that a whole frame completed. */
+    System.heartbeat(clock);
   }
 
   function start() {
@@ -89,7 +94,8 @@ function boot() {
 if (typeof globalThis !== 'undefined') {
   globalThis.ArcadeOS = {
     Shell: Shell, Input: Input, Audio2: Audio2, Render: Render, Loop: Loop,
-    Store: Store, Settings: Settings, Scores: Scores, System: System,
+    Store: Store, Settings: Settings, Scores: Scores, Faults: Faults,
+    System: System,
     GAMES: GAMES, VERSUS_GAMES: VERSUS_GAMES, gameById: gameById,
     seedRng: seedRng, rnd: rnd, boot: boot,
     COL: COL, ACCENT: ACCENT, ACTIONS: ACTIONS,

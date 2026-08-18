@@ -72,7 +72,6 @@ var CLIMB = (function () {
     particles.clear();
     camY = 0;
     spawnY = 0;
-    highest = 0;
     score = 0;
     over = false;
     shakeT = 0;
@@ -82,6 +81,12 @@ var CLIMB = (function () {
     hop.x = base ? base.x + base.w / 2 : GW / 2;
     hop.y = (base ? base.y : BOT - 80) - HOP_R - 2;
     hop.vx = 0; hop.vy = BOUNCE; hop.face = 1; hop.squash = 0;
+    /*
+     * Altitude is measured from wherever the hopper actually starts. Seeding
+     * this to 0 meant `hop.y < highest` was false until the player had climbed
+     * ~889px, so the first three or four screens of a run scored nothing.
+     */
+    highest = hop.y;
 
     spawnY = BOT - 80;
     while (spawnY > -PLAT_GAP * 8) {
@@ -315,7 +320,62 @@ var CLIMB = (function () {
     title: 'CLIMB',
     tag: 'The camera only goes up',
     accent: ACCENT.climb,
-    hint: 'D-PAD steer',
+    hint: '◀▶ STEER · BOUNCING IS AUTOMATIC',
+    /**
+     * Attract-mode pilot.
+     *
+     * You do not climb by chasing platforms above you — you climb by landing
+     * on the highest platform still BELOW you, which the arc then carries you
+     * past. Targeting upward was the first bug: it steered at things it could
+     * not reach and fell off in about three seconds.
+     *
+     * Height alone is not enough either. The highest platform below is often
+     * across the screen, and the hopper cannot get there before it falls past,
+     * so the choice is a trade-off between how much altitude a platform gains
+     * and whether it can actually be reached. Weighing both took the pilot
+     * from surviving 24 of 30 seeds to all 30.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var feet = hop.y + HOP_R;
+      var span = RIGHT - LEFT;
+
+      /* Horizontal distance, accounting for the wrap at the walls. */
+      function reach(cx2) {
+        var d = Math.abs(cx2 - hop.x);
+        return Math.min(d, span - d);
+      }
+
+      var best = null, bestCost = Infinity;
+      plats.forEach(function (p) {
+        if (p.used > 1) return;
+        if (p.y < feet - 4) return;              /* above us: cannot land on it */
+        if (p.y > feet + 560) return;            /* too far down to bother */
+        var centre = p.x + p.w / 2;
+        /* Altitude is the prize; distance is the risk. */
+        var cost = (p.y - feet) + reach(centre) * 1.6;
+        if (p.kind === 3) cost -= 90;            /* springs are worth going for */
+        if (p.kind === 2) cost += 60;            /* crumbling ones are a trap */
+        if (cost < bestCost) { bestCost = cost; best = p; }
+      });
+
+      if (!best) {
+        plats.forEach(function (p) {
+          if (p.used > 1) return;
+          if (!best || Math.abs(p.y - hop.y) < Math.abs(best.y - hop.y)) best = p;
+        });
+      }
+      if (!best) return out;
+
+      var want = best.x + best.w / 2;
+      var dx = want - hop.x;
+      /* Go the short way round if wrapping is closer. */
+      if (Math.abs(dx) > span / 2) dx = -dx;
+      if (dx < -8) out.left = true;
+      else if (dx > 8) out.right = true;
+      return out;
+    },
     start: start,
     update: update,
     draw: draw,

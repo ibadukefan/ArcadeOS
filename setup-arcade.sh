@@ -377,12 +377,39 @@ RestrictAddressFamilies=AF_INET AF_UNIX
 WantedBy=multi-user.target
 UNIT
 
+  install_watchdog
+
   systemctl daemon-reload
   systemctl enable arcadeos-agent.service >/dev/null
   systemctl restart arcadeos-agent.service
   systemctl set-default graphical.target >/dev/null
   systemctl enable arcadeos.service >/dev/null
   info "kiosk service enabled (starts on next boot; 'systemctl start arcadeos' to test now)"
+}
+
+# The Pi has a hardware watchdog (bcm2835_wdt). systemd will pet it while it is
+# healthy and let the board reset if it is not, which covers the one failure the
+# agent's frame heartbeat cannot: a kernel or systemd level hang, where nothing
+# in userspace is left running to notice.
+#
+# Two layers, deliberately:
+#   agent heartbeat  ->  frozen picture, healthy OS   ->  restart the kiosk
+#   hardware watchdog ->  wedged kernel               ->  reset the board
+install_watchdog() {
+  step "Arming the hardware watchdog"
+  if [[ ! -e /dev/watchdog ]] && ! modinfo bcm2835_wdt >/dev/null 2>&1; then
+    warn "no hardware watchdog on this machine; skipping"
+    return 0
+  fi
+  write_block /etc/systemd/system.conf "$(cat <<'CFG'
+# Reset the board if systemd stops petting the watchdog for this long.
+RuntimeWatchdogSec=20
+# Bound how long a shutdown may hang before the watchdog forces the issue.
+RebootWatchdogSec=2min
+CFG
+)"
+  info "systemd will reset the board after 20s of a wedged kernel"
+  info "kiosk-level hangs are handled by the agent's frame heartbeat"
 }
 
 install_gpio() {
@@ -591,6 +618,8 @@ uninstall() {
   local cfg; cfg="$(boot_config)"
   [[ -n "$cfg" ]] && { remove_block "$cfg"; info "cleaned $(basename "$cfg")"; }
   remove_block /etc/fstab
+  remove_block /etc/systemd/system.conf
+  info "disarmed the hardware watchdog"
 
   # Overlay off first — otherwise these deletions evaporate on reboot.
   if command -v raspi-config >/dev/null 2>&1; then

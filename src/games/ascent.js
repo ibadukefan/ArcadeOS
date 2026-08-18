@@ -316,7 +316,29 @@ var ASCENT = (function () {
     title: 'ASCENT',
     tag: 'Fly the gauntlet, climb the waves',
     accent: ACCENT.ascent,
-    hint: 'D-PAD fly · A fire',
+    hint: 'D-PAD FLY · {A} FIRE',
+    /** Attract-mode pilot: line up on the nearest foe, sidestep close ones. */
+    demo: function () {
+      var out = { confirm: true };
+      if (over) return out;
+      var target = null, bestY = -1e9;
+      var threat = null;
+      foes.forEach(function (f) {
+        if (f.y > bestY) { bestY = f.y; target = f; }
+        /* Anything nearly on top of us takes priority. */
+        if (f.y > ship.y - 190 && Math.abs(f.x - ship.x) < 46) threat = f;
+      });
+      if (threat) {
+        if (threat.x > ship.x) out.left = true; else out.right = true;
+        return out;
+      }
+      if (target) {
+        if (target.x < ship.x - 8) out.left = true;
+        else if (target.x > ship.x + 8) out.right = true;
+      }
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,

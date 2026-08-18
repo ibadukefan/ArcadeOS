@@ -555,7 +555,7 @@ var VERSUS = (function () {
     title: 'VERSUS',
     tag: 'Two wells, one pile of garbage',
     accent: ACCENT.versus,
-    hint: 'TWO PADS · UP rotate · A hard drop',
+    hint: 'TWO PADS · ▲ ROTATE · {A} SLAM',
     start: start,
     update: update,
     draw: draw,

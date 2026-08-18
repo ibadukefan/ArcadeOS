@@ -316,15 +316,42 @@ function gameById(id) {
 
 var Store = (function () {
   var NS = 'arcadeos';
-  var VERSION = 1;
+
+  /*
+   * SCHEMA VERSION AND MIGRATION
+   *
+   * Keys are namespaced `arcadeos:v<N>:<name>`. A version number that nothing
+   * ever migrates is decorative — bumping it would silently orphan every high
+   * score on every cabinet in the field. So the bump and the migration ship
+   * together, and the path is exercised rather than theoretical.
+   *
+   * To add v(N+1): raise VERSION and add MIGRATIONS[N+1], a function taking
+   * the parsed v(N) value of a record and returning the v(N+1) shape. Reads
+   * walk backwards to the newest stored version, apply the chain forward, and
+   * write the result at the current version. Old keys are left alone so a
+   * downgrade still finds its data.
+   */
+  var VERSION = 2;
+
+  var MIGRATIONS = {
+    /*
+     * 1 -> 2: no shape change. Both records were already validated field by
+     * field on read, so v1 data is v2 data. This exists so the machinery is
+     * live and covered rather than waiting for the first real change.
+     */
+    2: function (name, value) { return value; },
+  };
 
   /** In-memory mirror. Always authoritative during a session. */
   var mem = Object.create(null);
   /** null until probed. */
   var backend = undefined;
   var lastError = null;
+  var migrated = 0;
 
-  function key(name) { return NS + ':v' + VERSION + ':' + name; }
+  function key(name, version) {
+    return NS + ':v' + (version === undefined ? VERSION : version) + ':' + name;
+  }
 
   /**
    * Probe for a usable backend exactly once. Chromium can expose
@@ -349,10 +376,51 @@ var Store = (function () {
     return backend;
   }
 
-  function readRaw(name) {
+  function readRaw(name, version) {
     var b = be();
     if (!b) return null;
-    try { return b.getItem(key(name)); } catch (e) { lastError = e; return null; }
+    try { return b.getItem(key(name, version)); }
+    catch (e) { lastError = e; return null; }
+  }
+
+  /**
+   * Find a record, migrating it forward if it was written by an older build.
+   * Returns the parsed value, or null.
+   *
+   * A migration that throws is treated as "no usable data" rather than being
+   * allowed to propagate — a bad upgrade should cost you your high scores at
+   * worst, never a cabinet that will not boot.
+   */
+  function readMigrated(name) {
+    var raw = readRaw(name);
+    if (raw != null) return parse(raw);
+
+    for (var v = VERSION - 1; v >= 1; v--) {
+      var old = readRaw(name, v);
+      if (old == null) continue;
+      var value = parse(old);
+      if (value == null) continue;
+      try {
+        for (var step = v + 1; step <= VERSION; step++) {
+          var fn = MIGRATIONS[step];
+          if (fn) value = fn(name, value);
+          if (value == null) break;
+        }
+      } catch (e) {
+        lastError = e;
+        return null;
+      }
+      if (value == null) continue;
+      migrated++;
+      /* Write forward so the walk only happens once. */
+      try { writeRaw(name, JSON.stringify(value)); } catch (e2) { lastError = e2; }
+      return value;
+    }
+    return null;
+  }
+
+  function parse(raw) {
+    try { return JSON.parse(raw); } catch (e) { return null; }
   }
 
   function writeRaw(name, str) {
@@ -370,17 +438,13 @@ var Store = (function () {
    */
   function get(name, fallback, validate) {
     if (name in mem) return mem[name];
-    var raw = readRaw(name);
+    var parsed = readMigrated(name);
     var out = fallback;
-    if (raw != null) {
-      var parsed = null;
-      try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
-      if (parsed != null) {
-        var checked = null;
-        try { checked = validate ? validate(parsed) : parsed; }
-        catch (e2) { checked = null; }
-        if (checked != null) out = checked;
-      }
+    if (parsed != null) {
+      var checked = null;
+      try { checked = validate ? validate(parsed) : parsed; }
+      catch (e2) { checked = null; }
+      if (checked != null) out = checked;
     }
     mem[name] = out;
     return out;
@@ -409,9 +473,13 @@ var Store = (function () {
     /** True when writes actually survive a reboot. Surfaced in settings. */
     persistent: function () { return !!be(); },
     lastError: function () { return lastError; },
-    /** Test seam: drop the memoised backend and cache. */
-    _reset: function () { mem = Object.create(null); backend = undefined; lastError = null; },
+    /** How many records were upgraded from an older schema this session. */
+    migrated: function () { return migrated; },
+    _reset: function () {
+      mem = Object.create(null); backend = undefined; lastError = null; migrated = 0;
+    },
     _key: key,
+    _migrations: MIGRATIONS,
     VERSION: VERSION,
   };
 })();
@@ -492,6 +560,91 @@ var Settings = (function () {
   }
 
   return { all: all, get: get, set: set, reset: reset, _validate: validate };
+})();
+
+/* ------------------------------------------------------------- faults --- */
+
+/*
+ * Crash log.
+ *
+ * A cabinet has no keyboard and no console. Before this, a game fault showed a
+ * toast for 2.6 seconds and then existed nowhere at all — a reproducible crash
+ * was undiagnosable without pulling the SD card. Faults now persist (so the
+ * settings screen can show them) and are relayed to the local agent (so they
+ * land in journald and `journalctl -u arcadeos-agent` tells the story).
+ */
+var Faults = (function () {
+  var MAX = 10;
+  var cache = null;
+  /* Bound the relay: a game throwing every frame must not flood the journal. */
+  var lastRelay = 0;
+  var RELAY_GAP = 10000;
+
+  function validate(raw) {
+    if (!Array.isArray(raw)) return null;
+    var out = [];
+    for (var i = 0; i < raw.length && out.length < MAX; i++) {
+      var e = raw[i];
+      if (!e || typeof e !== 'object') continue;
+      out.push({
+        msg: String(e.msg == null ? '' : e.msg).slice(0, 200),
+        where: String(e.where == null ? '' : e.where).slice(0, 40),
+        at: (typeof e.at === 'number' && isFinite(e.at)) ? e.at : 0,
+        n: (typeof e.n === 'number' && isFinite(e.n)) ? Math.max(1, Math.floor(e.n)) : 1,
+      });
+    }
+    return out;
+  }
+
+  function all() {
+    if (!cache) cache = Store.get('faults', [], validate) || [];
+    return cache;
+  }
+
+  /**
+   * Record a fault. Repeats of the same message in the same place bump a
+   * counter rather than pushing a new row, so one broken game cannot evict
+   * the history of everything else.
+   */
+  function record(err, where, now) {
+    var msg = '';
+    try {
+      msg = (err && err.message) ? String(err.message) : String(err);
+    } catch (e) { msg = 'unknown error'; }
+    msg = msg.slice(0, 200);
+    var w = String(where || '').slice(0, 40);
+    var t = num(now, 0);
+
+    var list = all();
+    if (list.length && list[0].msg === msg && list[0].where === w) {
+      list[0].n++;
+      list[0].at = t;
+    } else {
+      list.unshift({ msg: msg, where: w, at: t, n: 1 });
+      while (list.length > MAX) list.pop();
+    }
+    Store.set('faults', list);
+
+    /* Relay to the agent so it reaches the journal, rate limited. */
+    if (t - lastRelay > RELAY_GAP || lastRelay === 0) {
+      lastRelay = t;
+      if (typeof System !== 'undefined' && System && System.log) {
+        System.log('fault in ' + (w || 'shell') + ': ' + msg);
+      }
+    }
+    return list[0];
+  }
+
+  return {
+    all: all,
+    record: record,
+    latest: function () { var l = all(); return l.length ? l[0] : null; },
+    count: function () { return all().length; },
+    clear: function () { cache = []; Store.set('faults', []); },
+    _validate: validate,
+    _drop: function () { cache = null; lastRelay = 0; },
+    MAX: MAX,
+  };
 })();
 
 /* --------------------------------------------------------- high scores --- */
@@ -928,6 +1081,8 @@ var Input = (function () {
       edge: Object.create(null),
       /** Live state at the previous sample, for transition detection. */
       sampled: Object.create(null),
+      /** Real-device state at the previous sample, for activity detection. */
+      realPrev: Object.create(null),
 
       down: Object.create(null),
       prev: Object.create(null),
@@ -938,6 +1093,7 @@ var Input = (function () {
     for (var i = 0; i < ACTIONS.length; i++) {
       var a = ACTIONS[i];
       s.live[a] = false; s.edge[a] = 0; s.sampled[a] = false;
+      s.realPrev[a] = false;
       s.down[a] = false; s.prev[a] = false; s.hit[a] = false;
       s.reps[a] = 0; s.timer[a] = 0;
     }
@@ -1065,6 +1221,19 @@ var Input = (function () {
   var scratch = Object.create(null);
   var padScratch = Object.create(null);
 
+  /*
+   * DEMO CHANNEL
+   *
+   * Attract mode needs the games to actually play. The demo's presses are OR'd
+   * into player 1 so games read them through the ordinary Input API and need
+   * no special case — but they are deliberately excluded from the `activity`
+   * flag. If they were not, the demo's first button press would register as a
+   * player touching the cabinet and attract mode would wake itself instantly.
+   */
+  var demoMap = null;
+
+  function setDemo(map) { demoMap = map || null; }
+
   /* Diagnostics, surfaced by the on-cabinet overlay. */
   var sampleCount = 0;
   var padUpdates = 0;
@@ -1093,7 +1262,8 @@ var Input = (function () {
          * player did, so that is what happens. */
         slot.reps[a] = presses > 4 ? 4 : presses;
         slot.timer[a] = REPEAT_DELAY;
-        activity = true;
+        /* NB: activity is set in sample() from real devices only, so that a
+         * demo press does not read as somebody touching the cabinet. */
         if (!isDown) tapsSaved++;
       } else if (isDown && wasDown) {
         slot.timer[a] -= dt;
@@ -1201,6 +1371,24 @@ var Input = (function () {
               padUpdates++;
             }
           }
+        }
+      }
+
+      /*
+       * Activity is judged on real hardware only, BEFORE the demo is mixed in.
+       * This is what lets the demo drive a game while attract mode still
+       * treats the cabinet as untouched.
+       */
+      for (a = 0; a < ACTIONS.length; a++) {
+        act = ACTIONS[a];
+        var real = !!scratch[act];
+        if (real && !slot.realPrev[act]) activity = true;
+        slot.realPrev[act] = real;
+      }
+
+      if (demoMap && pi === 0) {
+        for (a = 0; a < ACTIONS.length; a++) {
+          if (demoMap[ACTIONS[a]]) scratch[ACTIONS[a]] = true;
         }
       }
 
@@ -1448,6 +1636,9 @@ var Input = (function () {
   return {
     poll: poll,
     sample: sample,
+    /** Attract mode's synthetic input. Pass null to hand control back. */
+    setDemo: setDemo,
+    demoActive: function () { return !!demoMap; },
     startSampling: startSampling,
     stopSampling: stopSampling,
     SAMPLE_MS: SAMPLE_MS,
@@ -1506,7 +1697,7 @@ var Input = (function () {
       any = newSlot();
       pending = Object.create(null);
       padSignature = ''; padsVersion = 0; joinVersion = 0; activity = false;
-      sampleCount = 0; padUpdates = 0; tapsSaved = 0;
+      sampleCount = 0; padUpdates = 0; tapsSaved = 0; demoMap = null;
     },
   };
 })();
@@ -2417,7 +2608,54 @@ var System = (function () {
     }
   }
 
+  /**
+   * Relay a diagnostic line to the agent, which prints it to stdout and so
+   * into journald. Fire and forget: a cabinet with no agent installed simply
+   * has no journal entry, and nothing upstream ever waits on this.
+   */
+  function log(text) {
+    if (typeof fetch !== 'function') return;
+    var line = String(text == null ? '' : text).slice(0, 500);
+    try {
+      fetch(ENDPOINT + 'log', {
+        method: 'POST',
+        cache: 'no-store',
+        keepalive: true,
+        body: line,
+      }).then(function () {}, function () {});
+    } catch (e) { /* never let diagnostics break the thing being diagnosed */ }
+  }
+
+  /*
+   * LIVENESS HEARTBEAT
+   *
+   * systemd's Restart=always catches a crash. It does nothing for a hang — a
+   * wedged GPU or a stuck script leaves Chromium alive, the service "active",
+   * and a frozen picture on the cabinet forever.
+   *
+   * This is sent from the frame loop, so it stops the instant frames stop.
+   * The agent restarts the kiosk when it goes quiet. Cheap (once every few
+   * seconds, loopback) and the failure mode is benign: no agent means no
+   * heartbeat means nothing happens, exactly as before.
+   */
+  var HEARTBEAT_MS = 4000;
+  var lastBeat = 0;
+
+  function heartbeat(nowMs) {
+    var now = num(nowMs, 0);
+    if (now - lastBeat < HEARTBEAT_MS) return;
+    lastBeat = now;
+    if (typeof fetch !== 'function') return;
+    try {
+      fetch(ENDPOINT + 'alive', { method: 'POST', cache: 'no-store', keepalive: true })
+        .then(function () {}, function () {});
+    } catch (e) { /* a missing agent must never cost a frame */ }
+  }
+
   return {
+    log: log,
+    heartbeat: heartbeat,
+    HEARTBEAT_MS: HEARTBEAT_MS,
     /** command: 'shutdown' | 'restart' | 'pair' */
     request: function (command, onDone) {
       if (command !== 'shutdown' && command !== 'restart' && command !== 'pair') return;
@@ -2907,7 +3145,29 @@ var TETRIS = (function () {
     title: 'TETRIS',
     tag: 'Stack, clear, survive the climb',
     accent: ACCENT.tetris,
-    hint: 'UP rotate · A hard drop · X hold',
+    hint: '◀▶ MOVE · ▼ DROP · ▲ ROTATE · {A} SLAM · {X} HOLD',
+    /**
+     * Attract-mode pilot: slide toward the shallowest column and slam. Plays
+     * like a distracted human, which is exactly what a demo should look like.
+     */
+    demo: function () {
+      var out = {};
+      if (over || clearing) return out;
+      /* Column heights. */
+      var bestCol = 0, bestDepth = -1;
+      for (var c = 0; c < COLS; c++) {
+        var depth = ROWS;
+        for (var r = 0; r < ROWS; r++) {
+          if (grid[idx(c, r)] !== 0) { depth = r; break; }
+        }
+        if (depth > bestDepth) { bestDepth = depth; bestCol = c; }
+      }
+      if (cur.x < bestCol - 1) out.right = true;
+      else if (cur.x > bestCol) out.left = true;
+      else out.confirm = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -3238,7 +3498,29 @@ var ASCENT = (function () {
     title: 'ASCENT',
     tag: 'Fly the gauntlet, climb the waves',
     accent: ACCENT.ascent,
-    hint: 'D-PAD fly · A fire',
+    hint: 'D-PAD FLY · {A} FIRE',
+    /** Attract-mode pilot: line up on the nearest foe, sidestep close ones. */
+    demo: function () {
+      var out = { confirm: true };
+      if (over) return out;
+      var target = null, bestY = -1e9;
+      var threat = null;
+      foes.forEach(function (f) {
+        if (f.y > bestY) { bestY = f.y; target = f; }
+        /* Anything nearly on top of us takes priority. */
+        if (f.y > ship.y - 190 && Math.abs(f.x - ship.x) < 46) threat = f;
+      });
+      if (threat) {
+        if (threat.x > ship.x) out.left = true; else out.right = true;
+        return out;
+      }
+      if (target) {
+        if (target.x < ship.x - 8) out.left = true;
+        else if (target.x > ship.x + 8) out.right = true;
+      }
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -3470,7 +3752,19 @@ var STACK = (function () {
     title: 'STACK',
     tag: 'Time the drop, build the tower',
     accent: ACCENT.stack,
-    hint: 'A drop',
+    hint: '{A} DROP THE SLAB',
+    /** Attract-mode pilot: drop when the slab lines up with the row below. */
+    demo: function () {
+      var out = {};
+      if (over || !rows.length) return out;
+      var below = rows[rows.length - 1];
+      var slabMid = cur.x + cur.w / 2;
+      var belowMid = below.x + below.w / 2;
+      /* A little slack so it shaves the tower rather than playing perfectly. */
+      if (Math.abs(slabMid - belowMid) < 6) out.confirm = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -3571,6 +3865,35 @@ var SNAKE = (function () {
     if (d.x === -ref.x && d.y === -ref.y) return;   /* no 180s */
     if (d.x === ref.x && d.y === ref.y) return;     /* no duplicates */
     if (queued.length < 2) queued.push(d);
+  }
+
+  /**
+   * How many cells are reachable from `from`, capped so it stays cheap. Used
+   * only by the attract pilot, to avoid sealing itself into a pocket.
+   */
+  var reachSeen = new Uint8Array(COLS * ROWS);
+  var reachQueue = new Int16Array(COLS * ROWS);
+  function freeSpaceFrom(from) {
+    reachSeen.fill(0);
+    var head2 = 0, tail2 = 0, count = 0;
+    reachQueue[head2++] = from;
+    reachSeen[from] = 1;
+    var CAP = COLS * ROWS;
+    while (tail2 < head2 && count < CAP) {
+      var i = reachQueue[tail2++];
+      count++;
+      var x = cx(i), y = cy(i);
+      for (var d = 0; d < 4; d++) {
+        var nx = x + [0, 0, -1, 1][d];
+        var ny = y + [-1, 1, 0, 0][d];
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        var ni = idx(nx, ny);
+        if (reachSeen[ni] || occupied[ni]) continue;
+        reachSeen[ni] = 1;
+        reachQueue[head2++] = ni;
+      }
+    }
+    return count;
   }
 
   function die() {
@@ -3745,7 +4068,54 @@ var SNAKE = (function () {
     title: 'SNAKE',
     tag: 'Long field, tight corners',
     accent: ACCENT.snake,
-    hint: 'D-PAD turn',
+    hint: 'D-PAD TURN',
+    /**
+     * Attract-mode pilot.
+     *
+     * Survival first, food second. A purely greedy walk toward the apple
+     * looks fine for a few seconds and then corners itself — it died on one
+     * seed in eight at exactly the 2.8s mark, the same time the game used to
+     * die with no input at all.
+     *
+     * So every legal move is scored by how much open space it leaves (a flood
+     * fill from the new head), and the apple only breaks ties. That is enough
+     * to keep it alive indefinitely without looking like a solver.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var h = headCell();
+      var hx = cx(h), hy = cy(h);
+      var target = food >= 0 ? food : gold;
+      var tx = target >= 0 ? cx(target) : hx;
+      var ty = target >= 0 ? cy(target) : hy;
+
+      var names = ['up', 'down', 'left', 'right'];
+      var bestName = null, bestSpace = -1, bestDist = 1e9;
+
+      for (var i = 0; i < names.length; i++) {
+        var d = DIRS[names[i]];
+        if (d.x === -dir.x && d.y === -dir.y) continue;   /* no reversing */
+        var nx = hx + d.x, ny = hy + d.y;
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        var ni = idx(nx, ny);
+        if (occupied[ni] && ni !== body[tail]) continue;
+
+        var space = freeSpaceFrom(ni);
+        var dist = Math.abs(nx - tx) + Math.abs(ny - ty);
+        /* Prefer room to move; among equally roomy moves, head for the food.
+         * The tolerance keeps it from dithering over one-cell differences. */
+        if (space > bestSpace + 2 ||
+            (space > bestSpace - 3 && dist < bestDist)) {
+          if (space > bestSpace) bestSpace = space;
+          bestDist = dist;
+          bestName = names[i];
+        }
+      }
+
+      if (bestName) out[bestName] = true;
+      return out;
+    },
     start: start,
     update: update,
     draw: draw,
@@ -4154,7 +4524,24 @@ var BREAKOUT = (function () {
     title: 'BREAKOUT',
     tag: 'A tall well makes long arcs',
     accent: ACCENT.breakout,
-    hint: 'D-PAD move · A launch',
+    hint: '◀▶ PADDLE · {A} LAUNCH',
+    /** Attract-mode pilot: keep the paddle under the lowest live ball. */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var target = null, lowest = -1;
+      balls.forEach(function (b) {
+        if (b.stuck) { out.confirm = true; return; }
+        if (b.y > lowest) { lowest = b.y; target = b; }
+      });
+      if (!target) return out;
+      /* Aim slightly off-centre so the ball keeps picking up angle. */
+      var want = target.x + (target.vx > 0 ? -10 : 10);
+      if (want < paddle.x - 6) out.left = true;
+      else if (want > paddle.x + 6) out.right = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -4237,7 +4624,6 @@ var CLIMB = (function () {
     particles.clear();
     camY = 0;
     spawnY = 0;
-    highest = 0;
     score = 0;
     over = false;
     shakeT = 0;
@@ -4247,6 +4633,12 @@ var CLIMB = (function () {
     hop.x = base ? base.x + base.w / 2 : GW / 2;
     hop.y = (base ? base.y : BOT - 80) - HOP_R - 2;
     hop.vx = 0; hop.vy = BOUNCE; hop.face = 1; hop.squash = 0;
+    /*
+     * Altitude is measured from wherever the hopper actually starts. Seeding
+     * this to 0 meant `hop.y < highest` was false until the player had climbed
+     * ~889px, so the first three or four screens of a run scored nothing.
+     */
+    highest = hop.y;
 
     spawnY = BOT - 80;
     while (spawnY > -PLAT_GAP * 8) {
@@ -4480,7 +4872,62 @@ var CLIMB = (function () {
     title: 'CLIMB',
     tag: 'The camera only goes up',
     accent: ACCENT.climb,
-    hint: 'D-PAD steer',
+    hint: '◀▶ STEER · BOUNCING IS AUTOMATIC',
+    /**
+     * Attract-mode pilot.
+     *
+     * You do not climb by chasing platforms above you — you climb by landing
+     * on the highest platform still BELOW you, which the arc then carries you
+     * past. Targeting upward was the first bug: it steered at things it could
+     * not reach and fell off in about three seconds.
+     *
+     * Height alone is not enough either. The highest platform below is often
+     * across the screen, and the hopper cannot get there before it falls past,
+     * so the choice is a trade-off between how much altitude a platform gains
+     * and whether it can actually be reached. Weighing both took the pilot
+     * from surviving 24 of 30 seeds to all 30.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var feet = hop.y + HOP_R;
+      var span = RIGHT - LEFT;
+
+      /* Horizontal distance, accounting for the wrap at the walls. */
+      function reach(cx2) {
+        var d = Math.abs(cx2 - hop.x);
+        return Math.min(d, span - d);
+      }
+
+      var best = null, bestCost = Infinity;
+      plats.forEach(function (p) {
+        if (p.used > 1) return;
+        if (p.y < feet - 4) return;              /* above us: cannot land on it */
+        if (p.y > feet + 560) return;            /* too far down to bother */
+        var centre = p.x + p.w / 2;
+        /* Altitude is the prize; distance is the risk. */
+        var cost = (p.y - feet) + reach(centre) * 1.6;
+        if (p.kind === 3) cost -= 90;            /* springs are worth going for */
+        if (p.kind === 2) cost += 60;            /* crumbling ones are a trap */
+        if (cost < bestCost) { bestCost = cost; best = p; }
+      });
+
+      if (!best) {
+        plats.forEach(function (p) {
+          if (p.used > 1) return;
+          if (!best || Math.abs(p.y - hop.y) < Math.abs(best.y - hop.y)) best = p;
+        });
+      }
+      if (!best) return out;
+
+      var want = best.x + best.w / 2;
+      var dx = want - hop.x;
+      /* Go the short way round if wrapping is closer. */
+      if (Math.abs(dx) > span / 2) dx = -dx;
+      if (dx < -8) out.left = true;
+      else if (dx > 8) out.right = true;
+      return out;
+    },
     start: start,
     update: update,
     draw: draw,
@@ -4955,7 +5402,25 @@ var PULSE = (function () {
     title: 'PULSE',
     tag: 'Four lanes, one d-pad',
     accent: ACCENT.pulse,
-    hint: 'D-PAD hit the lanes',
+    hint: '◀▼▲▶ HIT THE FOUR LANES',
+    /**
+     * Attract-mode pilot: press a lane when its next note is inside the
+     * perfect window. Deliberately not frame-perfect on every note — a demo
+     * that never misses looks canned.
+     */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      for (var i = 0; i < notes.length; i++) {
+        var n = notes[i];
+        if (n.judged >= 0) continue;
+        var d = n.time - songT;
+        if (d > 60) break;
+        if (d > -30) out[LANE_ACTION[n.lane]] = true;
+      }
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -5393,7 +5858,25 @@ var DROP = (function () {
     title: 'DROP',
     tag: 'Match three, chain the cascade',
     accent: ACCENT.drop,
-    hint: 'D-PAD move · A cycle · X drop',
+    hint: '◀▶ MOVE · ▼ DROP · {A} CYCLE · {X} SLAM',
+    /** Attract-mode pilot: aim for the shallowest column and drop. */
+    demo: function () {
+      var out = {};
+      if (over || phase !== 'fall') return out;
+      var bestCol = 0, bestDepth = -1;
+      for (var c = 0; c < COLS; c++) {
+        var depth = ROWS;
+        for (var r = 0; r < ROWS; r++) {
+          if (grid[idx(c, r)] !== 0) { depth = r; break; }
+        }
+        if (depth > bestDepth) { bestDepth = depth; bestCol = c; }
+      }
+      if (piece.col < bestCol) out.right = true;
+      else if (piece.col > bestCol) out.left = true;
+      else out.alt = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
@@ -5971,7 +6454,7 @@ var VERSUS = (function () {
     title: 'VERSUS',
     tag: 'Two wells, one pile of garbage',
     accent: ACCENT.versus,
-    hint: 'TWO PADS · UP rotate · A hard drop',
+    hint: 'TWO PADS · ▲ ROTATE · {A} SLAM',
     start: start,
     update: update,
     draw: draw,
@@ -6125,6 +6608,8 @@ var Shell = (function () {
   /* ------------------------------------------------------ transitions --- */
 
   function go(next) {
+    /* Leaving attract by any route hands input back to the player. */
+    if (state === 'attract' && next !== 'attract') Input.setDemo(null);
     prevState = state;
     state = next;
     stateT = 0;
@@ -6133,6 +6618,29 @@ var Shell = (function () {
   }
 
   function say(msg) { toast = { text: String(msg), life: 2600 }; }
+
+  /**
+   * Substitute {A}/{B}/{X} in a game's hint with the glyphs of the controller
+   * actually in the player's hands, so a DualSense reads "✕ SLAM" and a Switch
+   * Pro reads "A SLAM" — matching the button they are about to press.
+   */
+  function formatHint(hint, playerIndex) {
+    var g = Input.glyphs(playerIndex || 0);
+    return String(hint == null ? '' : hint)
+      .replace(/\{A\}/g, g.confirm)
+      .replace(/\{B\}/g, g.back)
+      .replace(/\{X\}/g, g.alt);
+  }
+
+  /**
+   * Record a fault so it outlives its toast. Draw and preview faults fire once
+   * per frame while broken, so Faults.record() collapses repeats into a count
+   * rather than letting one bad game evict the whole history.
+   */
+  function fault(err, where) {
+    try { Faults.record(err, where, Date.now ? Date.now() : t); }
+    catch (e) { /* the error reporter must never be the thing that throws */ }
+  }
 
   /* ------------------------------------------------------------- boot --- */
 
@@ -6146,11 +6654,26 @@ var Shell = (function () {
 
   /* ------------------------------------------------------------- menu --- */
 
-  function startGame(game, versus) {
+  /**
+   * Seed for the next run. Normally the clock, so two cabinets do not play the
+   * same piece sequence — but pinnable, because a test that cannot reproduce
+   * its own failure is not much of a test.
+   */
+  var forcedSeed = null;
+
+  function startGame(game, versus, seed) {
     activeGame = game;
-    seedRng((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635);
+    var s = (seed !== undefined && seed !== null) ? seed
+      : (forcedSeed !== null ? forcedSeed
+        : ((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635));
+    seedRng(s);
     try { game.start(); }
-    catch (e) { say('FAILED TO START'); go('menu'); return; }
+    catch (e) {
+      fault(e, game.id + '.start');
+      say('FAILED TO START — SEE SETTINGS');
+      go('menu');
+      return;
+    }
     go('game');
     Audio2.sfx('start');
   }
@@ -6191,7 +6714,8 @@ var Shell = (function () {
     if (!activeGame) { go('menu'); return; }
     try { activeGame.update(dt); }
     catch (e) {
-      say('GAME ERROR — RETURNED TO MENU');
+      fault(e, activeGame.id + '.update');
+      say('GAME ERROR — SEE SETTINGS');
       activeGame = null;
       go('menu');
     }
@@ -6318,6 +6842,9 @@ var Shell = (function () {
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
       { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
+      { id: 'faults', label: 'DIAGNOSTICS', type: 'action',
+        value: Faults.count() ? Faults.count() + ' FAULT' + (Faults.count() === 1 ? '' : 'S') : 'NONE',
+        warn: Faults.count() > 0 },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
       { id: 'shutdown', label: 'SHUT DOWN', type: 'action', danger: true },
@@ -6379,6 +6906,7 @@ var Shell = (function () {
       return;
     }
     if (it.id === 'back') { go('menu'); Audio2.sfx('back'); return; }
+    if (it.id === 'faults') { go('faults'); Audio2.sfx('select'); return; }
     if (it.id === 'reset') {
       ask('ERASE ALL HIGH SCORES?', function () {
         Scores.reset();
@@ -6428,6 +6956,91 @@ var Shell = (function () {
     }
   }
 
+  /* --------------------------------------------------------- faults --- */
+
+  function faultsUpdate(dt) {
+    if (confirmBox) { confirmUpdate(dt); return; }
+    if (Input.hit('back')) { go('settings'); Audio2.sfx('back'); return; }
+    if (Input.hit('confirm') && Faults.count()) {
+      ask('CLEAR THE FAULT LOG?', function () {
+        Faults.clear();
+        say('FAULT LOG CLEARED');
+      });
+    }
+  }
+
+  function drawFaults(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'DIAGNOSTICS', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+      cache: true,
+    });
+
+    var list = Faults.all();
+    var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
+
+    /* Build state first: this is the screen someone reads over SSH's shoulder. */
+    var lines = [
+      ['STORAGE', Store.persistent() ? 'PERSISTENT' : 'SESSION ONLY',
+        Store.persistent() ? COL.good : COL.warn],
+      ['SCHEMA', 'v' + Store.VERSION +
+        (Store.migrated() ? '  (' + Store.migrated() + ' MIGRATED)' : ''), COL.data],
+      ['VIDEO', Render.lowLatency() ? 'LOW LATENCY' : 'NORMAL', COL.data],
+      ['CONTROLLERS', String(Input.padCount()) + ' PAD' +
+        (Input.padCount() === 1 ? '' : 'S') + ', ' +
+        Input.kindOf(0).toUpperCase(), COL.data],
+      ['INPUT SAMPLING', Input.diagnostics().sampling
+        ? Input.diagnostics().intervalMs + 'ms' : 'FRAME ONLY',
+        Input.diagnostics().sampling ? COL.good : COL.warn],
+    ];
+    var y = 240;
+    for (var i = 0; i < lines.length; i++) {
+      panel(c, x, y, w, 56, { fill: COL.card, stroke: COL.cardLine });
+      text(c, lines[i][0], x + 24, y + 34, {
+        size: 16, weight: '500', track: 2, color: COL.text2,
+      });
+      dataText(c, lines[i][1], x + w - 24, y + 34, {
+        size: 17, align: 'right', color: lines[i][2],
+      });
+      y += 64;
+    }
+
+    y += 30;
+    text(c, list.length ? 'RECENT FAULTS' : 'NO FAULTS RECORDED', x + 24, y, {
+      size: 15, weight: '600', track: 3,
+      color: list.length ? COL.bad : COL.good,
+    });
+    y += 18;
+
+    for (var f = 0; f < list.length && f < 6; f++) {
+      var e = list[f];
+      panel(c, x, y, w, 74, {
+        fill: 'rgba(240,100,94,.08)', stroke: rgba(COL.bad, 0.28),
+      });
+      text(c, e.where || 'shell', x + 20, y + 28, {
+        size: 15, weight: '700', track: 1.5, color: COL.warn,
+      });
+      if (e.n > 1) {
+        dataText(c, 'x' + e.n, x + w - 20, y + 28, {
+          size: 15, align: 'right', color: COL.bad,
+        });
+      }
+      /* Truncate rather than wrap: the point is recognising it, not reading it. */
+      var msg = e.msg.length > 58 ? e.msg.slice(0, 57) + '…' : e.msg;
+      text(c, msg, x + 20, y + 54, {
+        size: 14, weight: '400', color: COL.text2, mono: true,
+      });
+      y += 82;
+    }
+
+    var gl = Input.glyphs(0);
+    drawFooter(c, list.length
+      ? [{ g: gl.confirm, l: 'CLEAR' }, { g: gl.back, l: 'BACK' }]
+      : [{ g: gl.back, l: 'BACK' }]);
+
+    if (confirmBox) drawConfirm(c);
+  }
+
   /* ---------------------------------------------------------- scores --- */
 
   function scoresUpdate(dt) {
@@ -6447,6 +7060,7 @@ var Shell = (function () {
   /* --------------------------------------------------------- attract --- */
 
   function enterAttract() {
+    Input.setDemo(null);
     attract.index = (attract.index + 1) % Math.max(1, GAMES.length);
     attract.game = GAMES[attract.index] || null;
     attract.timer = 0;
@@ -6458,32 +7072,51 @@ var Shell = (function () {
   }
 
   function attractUpdate(dt) {
-    /* Any input at all drops straight back to the dashboard. */
+    /* Any real input at all drops straight back to the dashboard. The demo's
+     * own presses are excluded from activity, so this cannot self-trigger. */
     if (Input.consumeActivity()) {
-      attract.game = null;
-      idleT = 0;
+      leaveAttract();
       go('menu');
       Audio2.sfx('back');
       return;
     }
     attract.timer += dt;
     if (attract.game) {
-      /* The demo plays itself; if it dies or stalls, rotate to the next. */
-      try { attractDrive(dt); attract.game.update(dt); }
-      catch (e) { attract.game = null; }
+      try { attract.game.update(dt); }
+      catch (e) { fault(e, attract.game.id + '.update'); attract.game = null; }
     }
+    /* Drive the NEXT frame. Input.poll runs before Shell.update, so the map
+     * set here is consumed one frame later — invisible, and it keeps the
+     * demo reading its own freshly-updated state. */
+    attractDrive();
     if (attract.timer > 14000 || !attract.game) enterAttract();
   }
 
   /**
-   * The demo pilot. Deliberately mediocre — it exists to make the cabinet look
-   * alive from across a room, not to set records.
+   * The demo pilot.
+   *
+   * Each game supplies its own tiny policy via an optional demo() method,
+   * because only the game knows where its ball or its food is. Games without
+   * one simply run on gravity, which is what every game did before — SNAKE
+   * died in 2.8 seconds and PULSE in 8.5, then sat as a frozen board for the
+   * rest of the slot, which reads as a crashed cabinet from across a room.
+   *
+   * Deliberately mediocre policies: a demo that never loses looks canned.
    */
-  function attractDrive(dt) {
-    /* Nothing is injected into Input; games read Input directly, so the demo
-     * simply lets them run on gravity and timers. Games that need no input to
-     * be visually interesting (falling pieces, sweeping slabs, scrolling
-     * fields) carry the loop on their own. */
+  function attractDrive() {
+    var map = null;
+    if (attract.game && typeof attract.game.demo === 'function') {
+      try { map = attract.game.demo(); }
+      catch (e) { fault(e, attract.game.id + '.demo'); map = null; }
+    }
+    Input.setDemo(map);
+  }
+
+  /** Hand input back to the player and stop driving. */
+  function leaveAttract() {
+    Input.setDemo(null);
+    attract.game = null;
+    idleT = 0;
   }
 
   /* ------------------------------------------------------------ frame --- */
@@ -6539,6 +7172,7 @@ var Shell = (function () {
       case 'initials': initialsUpdate(dt); break;
       case 'settings': settingsUpdate(dt); break;
       case 'scores': scoresUpdate(dt); break;
+      case 'faults': faultsUpdate(dt); break;
       case 'attract': attractUpdate(dt); break;
     }
   }
@@ -6565,6 +7199,7 @@ var Shell = (function () {
       case 'initials': drawGameState(c, true); drawInitials(c); break;
       case 'settings': drawSettings(c); break;
       case 'scores': drawScores(c); break;
+      case 'faults': drawFaults(c); break;
       case 'attract': drawAttract(c); break;
     }
 
@@ -6660,7 +7295,7 @@ var Shell = (function () {
     c.fillRect(px, py, pw, ph);
     c.translate(px, py);
     try { g.preview(c, pw, ph, t); }
-    catch (err) { /* a broken preview must not take the dashboard down */ }
+    catch (err) { fault(err, g.id + '.preview'); }
     c.restore();
 
     if (e.versus) {
@@ -6686,6 +7321,16 @@ var Shell = (function () {
       dataText(c, fmtScore(best), rect.x + rect.w - 20, rect.y + rect.h - 40, {
         size: 16, align: 'right', color: rgba(g.accent, 0.95),
       });
+    }
+
+    /* Controls, on the selected card only — teaching without clutter. */
+    if (selected && g.hint) {
+      var hy = rect.y + rect.h - 14;
+      c.globalAlpha = 0.9;
+      text(c, formatHint(g.hint), rect.x + 20, hy, {
+        size: 13, weight: '500', track: 1.2, color: rgba(g.accent, 0.85),
+      });
+      c.globalAlpha = 1;
     }
   }
 
@@ -6786,12 +7431,37 @@ var Shell = (function () {
 
   /* ------------------------------------------------------- game frames --- */
 
+  /** How long the controls banner stays up after a game starts. */
+  var HINT_MS = 3200;
+
   function drawGameState(c, dim) {
     if (!activeGame) return;
     Render.enterGame();
     try { activeGame.draw(); }
-    catch (e) { /* a draw fault must not wedge the shell */ }
+    catch (e) { fault(e, activeGame.id + '.draw'); }
     Render.enterShell();
+
+    /*
+     * Controls banner for the first few seconds of a run. Someone walks up to
+     * a cabinet cold; they should not have to guess, and they should not have
+     * to look at it once they know.
+     */
+    if (!dim && state === 'game' && activeGame.hint && stateT < HINT_MS) {
+      var a = stateT < HINT_MS - 600 ? 1 : (HINT_MS - stateT) / 600;
+      c.globalAlpha = clamp(a, 0, 1);
+      var label = formatHint(activeGame.hint);
+      c.font = '500 20px ' + FONT_SANS;
+      var w = measure(c, label, 1.6) + 56;
+      var bx = (SW - w) / 2;
+      panel(c, bx, SH - 150, w, 52, {
+        fill: 'rgba(7,5,14,.82)', stroke: rgba(activeGame.accent, 0.35), radius: 14,
+      });
+      text(c, label, SW / 2, SH - 124, {
+        size: 20, weight: '500', track: 1.6, color: COL.text,
+        align: 'center', baseline: 'middle',
+      });
+      c.globalAlpha = 1;
+    }
     if (dim) {
       c.fillStyle = 'rgba(7,5,14,0.72)';
       c.fillRect(0, 0, SW, SH);
@@ -6830,10 +7500,21 @@ var Shell = (function () {
   }
 
   function drawPause(c) {
-    var m = drawModal(c, 'PAUSED', 620, 460);
+    var m = drawModal(c, 'PAUSED', 620, 500);
     drawList(c, PAUSE_ITEMS, pauseCursor, m.x + 60, m.y + 130, m.w - 120, 74);
+
+    /* Pause is where a stuck player looks, so put the controls here. */
+    if (activeGame && activeGame.hint) {
+      c.fillStyle = 'rgba(140,150,255,.10)';
+      c.fillRect(m.x + 60, m.y + m.h - 96, m.w - 120, 1);
+      text(c, formatHint(activeGame.hint), SW / 2, m.y + m.h - 70, {
+        size: 14, weight: '500', track: 1.2,
+        color: rgba(activeGame.accent, 0.9), align: 'center',
+      });
+    }
+
     var gl = Input.glyphs(0);
-    text(c, gl.confirm + ' SELECT   ' + gl.back + ' RESUME', SW / 2, m.y + m.h - 42, {
+    text(c, gl.confirm + ' SELECT   ' + gl.back + ' RESUME', SW / 2, m.y + m.h - 38, {
       size: 15, weight: '500', track: 2.5, color: COL.dim, align: 'center',
     });
   }
@@ -7256,6 +7937,8 @@ var Shell = (function () {
       return false;
     },
     _startGame: startGame,
+    /** Pin the seed every future run uses. null restores clock seeding. */
+    _seedRuns: function (seed) { forcedSeed = seed; },
     _activeGame: function () { return activeGame; },
     _lastScore: function () { return lastScore; },
     _rows: function () { return rows; },
@@ -7264,6 +7947,7 @@ var Shell = (function () {
     _confirm: function () { return confirmBox; },
     _setCursor: function (i) { setCursor = i; },
     _settingsItems: settingsItems,
+    _formatHint: formatHint,
     _idle: function () { return idleT; },
     _frameStats: function () {
       var sum = 0, worst = 0;
@@ -7283,6 +7967,7 @@ var Shell = (function () {
       pauseCursor = 0; overCursor = 0; scoresGame = 0; setCursor = 0;
       confirmBox = null; toast = null; lastPadsVersion = -1;
       attract.game = null; attract.timer = 0; attract.index = 0;
+      Input.setDemo(null);
       buildMenu();
     },
   };
@@ -7318,10 +8003,15 @@ var Loop = (function () {
   }
 
   /** One logical frame. Exposed so the harness can drive it directly. */
+  var clock = 0;
+
   function tick(dt) {
+    clock += num(dt, 16);
     Input.poll(dt);
     Shell.update(dt);
     Shell.draw(dt);
+    /* Last thing in the frame: proof that a whole frame completed. */
+    System.heartbeat(clock);
   }
 
   function start() {
@@ -7380,7 +8070,8 @@ function boot() {
 if (typeof globalThis !== 'undefined') {
   globalThis.ArcadeOS = {
     Shell: Shell, Input: Input, Audio2: Audio2, Render: Render, Loop: Loop,
-    Store: Store, Settings: Settings, Scores: Scores, System: System,
+    Store: Store, Settings: Settings, Scores: Scores, Faults: Faults,
+    System: System,
     GAMES: GAMES, VERSUS_GAMES: VERSUS_GAMES, gameById: gameById,
     seedRng: seedRng, rnd: rnd, boot: boot,
     COL: COL, ACCENT: ACCENT, ACTIONS: ACTIONS,

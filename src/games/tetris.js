@@ -475,7 +475,29 @@ var TETRIS = (function () {
     title: 'TETRIS',
     tag: 'Stack, clear, survive the climb',
     accent: ACCENT.tetris,
-    hint: 'UP rotate · A hard drop · X hold',
+    hint: '◀▶ MOVE · ▼ DROP · ▲ ROTATE · {A} SLAM · {X} HOLD',
+    /**
+     * Attract-mode pilot: slide toward the shallowest column and slam. Plays
+     * like a distracted human, which is exactly what a demo should look like.
+     */
+    demo: function () {
+      var out = {};
+      if (over || clearing) return out;
+      /* Column heights. */
+      var bestCol = 0, bestDepth = -1;
+      for (var c = 0; c < COLS; c++) {
+        var depth = ROWS;
+        for (var r = 0; r < ROWS; r++) {
+          if (grid[idx(c, r)] !== 0) { depth = r; break; }
+        }
+        if (depth > bestDepth) { bestDepth = depth; bestCol = c; }
+      }
+      if (cur.x < bestCol - 1) out.right = true;
+      else if (cur.x > bestCol) out.left = true;
+      else out.confirm = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,

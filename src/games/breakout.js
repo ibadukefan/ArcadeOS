@@ -398,7 +398,24 @@ var BREAKOUT = (function () {
     title: 'BREAKOUT',
     tag: 'A tall well makes long arcs',
     accent: ACCENT.breakout,
-    hint: 'D-PAD move · A launch',
+    hint: '◀▶ PADDLE · {A} LAUNCH',
+    /** Attract-mode pilot: keep the paddle under the lowest live ball. */
+    demo: function () {
+      var out = {};
+      if (over) return out;
+      var target = null, lowest = -1;
+      balls.forEach(function (b) {
+        if (b.stuck) { out.confirm = true; return; }
+        if (b.y > lowest) { lowest = b.y; target = b; }
+      });
+      if (!target) return out;
+      /* Aim slightly off-centre so the ball keeps picking up angle. */
+      var want = target.x + (target.vx > 0 ? -10 : 10);
+      if (want < paddle.x - 6) out.left = true;
+      else if (want > paddle.x + 6) out.right = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,

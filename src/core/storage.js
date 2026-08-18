@@ -10,15 +10,42 @@
 
 var Store = (function () {
   var NS = 'arcadeos';
-  var VERSION = 1;
+
+  /*
+   * SCHEMA VERSION AND MIGRATION
+   *
+   * Keys are namespaced `arcadeos:v<N>:<name>`. A version number that nothing
+   * ever migrates is decorative — bumping it would silently orphan every high
+   * score on every cabinet in the field. So the bump and the migration ship
+   * together, and the path is exercised rather than theoretical.
+   *
+   * To add v(N+1): raise VERSION and add MIGRATIONS[N+1], a function taking
+   * the parsed v(N) value of a record and returning the v(N+1) shape. Reads
+   * walk backwards to the newest stored version, apply the chain forward, and
+   * write the result at the current version. Old keys are left alone so a
+   * downgrade still finds its data.
+   */
+  var VERSION = 2;
+
+  var MIGRATIONS = {
+    /*
+     * 1 -> 2: no shape change. Both records were already validated field by
+     * field on read, so v1 data is v2 data. This exists so the machinery is
+     * live and covered rather than waiting for the first real change.
+     */
+    2: function (name, value) { return value; },
+  };
 
   /** In-memory mirror. Always authoritative during a session. */
   var mem = Object.create(null);
   /** null until probed. */
   var backend = undefined;
   var lastError = null;
+  var migrated = 0;
 
-  function key(name) { return NS + ':v' + VERSION + ':' + name; }
+  function key(name, version) {
+    return NS + ':v' + (version === undefined ? VERSION : version) + ':' + name;
+  }
 
   /**
    * Probe for a usable backend exactly once. Chromium can expose
@@ -43,10 +70,51 @@ var Store = (function () {
     return backend;
   }
 
-  function readRaw(name) {
+  function readRaw(name, version) {
     var b = be();
     if (!b) return null;
-    try { return b.getItem(key(name)); } catch (e) { lastError = e; return null; }
+    try { return b.getItem(key(name, version)); }
+    catch (e) { lastError = e; return null; }
+  }
+
+  /**
+   * Find a record, migrating it forward if it was written by an older build.
+   * Returns the parsed value, or null.
+   *
+   * A migration that throws is treated as "no usable data" rather than being
+   * allowed to propagate — a bad upgrade should cost you your high scores at
+   * worst, never a cabinet that will not boot.
+   */
+  function readMigrated(name) {
+    var raw = readRaw(name);
+    if (raw != null) return parse(raw);
+
+    for (var v = VERSION - 1; v >= 1; v--) {
+      var old = readRaw(name, v);
+      if (old == null) continue;
+      var value = parse(old);
+      if (value == null) continue;
+      try {
+        for (var step = v + 1; step <= VERSION; step++) {
+          var fn = MIGRATIONS[step];
+          if (fn) value = fn(name, value);
+          if (value == null) break;
+        }
+      } catch (e) {
+        lastError = e;
+        return null;
+      }
+      if (value == null) continue;
+      migrated++;
+      /* Write forward so the walk only happens once. */
+      try { writeRaw(name, JSON.stringify(value)); } catch (e2) { lastError = e2; }
+      return value;
+    }
+    return null;
+  }
+
+  function parse(raw) {
+    try { return JSON.parse(raw); } catch (e) { return null; }
   }
 
   function writeRaw(name, str) {
@@ -64,17 +132,13 @@ var Store = (function () {
    */
   function get(name, fallback, validate) {
     if (name in mem) return mem[name];
-    var raw = readRaw(name);
+    var parsed = readMigrated(name);
     var out = fallback;
-    if (raw != null) {
-      var parsed = null;
-      try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
-      if (parsed != null) {
-        var checked = null;
-        try { checked = validate ? validate(parsed) : parsed; }
-        catch (e2) { checked = null; }
-        if (checked != null) out = checked;
-      }
+    if (parsed != null) {
+      var checked = null;
+      try { checked = validate ? validate(parsed) : parsed; }
+      catch (e2) { checked = null; }
+      if (checked != null) out = checked;
     }
     mem[name] = out;
     return out;
@@ -103,9 +167,13 @@ var Store = (function () {
     /** True when writes actually survive a reboot. Surfaced in settings. */
     persistent: function () { return !!be(); },
     lastError: function () { return lastError; },
-    /** Test seam: drop the memoised backend and cache. */
-    _reset: function () { mem = Object.create(null); backend = undefined; lastError = null; },
+    /** How many records were upgraded from an older schema this session. */
+    migrated: function () { return migrated; },
+    _reset: function () {
+      mem = Object.create(null); backend = undefined; lastError = null; migrated = 0;
+    },
     _key: key,
+    _migrations: MIGRATIONS,
     VERSION: VERSION,
   };
 })();
@@ -186,6 +254,91 @@ var Settings = (function () {
   }
 
   return { all: all, get: get, set: set, reset: reset, _validate: validate };
+})();
+
+/* ------------------------------------------------------------- faults --- */
+
+/*
+ * Crash log.
+ *
+ * A cabinet has no keyboard and no console. Before this, a game fault showed a
+ * toast for 2.6 seconds and then existed nowhere at all — a reproducible crash
+ * was undiagnosable without pulling the SD card. Faults now persist (so the
+ * settings screen can show them) and are relayed to the local agent (so they
+ * land in journald and `journalctl -u arcadeos-agent` tells the story).
+ */
+var Faults = (function () {
+  var MAX = 10;
+  var cache = null;
+  /* Bound the relay: a game throwing every frame must not flood the journal. */
+  var lastRelay = 0;
+  var RELAY_GAP = 10000;
+
+  function validate(raw) {
+    if (!Array.isArray(raw)) return null;
+    var out = [];
+    for (var i = 0; i < raw.length && out.length < MAX; i++) {
+      var e = raw[i];
+      if (!e || typeof e !== 'object') continue;
+      out.push({
+        msg: String(e.msg == null ? '' : e.msg).slice(0, 200),
+        where: String(e.where == null ? '' : e.where).slice(0, 40),
+        at: (typeof e.at === 'number' && isFinite(e.at)) ? e.at : 0,
+        n: (typeof e.n === 'number' && isFinite(e.n)) ? Math.max(1, Math.floor(e.n)) : 1,
+      });
+    }
+    return out;
+  }
+
+  function all() {
+    if (!cache) cache = Store.get('faults', [], validate) || [];
+    return cache;
+  }
+
+  /**
+   * Record a fault. Repeats of the same message in the same place bump a
+   * counter rather than pushing a new row, so one broken game cannot evict
+   * the history of everything else.
+   */
+  function record(err, where, now) {
+    var msg = '';
+    try {
+      msg = (err && err.message) ? String(err.message) : String(err);
+    } catch (e) { msg = 'unknown error'; }
+    msg = msg.slice(0, 200);
+    var w = String(where || '').slice(0, 40);
+    var t = num(now, 0);
+
+    var list = all();
+    if (list.length && list[0].msg === msg && list[0].where === w) {
+      list[0].n++;
+      list[0].at = t;
+    } else {
+      list.unshift({ msg: msg, where: w, at: t, n: 1 });
+      while (list.length > MAX) list.pop();
+    }
+    Store.set('faults', list);
+
+    /* Relay to the agent so it reaches the journal, rate limited. */
+    if (t - lastRelay > RELAY_GAP || lastRelay === 0) {
+      lastRelay = t;
+      if (typeof System !== 'undefined' && System && System.log) {
+        System.log('fault in ' + (w || 'shell') + ': ' + msg);
+      }
+    }
+    return list[0];
+  }
+
+  return {
+    all: all,
+    record: record,
+    latest: function () { var l = all(); return l.length ? l[0] : null; },
+    count: function () { return all().length; },
+    clear: function () { cache = []; Store.set('faults', []); },
+    _validate: validate,
+    _drop: function () { cache = null; lastRelay = 0; },
+    MAX: MAX,
+  };
 })();
 
 /* --------------------------------------------------------- high scores --- */

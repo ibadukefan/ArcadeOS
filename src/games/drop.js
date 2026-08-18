@@ -411,7 +411,25 @@ var DROP = (function () {
     title: 'DROP',
     tag: 'Match three, chain the cascade',
     accent: ACCENT.drop,
-    hint: 'D-PAD move · A cycle · X drop',
+    hint: '◀▶ MOVE · ▼ DROP · {A} CYCLE · {X} SLAM',
+    /** Attract-mode pilot: aim for the shallowest column and drop. */
+    demo: function () {
+      var out = {};
+      if (over || phase !== 'fall') return out;
+      var bestCol = 0, bestDepth = -1;
+      for (var c = 0; c < COLS; c++) {
+        var depth = ROWS;
+        for (var r = 0; r < ROWS; r++) {
+          if (grid[idx(c, r)] !== 0) { depth = r; break; }
+        }
+        if (depth > bestDepth) { bestDepth = depth; bestCol = c; }
+      }
+      if (piece.col < bestCol) out.right = true;
+      else if (piece.col > bestCol) out.left = true;
+      else out.alt = true;
+      return out;
+    },
+
     start: start,
     update: update,
     draw: draw,
