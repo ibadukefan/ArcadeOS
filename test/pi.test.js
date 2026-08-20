@@ -132,6 +132,92 @@ describe('setup-arcade.sh', () => {
   });
 });
 
+describe('OS support check', () => {
+  /*
+   * A real cabinet install died three quarters of the way through apt with
+   * "E: Unable to locate package cage" — accurate, and useless: the machine
+   * was on Bullseye, where cage, seatd and python3-lgpio simply do not exist,
+   * and the only real fix was to reflash. The check that replaced that has to
+   * be exactly as wide as the package availability, so it is exercised against
+   * the os-release values of every release someone might actually be on.
+   */
+  const src = read(SETUP);
+
+  /** Run just check_os against a fabricated /etc/os-release. */
+  function checkOs(fields) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arcadeos-os-'));
+    const osRelease = path.join(dir, 'os-release');
+    fs.writeFileSync(osRelease, Object.keys(fields)
+      .map((k) => k + '=' + JSON.stringify(fields[k])).join('\n') + '\n');
+
+    const fn = src.slice(src.indexOf('MIN_DEBIAN=12'));
+    const body = fn.slice(0, fn.indexOf('\n}\n') + 3);
+    const script = [
+      'set -Eeuo pipefail',
+      'warn(){ echo "WARN: $*"; }',
+      'die(){ echo "$*" >&2; exit 1; }',
+      body,
+      'check_os && echo ACCEPTED',
+    ].join('\n').split('/etc/os-release').join(osRelease);
+
+    const file = path.join(dir, 'run.sh');
+    fs.writeFileSync(file, script);
+    try {
+      return { ok: true, out: execFileSync('bash', [file], { encoding: 'utf8' }) };
+    } catch (e) {
+      return { ok: false, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+
+  it('is called before anything is installed', () => {
+    const main = src.slice(src.indexOf('main() {'));
+    const checkAt = main.indexOf('check_os');
+    const installAt = main.indexOf('install_packages');
+    assert.ok(checkAt > 0, 'main runs the OS check');
+    assert.ok(checkAt < installAt, 'and runs it before touching apt');
+  });
+
+  it('refuses Bullseye, and says to reflash rather than naming a package', () => {
+    const r = checkOs({
+      ID: 'raspbian', VERSION_ID: '11', VERSION_CODENAME: 'bullseye',
+      PRETTY_NAME: 'Raspbian GNU/Linux 11 (bullseye)',
+    });
+    assert.ok(!r.ok, 'Bullseye must be refused');
+    assert.ok(/too old/.test(r.out));
+    assert.ok(/Reflash/.test(r.out), 'tells you the actual fix');
+    assert.ok(/bullseye/.test(r.out), 'names the release it found');
+    assert.ok(/Nothing on this system has been changed/.test(r.out));
+  });
+
+  it('accepts every release that has the packages', () => {
+    for (const v of [
+      { ID: 'debian', VERSION_ID: '12', VERSION_CODENAME: 'bookworm', PRETTY_NAME: 'Debian 12' },
+      { ID: 'debian', VERSION_ID: '13', VERSION_CODENAME: 'trixie', PRETTY_NAME: 'Debian 13' },
+      { ID: 'debian', VERSION_ID: '14', VERSION_CODENAME: 'forky', PRETTY_NAME: 'Debian 14' },
+    ]) {
+      const r = checkOs(v);
+      assert.ok(r.ok, v.PRETTY_NAME + ' must be accepted: ' + r.out);
+      assert.ok(/ACCEPTED/.test(r.out));
+    }
+  });
+
+  it('warns but proceeds on a non-Debian distro', () => {
+    /* Refusing outright would be overreach — the packages may well be there. */
+    const r = checkOs({
+      ID: 'ubuntu', VERSION_ID: '24.04', VERSION_CODENAME: 'noble',
+      PRETTY_NAME: 'Ubuntu 24.04 LTS',
+    });
+    assert.ok(r.ok, 'must not block');
+    assert.ok(/WARN/.test(r.out));
+    assert.ok(/ACCEPTED/.test(r.out));
+  });
+
+  it('proceeds on a testing image with no numeric VERSION_ID', () => {
+    const r = checkOs({ ID: 'debian', VERSION_CODENAME: 'sid', PRETTY_NAME: 'Debian sid' });
+    assert.ok(r.ok, 'an unnumbered release is newer, not older: ' + r.out);
+  });
+});
+
 describe('arcadeos-agent', () => {
   const src = path.join(PI, 'arcadeos-agent.py');
 

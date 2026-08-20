@@ -58,7 +58,7 @@ can skip the build entirely if you just want to look.
 | | |
 |---|---|
 | Board | Raspberry Pi 4 Model B (2GB is enough) |
-| OS | Raspberry Pi OS **Lite**, 64-bit, Bookworm |
+| OS | Raspberry Pi OS **Lite**, **64-bit**, **Bookworm or newer** — see below |
 | Display | A 1080p monitor rotated 90° — the cabinet runs at 1080×1920 |
 | Input | Any Xbox / PlayStation / Nintendo pad over USB or Bluetooth, or a USB arcade encoder |
 | Storage | 4GB card or larger |
@@ -66,6 +66,17 @@ can skip the build entirely if you just want to look.
 Use Raspberry Pi Imager to write **Raspberry Pi OS Lite (64-bit)**. In the
 imager's settings, set a username and enable SSH — you will want it, because
 once ArcadeOS is running there is no console on the screen.
+
+**Bullseye will not work, and neither will a 32-bit image.** The kiosk runs on
+`cage` and `seatd`, which are not packaged before Debian 12, and there is no
+32-bit build of the stack worth having. The installer checks both before it
+touches anything and tells you to reflash rather than failing halfway through
+`apt`. To check an existing card:
+
+```bash
+. /etc/os-release && echo "$PRETTY_NAME"   # want bookworm or newer
+uname -m                                   # want aarch64
+```
 
 ### Install
 
@@ -542,6 +553,13 @@ ArcadeOS.Input.players()
 ---
 
 ## Troubleshooting
+
+**`E: Unable to locate package cage` during install**
+
+The card is running Bullseye or older. `cage`, `seatd` and `python3-lgpio` do
+not exist before Debian 12, so there is nothing to install and no way to patch
+around it — reflash with Raspberry Pi OS Lite (64-bit). Current installers stop
+before this point with a clearer message.
 
 **Black screen after boot**
 

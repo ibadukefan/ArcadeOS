@@ -193,6 +193,49 @@ svc_disable() {
 
 # --------------------------------------------------------------- install ---
 
+# The kiosk stack is cage + seatd, and the GPIO watcher wants python3-lgpio.
+# None of those exist before Debian 12. On Bullseye the install used to die
+# three quarters of the way through `apt install` with nothing but
+# "E: Unable to locate package cage" — true, but it does not tell you that the
+# real answer is to reflash. Say so here, before anything is touched.
+MIN_DEBIAN=12
+
+check_os() {
+  [[ -r /etc/os-release ]] || { warn "no /etc/os-release; skipping the OS check"; return 0; }
+  # shellcheck disable=SC1091
+  local ID VERSION_ID VERSION_CODENAME PRETTY_NAME
+  ID="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  VERSION_ID="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+  VERSION_CODENAME="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+  PRETTY_NAME="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-unknown}")"
+
+  case "$ID" in
+    debian|raspbian) ;;
+    *) warn "this expects Raspberry Pi OS; found ${PRETTY_NAME}. Continuing anyway."
+       return 0 ;;
+  esac
+
+  # Testing/unstable images carry no numeric VERSION_ID. Assume new enough.
+  [[ "$VERSION_ID" =~ ^[0-9]+$ ]] || return 0
+
+  if (( VERSION_ID < MIN_DEBIAN )); then
+    die "$(cat <<MSG
+${PRETTY_NAME} is too old.
+
+    ArcadeOS needs Debian 12 (bookworm) or newer: the kiosk runs on cage and
+    seatd, and neither is packaged for ${VERSION_CODENAME:-this release}.
+
+    Reflash the card with Raspberry Pi OS Lite (64-bit), then run this again.
+    Nothing on this system has been changed.
+MSG
+)"
+  fi
+
+  if [[ "$(uname -m)" != "aarch64" && "$(uname -m)" != "x86_64" ]]; then
+    die "ArcadeOS needs a 64-bit OS; this kernel is $(uname -m). Reflash with the 64-bit image."
+  fi
+}
+
 install_packages() {
   [[ $SKIP_APT -eq 1 ]] && { info "skipping apt (--skip-apt)"; return 0; }
   step "Updating the system and installing packages"
@@ -714,6 +757,8 @@ main() {
     "$C_OK" "$VERSION" "$C_OFF" "$C_OK" "$ARCADE_USER" "$C_OFF"
 
   id "$ARCADE_USER" >/dev/null 2>&1 || die "user '$ARCADE_USER' does not exist (set ARCADE_USER=...)"
+
+  check_os
 
   # A read-only root would silently swallow the whole install.
   if [[ -d /overlay ]] || grep -qs ' / overlay ' /proc/mounts; then
