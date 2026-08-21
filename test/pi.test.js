@@ -348,16 +348,18 @@ describe('kiosk service unit', () => {
      * browser to SwiftShader: software rendering, 22fps at 1080p on a Pi 4 —
      * exactly what the first cabinet measured. Let the OS package choose. */
     assert.notOk(/--use-gl=/.test(src), 'no --use-gl flag anywhere');
-    /* Same lesson for canvas raster: enable the path, never force the mode. */
-    assert.notOk(/--canvas-oop-rasterization/.test(src),
-      'canvas raster mode is not forced');
   });
 
-  it('keeps the 2D canvas on the GPU', () => {
-    /* The whole front end is one big 2D canvas. With this path off the GPU
-     * process can be perfectly healthy while every frame rasterises on the
-     * CPU — the second cabinet symptom: green GPU row, 33fps. */
-    assert.ok(/--enable-accelerated-2d-canvas/.test(src));
+  it('keeps the 2D canvas raster on the GPU', () => {
+    /* Measured on the cabinet: with a healthy ANGLE/V3D backend but no
+     * canvas OOP raster, 20 full-surface fills took 168ms — software, on
+     * the main thread. The whole front end is one big 2D canvas, so that
+     * was the entire 30fps lock. Both spellings pinned: the switch and
+     * the feature flag it maps to on newer builds. */
+    assert.ok(/--canvas-oop-rasterization/.test(src));
+    assert.ok(/--enable-features=CanvasOopRasterization/.test(src));
+    assert.ok(/--enable-accelerated-2d-canvas/.test(src),
+      'legacy switch kept for older Chromium builds');
   });
 
   it('evicts the login prompt from its TTY', () => {

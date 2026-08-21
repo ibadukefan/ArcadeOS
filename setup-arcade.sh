@@ -458,16 +458,17 @@ mkdir -p "\$PROFILE"
 #   --ignore-gpu-blocklist      the VideoCore VI is blocklisted by default,
 #                               which silently drops you to software raster
 #   --enable-gpu-rasterization  raster on the GPU, not the CPU
-#   --enable-accelerated-2d-canvas  the page IS one big 2D canvas; if this
-#                               path is off, every frame rasterises on the
-#                               CPU no matter how healthy the GPU process is
+#   --enable-accelerated-2d-canvas  legacy switch, kept for older builds;
+#                               modern Chromium largely ignores it
+#   --canvas-oop-rasterization  THE canvas switch on this stack. Measured
+#                               on the cabinet with a working ANGLE/V3D
+#                               backend: without it, 20 full-surface fills
+#                               take 168ms (software, on the main thread);
+#                               the page IS one big 2D canvas, so that is
+#                               the whole 30fps lock. The feature flag is
+#                               the modern spelling of the same thing.
 #   --enable-zero-copy          no extra texture copy on upload
-#   --force-device-scale-factor=1  never resample a 1080x1920 panel
-#
-# (Canvas OOP rasterisation used to be forced here via its flag. Same
-# lesson as the removed GL-backend flag: forcing a path the driver
-# blocklisted trades a slow frame for a broken one. Chromium picks the
-# canvas raster mode on its own.)
+#   --force-device-scale-factor=1  never resample the panel
 #
 #   --enable-logging=stderr     Chromium's own GPU/crash lines land in
 #                               journalctl -u arcadeos. Without this the first
@@ -492,6 +493,8 @@ exec "\$CHROMIUM" \\
   --ignore-gpu-blocklist \\
   --enable-gpu-rasterization \\
   --enable-accelerated-2d-canvas \\
+  --canvas-oop-rasterization \\
+  --enable-features=CanvasOopRasterization \\
   --enable-zero-copy \\
   --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\
