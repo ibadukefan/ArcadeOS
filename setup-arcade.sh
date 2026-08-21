@@ -373,7 +373,12 @@ install_page() {
     cat "$SRC_DIR/dist/arcade.html"
   } > "$tmp"
   # 0640 root:$ARCADE_USER — the kiosk reads it, nothing else on the box does.
-  install -m 0640 -o root -g "$ARCADE_USER" "$tmp" "$APP_DIR/arcade.html"
+  # Stage in the destination directory and rename: rename(2) is atomic, so
+  # Chromium either sees the old page or the new one, never a truncated file
+  # mid-write. install(1) truncates in place, which is a renderer crash if
+  # the browser reloads at the wrong moment — as it does during an update.
+  install -m 0640 -o root -g "$ARCADE_USER" "$tmp" "$APP_DIR/.arcade.html.new"
+  mv -f "$APP_DIR/.arcade.html.new" "$APP_DIR/arcade.html"
   rm -f "$tmp"
   info "installed arcade.html (token bound)"
 }
@@ -456,7 +461,13 @@ mkdir -p "\$PROFILE"
 #   --enable-zero-copy          no extra texture copy on upload
 #   --canvas-oop-rasterization  canvas raster off the main thread
 #   --force-device-scale-factor=1  never resample a 1080x1920 panel
+#
+#   --enable-logging=stderr     Chromium's own GPU/crash lines land in
+#                               journalctl -u arcadeos. Without this the first
+#                               real cabinet was undiagnosable: 22fps and
+#                               renderer crashes with an empty journal.
 exec "\$CHROMIUM" \\
+  --enable-logging=stderr \\
   --kiosk \\
   --app="\$PAGE" \\
   --user-data-dir="\$PROFILE" \\

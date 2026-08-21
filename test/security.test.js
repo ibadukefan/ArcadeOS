@@ -140,7 +140,18 @@ describe('setup script', () => {
 
   it('bakes the token into the installed page, readable only by the kiosk user', () => {
     assert.ok(/window\.ARCADEOS_AGENT_TOKEN=%s/.test(SETUP));
-    assert.ok(/install -m 0640 -o root -g "\$ARCADE_USER" "\$tmp" "\$APP_DIR\/arcade\.html"/.test(SETUP));
+    assert.ok(/install -m 0640 -o root -g "\$ARCADE_USER" "\$tmp" "\$APP_DIR\/\.arcade\.html\.new"/.test(SETUP));
+  });
+
+  it('replaces the live page atomically', () => {
+    /* install(1) truncates in place; a mid-write reload is a renderer crash.
+     * Stage-and-rename means Chromium sees old page or new, never half. */
+    assert.ok(/mv -f "\$APP_DIR\/\.arcade\.html\.new" "\$APP_DIR\/arcade\.html"/.test(SETUP));
+  });
+
+  it('captures Chromium logs in the journal', () => {
+    /* The first cabinet crash-looped with an empty journal — undiagnosable. */
+    assert.ok(/--enable-logging=stderr/.test(SETUP));
   });
 
   it('removes the token directory on uninstall', () => {
