@@ -79,7 +79,19 @@ source "$CONF"
 [[ -d "$SRC_DIR/.git" ]] || fail "the install source at $SRC_DIR is not a git checkout"
 BRANCH="${GIT_BRANCH:-main}"
 
+# Git must run AS THE CABINET USER, not root. This unit is root, and a root
+# `git fetch` writes root-owned objects into the user's checkout — after
+# which the user's own `git pull` fails with "insufficient permission for
+# adding an object". Happened on a real cabinet. runuser only when we are
+# root and the user actually exists (the test fixtures use a fake name).
 GIT=(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR")
+if [[ "$(id -u)" == 0 && -n "${ARCADE_USER:-}" ]] && id -u "$ARCADE_USER" >/dev/null 2>&1; then
+  # Self-heal checkouts already damaged by earlier root-run updates.
+  if [[ "$(stat -c %U "$SRC_DIR/.git" 2>/dev/null)" != "$ARCADE_USER" ]]; then
+    chown -R "$ARCADE_USER" "$SRC_DIR" 2>/dev/null || true
+  fi
+  GIT=(runuser -u "$ARCADE_USER" -- git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR")
+fi
 
 # ------------------------------------------------------------------- fetch ---
 

@@ -226,6 +226,17 @@ describe('on-cabinet updater', () => {
     assert.equal(f.status().updated, false);
   });
 
+  it('runs git as the cabinet user, never as root', () => {
+    /* A root-run fetch writes root-owned objects into the user's checkout,
+     * after which the user's own git pull is broken. Real-cabinet scar. */
+    const src = read(UPDATER);
+    assert.ok(/runuser -u "\$ARCADE_USER" -- git/.test(src));
+    assert.ok(/id -u "\$ARCADE_USER" >\/dev\/null/.test(src),
+      'guarded, so a missing user falls back instead of failing');
+    assert.ok(/chown -R "\$ARCADE_USER" "\$SRC_DIR"/.test(src),
+      'and checkouts already damaged by earlier root runs are healed');
+  });
+
   it('records the cabinet user for the next update', () => {
     const src = read(SETUP);
     assert.ok(/^ARCADE_USER=\$ARCADE_USER$/m.test(src.slice(src.indexOf('write_update_conf'))),
