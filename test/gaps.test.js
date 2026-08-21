@@ -415,13 +415,13 @@ describe('agent watchdog', () => {
   it('only arms after it has actually seen the front end', () => {
     /* Otherwise a machine with the kiosk disabled, or one still booting,
      * would be restarted on a timer forever. */
-    assert.ok(/if not self\.armed or now < self\.next_check:/.test(src));
+    assert.ok(/due = self\.armed and now >= self\.next_check/.test(src));
     assert.ok(/self\.armed = True/.test(src));
   });
 
   it('waits a grace period before judging again after a restart', () => {
     assert.ok(/GRACE_SECONDS/.test(src));
-    assert.ok(/self\.next_check = now \+ GRACE_SECONDS/.test(src));
+    assert.ok(/self\.next_check = time\.monotonic\(\) \+ GRACE_SECONDS/.test(src));
   });
 
   it('restarts the kiosk unit, never anything derived from a request', () => {
@@ -432,6 +432,53 @@ describe('agent watchdog', () => {
   it('never interprets relayed log text as a command', () => {
     assert.ok(/log\("frontend: %s" % clean_text\(self\._body\(\)\)\)/.test(src),
       'log text is printed as data and nothing else');
+  });
+
+  it('holds instead of restarting while a person owns the console', () => {
+    /* Ctrl+Alt+F2 stops the kiosk's frames because the kiosk lost the
+     * display — the first cabinet's watchdog read that as a hang and
+     * snatched the screen back mid-keystroke. The watch loop must consult
+     * the hold before every restart. */
+    assert.ok(/ACTIVE_VT_FILE = "\/sys\/class\/tty\/tty0\/active"/.test(src));
+    const watch = src.slice(src.indexOf('def watch'));
+    assert.ok(/watchdog_hold\(\)/.test(watch), 'the watch loop consults the hold');
+    assert.ok(/self\.last = time\.monotonic\(\)/.test(watch),
+      'silence accrued while away is forgiven');
+  });
+
+  it('the hold logic distinguishes a person from a hang (runs for real)', () => {
+    const agentPath = path.join(__dirname, '..', 'pi', 'arcadeos-agent.py');
+    const script = [
+      'import importlib.util, tempfile, os',
+      `spec = importlib.util.spec_from_file_location("agent", ${JSON.stringify(agentPath)})`,
+      'm = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(m)',
+      'fd, p = tempfile.mkstemp()',
+      'os.close(fd)',
+      'm.ACTIVE_VT_FILE = p',
+      'm.kiosk_unit_active = lambda: True',
+      'open(p, "w").write("tty2\\n")',
+      'assert m.watchdog_hold() == "console is on tty2", m.watchdog_hold()',
+      'open(p, "w").write("tty1\\n")',
+      'assert m.watchdog_hold() == "", m.watchdog_hold()',
+      'm.kiosk_unit_active = lambda: False',
+      'assert "stopped" in m.watchdog_hold(), m.watchdog_hold()',
+      /* No VT sysfs at all (a container): judge normally, never crash. */
+      'os.unlink(p)',
+      'm.kiosk_unit_active = lambda: True',
+      'assert m.watchdog_hold() == "", m.watchdog_hold()',
+      'print("ok")',
+    ].join('\n');
+    const out = execFileSync('python3', ['-c', script], { stdio: 'pipe' }).toString();
+    assert.ok(/ok/.test(out), out);
+  });
+
+  it('holds while the kiosk unit is deliberately stopped', () => {
+    /* `systemctl stop arcadeos` over SSH is the documented rescue path; the
+     * watchdog restarting it 30s later would make rescue impossible. A unit
+     * that CRASHES is systemd's job (Restart=always), not the watchdog's. */
+    assert.ok(/"is-active", "--quiet", KIOSK_UNIT/.test(src));
+    assert.ok(/is stopped/.test(src));
   });
 
   it('the setup script arms the hardware watchdog and disarms it on uninstall', () => {

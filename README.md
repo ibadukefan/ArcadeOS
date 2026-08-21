@@ -622,6 +622,14 @@ partition (the FAT one, visible on Windows/Mac). On the next boot sshd starts
 permanently. Ctrl+Alt+F2 on an attached keyboard also switches to a login
 console on most keyboards; compact keyboards may need Fn held as well.
 
+The liveness watchdog knows the difference between a hang and a person: while
+the console is on another VT, or while `systemctl stop arcadeos` has the unit
+deliberately stopped, silence is never judged and the kiosk will not restart
+itself back over your shell. (It did, once — the first cabinet's watchdog
+grabbed the screen back thirty seconds into a rescue session.) `curl
+http://127.0.0.1:8127/` shows `watchdog_hold` non-empty while this protection
+is active. Ctrl+Alt+F1 returns to the kiosk.
+
 **`E: Unable to locate package cage` during install**
 
 The card is running Bullseye or older. `cage`, `seatd` and `python3-lgpio` do

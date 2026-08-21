@@ -70,6 +70,15 @@ STALL_SECONDS = 30
 GRACE_SECONDS = 90
 KIOSK_UNIT = "arcadeos.service"
 
+# The VT the kiosk owns (TTYPath in arcadeos.service) and where the kernel
+# reports which VT the console is on. Silence alone is not a hang: a person
+# who pressed Ctrl+Alt+F2 for a rescue shell took the display away from the
+# kiosk on purpose, and frames stopping is the expected result. The first
+# cabinet's watchdog restarted the kiosk after 30s of that and snatched the
+# screen back mid-keystroke — locking its owner out of their own console.
+KIOSK_TTY = "tty1"
+ACTIVE_VT_FILE = "/sys/class/tty/tty0/active"
+
 # Shared secret, written by setup-arcade.sh and baked into the installed
 # arcade.html. Absent in development, where the checks below still block the
 # cross-origin and rebinding cases.
@@ -182,6 +191,47 @@ def start_update():
         return False, "could not start updater: %s" % exc
 
 
+def active_vt():
+    """Which VT owns the console right now ("tty1"...), or "" if unknowable."""
+    try:
+        with open(ACTIVE_VT_FILE, "r") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def kiosk_unit_active():
+    """False when an administrator stopped the kiosk unit on purpose."""
+    binary = resolve("systemctl")
+    if not binary:
+        return True  # cannot tell (dev machine): judge liveness normally
+    try:
+        rc = subprocess.call(
+            [binary, "is-active", "--quiet", KIOSK_UNIT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return rc == 0
+
+
+def watchdog_hold():
+    """
+    A reason silence must NOT be judged, or "".
+
+    From the beat stream alone a hang and a human look identical: switch VTs
+    and the kiosk stops drawing; stop the unit over SSH and the beats end.
+    Both are deliberate, and restarting over either steals the machine back
+    from its own operator.
+    """
+    vt = active_vt()
+    if vt and vt != KIOSK_TTY:
+        return "console is on %s" % vt
+    if not kiosk_unit_active():
+        return "%s is stopped" % KIOSK_UNIT
+    return ""
+
+
 class Liveness:
     """Tracks front-end heartbeats and restarts the kiosk if they stop."""
 
@@ -205,17 +255,31 @@ class Liveness:
             return {"armed": self.armed, "age": age, "restarts": self.restarts}
 
     def watch(self):
+        last_hold = ""
         while True:
             time.sleep(5)
             now = time.monotonic()
             with self.lock:
-                if not self.armed or now < self.next_check:
-                    continue
-                stalled = (now - self.last) > STALL_SECONDS
-                if not stalled:
-                    continue
+                due = self.armed and now >= self.next_check
+                stalled = due and (now - self.last) > STALL_SECONDS
+            if not stalled:
+                continue
+
+            hold = watchdog_hold()
+            if hold:
+                if hold != last_hold:
+                    log("beats quiet but %s — watchdog holding" % hold)
+                last_hold = hold
+                with self.lock:
+                    # A fresh window once the hold clears, so returning to the
+                    # kiosk VT is not judged on silence accrued while away.
+                    self.last = time.monotonic()
+                continue
+            last_hold = ""
+
+            with self.lock:
                 self.restarts += 1
-                self.next_check = now + GRACE_SECONDS
+                self.next_check = time.monotonic() + GRACE_SECONDS
                 # Require a fresh beat before judging again, so a kiosk that
                 # never comes back is not restarted every 30 seconds forever.
                 self.armed = False
@@ -411,6 +475,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "frontend": "alive" if state["armed"] else "not seen",
                 "last_beat_s": round(state["age"], 1) if state["age"] is not None else None,
                 "kiosk_restarts": state["restarts"],
+                # Non-empty while silence is deliberately not being judged
+                # (console on another VT, or the unit stopped by hand).
+                "watchdog_hold": watchdog_hold(),
             })
         else:
             self._reply(405, {"ok": False, "error": "use POST"})
