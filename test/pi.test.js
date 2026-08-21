@@ -319,19 +319,35 @@ describe('kiosk service unit', () => {
    */
   const src = read(SETUP);
 
+  it('starts the kiosk through the compositor dispatcher', () => {
+    assert.ok(/ExecStart=\$\{APP_DIR\}\/kiosk\.sh/.test(src),
+      'the unit runs kiosk.sh, which picks cage or weston');
+    /* The dispatcher must never leave the cabinet black: an unknown or
+     * missing choice, or a missing compositor binary, falls to cage. */
+    const start = src.indexOf('kiosk.sh" <<KIOSK');
+    const kiosk = src.slice(start, src.indexOf('\nKIOSK', start));
+    assert.ok(/command -v labwc/.test(kiosk), 'labwc is verified before use');
+    assert.ok(/command -v weston/.test(kiosk), 'weston is verified before use');
+    assert.ok(/exec \/usr\/bin\/cage/.test(kiosk), 'cage is the unconditional fallback');
+    assert.ok(/exec labwc -C/.test(kiosk), 'labwc runs with a private config dir');
+    assert.ok(/--shell=kiosk-shell\.so/.test(kiosk), 'weston runs its kiosk shell');
+    assert.ok(/arcadeos-wl/.test(kiosk) && /sleep 0\.2/.test(kiosk),
+      'chromium waits for the weston socket instead of racing it');
+  });
+
   it('starts cage with real flags only', () => {
-    const exec = src.match(/ExecStart=\/usr\/bin\/cage ([^\n]*)/);
-    assert.ok(exec, 'unit starts cage');
+    const exec = src.match(/exec \/usr\/bin\/cage ([^\n]*)/);
+    assert.ok(exec, 'the dispatcher execs cage');
     const flags = exec[1].split('--')[0].trim().split(/\s+/);
     for (const f of flags) {
-      assert.ok(/^-[dhmsv]+$/.test(f), f + ' is not a flag cage 0.1.x accepts');
+      assert.ok(/^-[dhmsv]+$/.test(f), f + ' is not a flag cage accepts');
     }
   });
 
   it('keeps VT switching available for rescue', () => {
     /* Without -s there is no local way into a machine whose only screen is
      * owned by the kiosk. */
-    assert.ok(/ExecStart=\/usr\/bin\/cage -\w*s\w* --/.test(src));
+    assert.ok(/exec \/usr\/bin\/cage -\w*s\w* --/.test(src));
   });
 
   it('applies rotation through the kernel, for either HDMI port', () => {
@@ -382,7 +398,7 @@ describe('kiosk service unit', () => {
     assert.ok(/timeout/.test(pre[1]), 'the wait is bounded');
     assert.ok(/\/sys\/class\/drm\/card\*-\*\/status/.test(pre[1]),
       'it watches connector status, not the card device');
-    assert.ok(src.indexOf('ExecStartPre=') < src.indexOf('ExecStart=/usr/bin/cage'),
+    assert.ok(src.indexOf('ExecStartPre=') < src.indexOf('ExecStart=${APP_DIR}/kiosk.sh'),
       'the gate precedes the kiosk');
   });
 

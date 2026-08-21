@@ -289,6 +289,8 @@ install_packages() {
   # a full login manager. The rest is Bluetooth pads, GPIO and fonts.
   local packages=(
     cage
+    labwc
+    weston
     seatd
     chromium-browser
     plymouth
@@ -514,6 +516,52 @@ exec "\$CHROMIUM" \\
 LAUNCH
   chmod 0755 "$APP_DIR/launch.sh"
 
+  # Compositor dispatcher. Measured on the first cabinet: under cage,
+  # Chromium delivers exactly half the display's refresh no matter how
+  # cheap the frame is — 30.0fps at 60Hz with 2.9ms frames, on both the
+  # wayland and the Xwayland ozone paths, because every frame still
+  # traverses cage's repaint loop. labwc is what Raspberry Pi OS itself
+  # composites with, where Chromium demonstrably paces at full rate on
+  # this hardware, and it is what maintained Pi kiosk projects ship;
+  # weston's kiosk shell is the embedded-world alternative.
+  # /etc/arcadeos/compositor selects: "cage" (default), "labwc", or
+  # "weston". Every branch verifies its binary and falls back to cage,
+  # so an update that cannot run apt can never black-screen a cabinet.
+  cat > "$APP_DIR/kiosk.sh" <<KIOSK
+#!/usr/bin/env bash
+# ArcadeOS compositor dispatcher. Managed by setup-arcade.sh.
+set -Eeuo pipefail
+
+CHOICE="cage"
+[[ -r /etc/arcadeos/compositor ]] \\
+  && CHOICE="\$(head -1 /etc/arcadeos/compositor | tr -d '[:space:]')"
+
+if [[ "\$CHOICE" == "labwc" ]] && command -v labwc >/dev/null 2>&1; then
+  # labwc has no single-app mode; a private config dir whose autostart
+  # launches the kiosk page does the same job. A fullscreen surface has
+  # no decorations, so no rc.xml surgery is needed.
+  CFG="${DATA_DIR}/labwc"
+  mkdir -p "\$CFG"
+  printf '%s\n' "${APP_DIR}/launch.sh &" > "\$CFG/autostart"
+  exec labwc -C "\$CFG"
+fi
+
+if [[ "\$CHOICE" == "weston" ]] && command -v weston >/dev/null 2>&1; then
+  # Kiosk shell: the first fullscreen client owns the output. Weston runs
+  # inside this unit's cgroup, so a unit stop or restart takes down both
+  # the compositor and Chromium together.
+  weston --shell=kiosk-shell.so --socket=arcadeos-wl &
+  for _ in \$(seq 1 50); do
+    [[ -S "\$XDG_RUNTIME_DIR/arcadeos-wl" ]] && break
+    sleep 0.2
+  done
+  WAYLAND_DISPLAY=arcadeos-wl exec ${APP_DIR}/launch.sh
+fi
+
+exec /usr/bin/cage -ds -- ${APP_DIR}/launch.sh
+KIOSK
+  chmod 0755 "$APP_DIR/kiosk.sh"
+
   install -m 0755 "$SRC_DIR/pi/arcadeos-agent.py" "$APP_DIR/arcadeos-agent.py"
   install -m 0755 "$SRC_DIR/pi/arcadeos-update.sh" "$APP_DIR/arcadeos-update.sh"
   install -m 0755 "$SRC_DIR/pi/arcadeos-gpio.py" "$APP_DIR/arcadeos-gpio.py"
@@ -560,7 +608,7 @@ Environment=ARCADEOS_ROTATE=${ROTATE}
 # live connector (bounded — start anyway after 15s so a headless cabinet
 # still comes up and keeps the agent's watchdog meaningful).
 ExecStartPre=-/usr/bin/timeout 15 /bin/sh -c 'until grep -qs ^connected /sys/class/drm/card*-*/status; do sleep 0.3; done'
-ExecStart=/usr/bin/cage -ds -- ${APP_DIR}/launch.sh
+ExecStart=${APP_DIR}/kiosk.sh
 Restart=always
 RestartSec=2
 # A cabinet should come back from a crash, not sit on a black screen.

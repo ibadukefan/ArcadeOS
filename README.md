@@ -767,6 +767,23 @@ unit's journal, so this is the channel that works:
 journalctl -u arcadeos-agent | grep "diag " | tail -5
 ```
 
+**Frames are healthy but fps sits at exactly half the refresh rate**
+
+That is the compositor's frame pacing, not the page — the first cabinet
+measured 2.9ms frames delivered at 30.0fps under cage, on the wayland and
+Xwayland paths alike. The kiosk supports three compositors, selected by
+`/etc/arcadeos/compositor` (`cage`, the default; `labwc`, what Raspberry Pi
+OS itself composites with and where Chromium paces at full rate; `weston`,
+the embedded-world kiosk shell):
+
+```bash
+echo labwc | sudo tee /etc/arcadeos/compositor
+sudo systemctl restart arcadeos
+```
+
+Anything missing or misspelled falls back to cage — the cabinet can never
+black-screen over this file.
+
 **The screen froze and nothing recovers it**
 
 It should recover itself within about thirty seconds. The front end sends a
