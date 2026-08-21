@@ -360,6 +360,16 @@ describe('kiosk service unit', () => {
     assert.ok(/--enable-accelerated-2d-canvas/.test(src));
   });
 
+  it('evicts the login prompt from its TTY', () => {
+    /* getty@tty1 and the kiosk raced for tty1 on every boot. The display
+     * wait handed getty a guaranteed win, and cage then wedged in PAM
+     * session setup behind it — service "active", one task, a login
+     * prompt on the cabinet. Conflicts= is how every kiosk settles this. */
+    assert.ok(/Conflicts=getty@tty1\.service/.test(src));
+    assert.ok(/After=getty@tty1\.service/.test(src),
+      'ordered after it, so the eviction settles before cage takes the VT');
+  });
+
   it('waits for a connected display before starting cage', () => {
     /* cage exits 0 when it finds no output; the first cabinet quick-exited
      * six times per boot racing the HDMI connector. The wait is bounded and

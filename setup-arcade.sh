@@ -525,6 +525,13 @@ install_services() {
 Description=ArcadeOS kiosk
 After=systemd-user-sessions.service seatd.service arcadeos-agent.service
 Wants=arcadeos-agent.service
+# The kiosk and the login prompt both want tty1. They always raced; the
+# display-ready wait below made getty win every boot, after which cage
+# wedged forever in PAM session setup behind it — "active (running)", one
+# task, a login prompt on the cabinet. Standard kiosk arrangement: evict
+# getty from our TTY, take it back cleanly.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
 
 [Service]
 Type=simple
