@@ -578,5 +578,7 @@ describe('frame cost visibility', () => {
     assert.ok(/gpu="[^"]*"/.test(diag), 'names the GPU: ' + diag);
     assert.ok(/dev=\d+x\d+ rot=\d+/.test(diag), 'names the surface: ' + diag);
     assert.ok(/fps=[\d.]+ cpu=[\d.]+ms/.test(diag), 'names the cost: ' + diag);
+    assert.ok(/upd=[\d.]+ drw=[\d.]+/.test(diag),
+      'splits the cost into logic and paint: ' + diag);
   });
 });

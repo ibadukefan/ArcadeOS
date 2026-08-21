@@ -1654,7 +1654,8 @@ var Shell = (function () {
      * Near zero with a slow avg: the pipeline below us is the cost. */
     var lp = Loop.perf();
     dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) +
-      '  cpu ' + lp.cpuMean.toFixed(1) + 'ms',
+      '  cpu ' + lp.cpuMean.toFixed(1) +
+      ' (u' + lp.updMean.toFixed(1) + ' d' + lp.drwMean.toFixed(1) + ')',
       32, SH - 280, { size: 14, color: COL.dim });
 
     /*

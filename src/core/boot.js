@@ -56,16 +56,20 @@ var Loop = (function () {
 
   /** Mean/worst over the last second or so, for the overlay and the relay. */
   function perf() {
-    var cpuSum = 0, cpuWorst = 0, dtSum = 0;
+    var cpuSum = 0, cpuWorst = 0, dtSum = 0, updSum = 0, drwSum = 0;
     for (var i = 0; i < CPU_N; i++) {
       cpuSum += cpuTimes[i];
       if (cpuTimes[i] > cpuWorst) cpuWorst = cpuTimes[i];
       dtSum += dtTimes[i];
+      updSum += updTimes[i];
+      drwSum += drwTimes[i];
     }
     var dtMean = dtSum / CPU_N;
     return {
       cpuMean: cpuSum / CPU_N,
       cpuWorst: cpuWorst,
+      updMean: updSum / CPU_N,
+      drwMean: drwSum / CPU_N,
       fps: dtMean > 0 ? 1000 / dtMean : 0,
     };
   }
@@ -73,11 +77,25 @@ var Loop = (function () {
   /** One logical frame. Exposed so the harness can drive it directly. */
   var clock = 0;
 
+  /* The update/draw split of each frame's cpu time. 12ms of "cpu" says the
+   * page is the cost; only the split says whether it is game logic or the
+   * paint path — and they get slimmed in completely different ways. */
+  var updTimes = new Array(CPU_N);
+  for (var ui = 0; ui < CPU_N; ui++) updTimes[ui] = 0;
+  var drwTimes = new Array(CPU_N);
+  for (var wi = 0; wi < CPU_N; wi++) drwTimes[wi] = 0;
+  var splitAt = 0;
+
   function tick(dt) {
     clock += num(dt, 16);
+    var t0 = nowMs();
     Input.poll(dt);
     Shell.update(dt);
+    var t1 = nowMs();
     Shell.draw(dt);
+    updTimes[splitAt] = t1 - t0;
+    drwTimes[splitAt] = nowMs() - t1;
+    splitAt = (splitAt + 1) % CPU_N;
     /* Last thing in the frame: proof that a whole frame completed. */
     System.heartbeat(clock);
   }
@@ -122,6 +140,7 @@ function armDiagRelay() {
       ' scale=' + s.scale.toFixed(3) +
       ' fps=' + p.fps.toFixed(1) +
       ' cpu=' + p.cpuMean.toFixed(1) + 'ms' +
+      ' upd=' + p.updMean.toFixed(1) + ' drw=' + p.drwMean.toFixed(1) +
       ' video=' + (Render.lowLatency() ? 'low-lat' : 'normal');
   }
 
