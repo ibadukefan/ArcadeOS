@@ -1044,6 +1044,34 @@ var Shell = (function () {
     c.fillRect(MARGIN, HEADER_H - 42, SW - MARGIN * 2, 1);
   }
 
+  /* Offscreen preview buffers for unselected cards, refreshed at 10Hz. */
+  var PREVIEW_HZ_MS = 100;
+  var previewBufs = Object.create(null);
+
+  function previewCache(g, pw, ph) {
+    if (typeof document === 'undefined' || !document.createElement) return null;
+    var buf = previewBufs[g.id];
+    var w = Math.max(1, Math.round(pw)), h = Math.max(1, Math.round(ph));
+    if (!buf || buf.canvas.width !== w || buf.canvas.height !== h) {
+      var cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      buf = previewBufs[g.id] = { canvas: cv, at: -1e9 };
+    }
+    if (t - buf.at >= PREVIEW_HZ_MS) {
+      buf.at = t;
+      var bc = buf.canvas.getContext('2d');
+      if (bc) {
+        bc.setTransform(1, 0, 0, 1, 0, 0);
+        bc.clearRect(0, 0, w, h);
+        bc.fillStyle = 'rgba(8,6,18,0.45)';
+        bc.fillRect(0, 0, w, h);
+        try { g.preview(bc, w, h, t); }
+        catch (err) { fault(err, g.id + '.preview'); }
+      }
+    }
+    return buf.canvas;
+  }
+
   function drawCard(c, e, rect, selected) {
     var g = e.game;
     var pulse = selected ? 0.5 + Math.sin(t * 0.004) * 0.18 : 0;
@@ -1059,17 +1087,24 @@ var Shell = (function () {
       lineWidth: selected ? 2 : 1,
     });
 
-    /* Preview window. */
+    /* Preview window. The selected card animates live; the rest redraw
+     * from a small cache at 10Hz. Five extra live previews per frame were
+     * pure decoration costing real milliseconds of the 16.7ms budget. */
     var pw = rect.w - 36, ph = rect.h - 132;
     var px = rect.x + 18, py = rect.y + 18;
     c.save();
     roundRect(c, px, py, pw, ph, 12);
     c.clip();
-    c.fillStyle = 'rgba(8,6,18,0.45)';
-    c.fillRect(px, py, pw, ph);
-    c.translate(px, py);
-    try { g.preview(c, pw, ph, t); }
-    catch (err) { fault(err, g.id + '.preview'); }
+    if (selected) {
+      c.fillStyle = 'rgba(8,6,18,0.45)';
+      c.fillRect(px, py, pw, ph);
+      c.translate(px, py);
+      try { g.preview(c, pw, ph, t); }
+      catch (err) { fault(err, g.id + '.preview'); }
+    } else {
+      var cached = previewCache(g, pw, ph);
+      if (cached) c.drawImage(cached, px, py, pw, ph);
+    }
     c.restore();
 
     if (e.versus) {

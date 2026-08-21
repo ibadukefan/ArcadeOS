@@ -300,11 +300,22 @@ var Render = (function () {
   /** Full-logical space: (0,0)-(W,H) covers the panel, rotated or not. */
   function setBase() { setSpace(1, 0, 0); }
 
+  var auroraFrame = 0;
+
   function beginFrame(dt, tint) {
     if (!ctx) return null;
     var reduced = false;
     try { reduced = !!Settings.get('reducedMotion'); } catch (e) { reduced = false; }
-    if (!reduced) { auroraT += num(dt, 16); backdropDirty = true; }
+    /* The aurora clock advances every frame so its speed never changes, but
+     * the buffer recomposes on alternate frames: 30Hz drift is visually
+     * identical and halves the one piece of per-frame CPU compose work.
+     * Measured on the cabinet at 768p: every millisecond of draw matters —
+     * an ~18ms frame misses the 16.7ms vsync budget and shows as 30fps. */
+    if (!reduced) {
+      auroraT += num(dt, 16);
+      auroraFrame++;
+      if (auroraFrame & 1) backdropDirty = true;
+    }
     if (tint !== lastTint) { lastTint = tint; backdropDirty = true; }
 
     setBase();
