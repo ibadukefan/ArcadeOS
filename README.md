@@ -129,11 +129,14 @@ sudo ./setup-arcade.sh --help
 
 ### Rotation
 
-The rotation is applied by `cage`, the Wayland compositor, not by the
-firmware. Chromium therefore sees a genuine 1080×1920 portrait viewport and
-the front end never has to know it is running sideways.
+Rotation is declared to the kernel (`panel_orientation` on the boot command
+line) and the Wayland compositor honours it automatically. Chromium therefore
+sees a genuine 1080×1920 portrait viewport and the front end never has to know
+it is running sideways. A rotation change takes effect on the next reboot.
 
-If your monitor is physically rotated the other way, use `--rotate 270`.
+If your picture comes out rotated the wrong way, use `--rotate 270` — which of
+90/270 is "clockwise" depends on which way you physically turned the monitor.
+Both HDMI ports are configured, so either can drive the cabinet.
 
 ### Shutting down properly
 

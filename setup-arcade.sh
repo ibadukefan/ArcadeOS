@@ -470,10 +470,13 @@ TTYVHangup=yes
 TTYVTDisallocate=yes
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=WLR_LIBINPUT_NO_DEVICES=1
-# Panel rotation. cage rotates the whole output, so the front end never has to
-# know it is running sideways.
+# Rotation happens in the kernel (panel_orientation on the cmdline), not here:
+# cage has no rotation flag — passing one made it exit 1 and the cabinet
+# crash-looped on a black screen. Verified against cage 0.1.x, options dhm:sv.
+# -s keeps Ctrl+Alt+F2 working, which is the only local way back into a
+# machine whose one screen is owned by the kiosk.
 Environment=ARCADEOS_ROTATE=${ROTATE}
-ExecStart=/usr/bin/cage -d -r ${ROTATE} -- ${APP_DIR}/launch.sh
+ExecStart=/usr/bin/cage -ds -- ${APP_DIR}/launch.sh
 Restart=always
 RestartSec=2
 # A cabinet should come back from a crash, not sit on a black screen.
@@ -550,8 +553,6 @@ install_gpio() {
     write_block "$cfg" "$(cat <<CFG
 # ArcadeOS: shutdown button on BCM${GPIO_PIN} to ground, handled in-kernel.
 dtoverlay=gpio-shutdown,gpio_pin=${GPIO_PIN},active_low=1,gpio_pull=up
-# Portrait panel: rotation is applied by cage, not the firmware, so that
-# Chromium still reports a 1080x1920 viewport.
 disable_splash=1
 CFG
 )"
@@ -624,30 +625,63 @@ install_splash() {
     update-initramfs -u >/dev/null 2>&1 || true
   fi
 
-  # Quiet the kernel so boot is genuinely black -> wordmark -> dashboard.
+}
+
+# ------------------------------------------------------------- cmdline ---
+#
+# One function owns cmdline.txt. It used to be buried in install_splash, which
+# meant a machine without plymouth never got any of it — including rotation,
+# once rotation moved here.
+configure_cmdline() {
+  step "Configuring the kernel command line"
   local cmdline; cmdline="$(boot_cmdline)"
-  if [[ -n "$cmdline" ]]; then
-    local current; current="$(cat "$cmdline")"
-    local wanted="$current"
-    #
-    # usbhid.*poll=1 asks every USB input device for a report every 1ms
-    # instead of at its descriptor's default interval, which for cheap arcade
-    # encoders and many pads is 10ms. This is the largest single source of
-    # controller latency on a Pi and it is invisible from inside the browser.
-    #
-    for opt in quiet splash plymouth.ignore-serial-consoles logo.nologo \
-               vt.global_cursor_default=0 \
-               usbhid.jspoll=1 usbhid.kbpoll=1 usbhid.mousepoll=1; do
-      grep -qw -- "$opt" <<<"$wanted" || wanted="$wanted $opt"
-    done
-    wanted="$(tr -s ' ' <<<"$wanted" | sed 's/^ *//; s/ *$//')"
-    if [[ "$wanted" != "$current" ]]; then
-      cp -a "$cmdline" "${cmdline}.arcadeos.bak"
-      printf '%s\n' "$wanted" > "$cmdline"
-      info "updated $(basename "$cmdline") (backup at ${cmdline}.arcadeos.bak)"
-    else
-      info "$(basename "$cmdline") already configured"
-    fi
+  if [[ -z "$cmdline" ]]; then
+    warn "no cmdline.txt found; skipping kernel options (not a Pi boot layout?)"
+    return 0
+  fi
+
+  local current; current="$(cat "$cmdline")"
+  local wanted="$current"
+
+  # Rotation. cage has no rotation option, so the panel orientation is
+  # declared to the kernel and every wlroots compositor honours it. Chromium
+  # still sees an upright 1080x1920 output. Both HDMI connectors are listed
+  # because either port may be in use. If your picture comes out rotated the
+  # wrong way, re-run with --rotate 270 (or 90) — the two are mirror cases
+  # and which is "clockwise" depends on which way you physically turned the
+  # monitor.
+  wanted="$(sed -E 's/video=HDMI-A-[0-9]+:panel_orientation=[a-z_]+//g' <<<"$wanted")"
+  local po=""
+  case "$ROTATE" in
+    90)  po=right_side_up ;;
+    180) po=upside_down ;;
+    270) po=left_side_up ;;
+  esac
+  if [[ -n "$po" ]]; then
+    wanted="$wanted video=HDMI-A-1:panel_orientation=$po video=HDMI-A-2:panel_orientation=$po"
+  fi
+
+  #
+  # usbhid.*poll=1 asks every USB input device for a report every 1ms
+  # instead of at its descriptor's default interval, which for cheap arcade
+  # encoders and many pads is 10ms. This is the largest single source of
+  # controller latency on a Pi and it is invisible from inside the browser.
+  #
+  for opt in quiet splash plymouth.ignore-serial-consoles logo.nologo \
+             vt.global_cursor_default=0 \
+             usbhid.jspoll=1 usbhid.kbpoll=1 usbhid.mousepoll=1; do
+    grep -qw -- "$opt" <<<"$wanted" || wanted="$wanted $opt"
+  done
+  wanted="$(tr -s ' ' <<<"$wanted" | sed 's/^ *//; s/ *$//')"
+
+  if [[ "$wanted" != "$current" ]]; then
+    # Keep the first backup: it is the only pristine copy, and a rotation
+    # change on a later run must not clobber it with an already-edited file.
+    [[ -f "${cmdline}.arcadeos.bak" ]] || cp -a "$cmdline" "${cmdline}.arcadeos.bak"
+    printf '%s\n' "$wanted" > "$cmdline"
+    info "updated $(basename "$cmdline") (backup at ${cmdline}.arcadeos.bak)"
+  else
+    info "$(basename "$cmdline") already configured"
   fi
 }
 
@@ -795,6 +829,7 @@ main() {
   install_services
   install_gpio
   install_splash
+  configure_cmdline
 
   [[ $DO_READONLY -eq 1 ]] && enable_readonly
 

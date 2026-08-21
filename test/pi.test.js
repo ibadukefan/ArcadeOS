@@ -132,6 +132,52 @@ describe('setup-arcade.sh', () => {
   });
 });
 
+describe('kiosk service unit', () => {
+  /*
+   * The first boot on real hardware crash-looped on a black screen because
+   * ExecStart passed cage a rotation flag that does not exist. cage's real
+   * option set is tiny (getopt string "dhm:sv", checked against the shipped
+   * binary) — pin the ExecStart to flags cage actually has, and keep rotation
+   * where it now lives: panel_orientation on the kernel command line.
+   */
+  const src = read(SETUP);
+
+  it('starts cage with real flags only', () => {
+    const exec = src.match(/ExecStart=\/usr\/bin\/cage ([^\n]*)/);
+    assert.ok(exec, 'unit starts cage');
+    const flags = exec[1].split('--')[0].trim().split(/\s+/);
+    for (const f of flags) {
+      assert.ok(/^-[dhmsv]+$/.test(f), f + ' is not a flag cage 0.1.x accepts');
+    }
+  });
+
+  it('keeps VT switching available for rescue', () => {
+    /* Without -s there is no local way into a machine whose only screen is
+     * owned by the kiosk. */
+    assert.ok(/ExecStart=\/usr\/bin\/cage -\w*s\w* --/.test(src));
+  });
+
+  it('applies rotation through the kernel, for either HDMI port', () => {
+    assert.ok(/video=HDMI-A-1:panel_orientation=\$po/.test(src));
+    assert.ok(/video=HDMI-A-2:panel_orientation=\$po/.test(src));
+    assert.ok(/90\)\s+po=right_side_up/.test(src));
+    assert.ok(/270\)\s+po=left_side_up/.test(src));
+    assert.ok(/180\)\s+po=upside_down/.test(src));
+  });
+
+  it('configures the cmdline even when plymouth is missing', () => {
+    /* The edit used to live inside install_splash, which returns early
+     * without plymouth — rotation would silently never apply. */
+    const main = src.slice(src.indexOf('main() {'));
+    assert.ok(/configure_cmdline/.test(main), 'main calls configure_cmdline directly');
+  });
+
+  it('never clobbers the pristine cmdline backup on a re-run', () => {
+    const fn = src.slice(src.indexOf('configure_cmdline() {'));
+    assert.ok(/\[\[ -f "\$\{cmdline\}\.arcadeos\.bak" \]\] \|\| cp -a/.test(fn));
+  });
+});
+
 describe('OS support check', () => {
   /*
    * A real cabinet install died three quarters of the way through apt with
