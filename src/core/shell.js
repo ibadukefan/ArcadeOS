@@ -425,6 +425,8 @@ var Shell = (function () {
       { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
       { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
+      { id: 'orientation', label: 'ORIENTATION', type: 'choice',
+        value: orientationLabel(s.orientation) },
       { type: 'header', label: 'CONTROLS' },
       { id: 'layout', label: 'CONTROLLER', type: 'choice',
         value: layoutLabel(s.layout) },
@@ -484,6 +486,25 @@ var Shell = (function () {
 
   var LAYOUTS = ['auto', 'xbox', 'playstation', 'nintendo'];
 
+  /* Every multi-value settings row, keyed by id, so the cycle logic is one
+   * function instead of one hardcoded special case per row. */
+  var ORIENTATIONS = ['auto', 'auto-left', 'off'];
+  var CHOICES = { layout: LAYOUTS, orientation: ORIENTATIONS };
+
+  function cycleChoice(id, dir) {
+    var list = CHOICES[id];
+    if (!list) return;
+    var i = list.indexOf(Settings.get(id));
+    Settings.set(id, list[(i + dir + list.length * 8) % list.length]);
+    Audio2.sfx('select');
+  }
+
+  function orientationLabel(v) {
+    if (v === 'auto-left') return 'AUTO PORTRAIT \u2190';
+    if (v === 'off') return 'NO ROTATION';
+    return 'AUTO PORTRAIT \u2192';
+  }
+
   function settingsUpdate(dt) {
     if (confirmBox) { confirmUpdate(dt); return; }
 
@@ -512,10 +533,7 @@ var Shell = (function () {
       Settings.set('volume', Math.round(vol * 20) / 20);
       Audio2.sfx('move');
     } else if (h && it.type === 'choice') {
-      var i = LAYOUTS.indexOf(Settings.get('layout'));
-      i = (i + h + LAYOUTS.length * 8) % LAYOUTS.length;
-      Settings.set('layout', LAYOUTS[i]);
-      Audio2.sfx('select');
+      cycleChoice(it.id, h > 0 ? 1 : -1);
     } else if (h && it.type === 'toggle') {
       Settings.set(it.id, !Settings.get(it.id));
       Audio2.sfx('select');
@@ -533,9 +551,7 @@ var Shell = (function () {
       return;
     }
     if (it.type === 'choice') {
-      var i = LAYOUTS.indexOf(Settings.get('layout'));
-      Settings.set('layout', LAYOUTS[(i + 1) % LAYOUTS.length]);
-      Audio2.sfx('select');
+      cycleChoice(it.id, 1);
       return;
     }
     if (it.id === 'back') { navBack(); Audio2.sfx('back'); return; }

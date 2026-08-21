@@ -26,7 +26,20 @@ var Render = (function () {
   var ctx = null;
 
   /* Device backing size. */
+  /* Logical canvas dims (post-rotation) — everything below draws in these. */
   var W = SW, H = SH;
+  /* Physical device dims, and the rotation applied between the two spaces. */
+  var DW = SW, DH = SH;
+  /*
+   * AUTOMATIC VERTICAL. The cabinet is portrait by identity, but the
+   * compositor cannot be trusted to rotate the output: Bookworm's cage links
+   * a wlroots old enough to ignore the kernel's panel_orientation hint —
+   * observed on hardware as "boots vertical, reverts to horizontal". So when
+   * the surface arrives landscape, the front end rotates ITSELF 90 degrees
+   * and fills the panel. Chromium and the compositor never need to know.
+   * 0 = none, 90 = clockwise, 270 = counter-clockwise.
+   */
+  var rot = 0;
   var dpr = 1;
 
   /* Shell-space transform. */
@@ -119,16 +132,30 @@ var Render = (function () {
     /* Above 1.5 the Pi burns fill rate for pixels nobody can resolve. */
     dpr = clamp(num(ratio, 1), 1, 1.5);
 
-    W = Math.max(1, Math.floor(vw * dpr));
-    H = Math.max(1, Math.floor(vh * dpr));
-    canvas.width = W;
-    canvas.height = H;
+    DW = Math.max(1, Math.floor(vw * dpr));
+    DH = Math.max(1, Math.floor(vh * dpr));
+    canvas.width = DW;
+    canvas.height = DH;
     if (canvas.style) {
       canvas.style.width = vw + 'px';
       canvas.style.height = vh + 'px';
     }
 
-    /* Shell space letterboxed into the device surface. */
+    /* Native resolution is whatever the panel offers — no cap. Rotation is
+     * only engaged when the surface is landscape: a portrait surface means
+     * something below us already did the right thing, and rotating twice
+     * would be worse than either bug alone. */
+    var want = 'auto';
+    try { want = Settings.get('orientation') || 'auto'; } catch (e) { want = 'auto'; }
+    rot = 0;
+    if (DW > DH) {
+      if (want === 'auto') rot = 90;
+      else if (want === 'auto-left') rot = 270;
+    }
+    W = rot ? DH : DW;
+    H = rot ? DW : DH;
+
+    /* Shell space letterboxed into the (logical) surface. */
     scale = Math.min(W / SW, H / SH);
     ox = (W - SW * scale) / 2;
     oy = (H - SH * scale) / 2;
@@ -259,6 +286,20 @@ var Render = (function () {
    * Paint the shared background and set up shell space. Returns the shell ctx.
    * `tint` optionally recolours the middle aurora blob to a game accent.
    */
+  /**
+   * The one place the rotation matrix lives. Sets the transform that maps a
+   * space of scale k, offset (tx,ty) in LOGICAL coordinates onto the device.
+   */
+  function setSpace(k, tx, ty) {
+    if (!ctx) return;
+    if (rot === 90) ctx.setTransform(0, k, -k, 0, DW - ty, tx);
+    else if (rot === 270) ctx.setTransform(0, -k, k, 0, ty, DH - tx);
+    else ctx.setTransform(k, 0, 0, k, tx, ty);
+  }
+
+  /** Full-logical space: (0,0)-(W,H) covers the panel, rotated or not. */
+  function setBase() { setSpace(1, 0, 0); }
+
   function beginFrame(dt, tint) {
     if (!ctx) return null;
     var reduced = false;
@@ -266,7 +307,7 @@ var Render = (function () {
     if (!reduced) { auroraT += num(dt, 16); backdropDirty = true; }
     if (tint !== lastTint) { lastTint = tint; backdropDirty = true; }
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    setBase();
     ctx.globalAlpha = 1;
 
     /* With reduced motion the blobs are still, so the buffer only needs
@@ -288,14 +329,14 @@ var Render = (function () {
     }
 
     /* Enter shell space. */
-    ctx.setTransform(scale, 0, 0, scale, ox, oy);
+    setSpace(scale, ox, oy);
     return ctx;
   }
 
   /** Scanlines + vignette sit on top of everything. */
   function endFrame() {
     if (!ctx) return;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    setBase();
     ctx.globalAlpha = 1;
 
     /* Full-screen op 2 of 2: scanlines and vignette in a single 1:1 blit. */
@@ -316,15 +357,14 @@ var Render = (function () {
   /** Switch the active transform into 600x1000 game space. */
   function enterGame() {
     if (!ctx) return null;
-    ctx.setTransform(scale * gScale, 0, 0, scale * gScale,
-      ox + gox * scale, oy + goy * scale);
+    setSpace(scale * gScale, ox + gox * scale, oy + goy * scale);
     return ctx;
   }
 
   /** Back to 1080x1920 shell space. */
   function enterShell() {
     if (!ctx) return null;
-    ctx.setTransform(scale, 0, 0, scale, ox, oy);
+    setSpace(scale, ox, oy);
     return ctx;
   }
 
@@ -391,7 +431,16 @@ var Render = (function () {
     glow: glow,
     glowSprite: glowSprite,
     ctx: function () { return ctx; },
-    size: function () { return { w: W, h: H, scale: scale, ox: ox, oy: oy }; },
+    size: function () {
+      return { w: W, h: H, scale: scale, ox: ox, oy: oy, rot: rot, dw: DW, dh: DH };
+    },
+    /** Test seam: where does a shell-space point land on the physical panel? */
+    _toDevice: function (x, y) {
+      var px = x * scale + ox, py = y * scale + oy;
+      if (rot === 90) return { x: DW - py, y: px };
+      if (rot === 270) return { x: py, y: DH - px };
+      return { x: px, y: py };
+    },
     gameRect: function () { return { x: gox, y: goy, w: GW * gScale, h: GH * gScale, s: gScale }; },
     /** Force the low-latency context setting to take effect now. */
     rebuild: rebuild,

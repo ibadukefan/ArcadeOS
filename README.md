@@ -129,14 +129,23 @@ sudo ./setup-arcade.sh --help
 
 ### Rotation
 
-Rotation is declared to the kernel (`panel_orientation` on the boot command
-line) and the Wayland compositor honours it automatically. Chromium therefore
-sees a genuine 1080×1920 portrait viewport and the front end never has to know
-it is running sideways. A rotation change takes effect on the next reboot.
+**Vertical mode is automatic and lives in the front end.** The monitor runs
+at its native resolution (the compositor picks the panel's preferred mode —
+1080p, 1440p and 4K all work), and if the surface arrives landscape the front
+end rotates its whole output 90° so a portrait-mounted panel reads upright and
+fills the screen. No reboot, no flags.
 
-If your picture comes out rotated the wrong way, use `--rotate 270` — which of
-90/270 is "clockwise" depends on which way you physically turned the monitor.
-Both HDMI ports are configured, so either can drive the cabinet.
+If your panel is turned the other way, flip it on the cabinet itself:
+**SETTINGS → DISPLAY → ORIENTATION** cycles AUTO PORTRAIT → / AUTO PORTRAIT ←
+/ NO ROTATION (the last letterboxes upright, for a monitor standing normally
+on a desk). Applies instantly.
+
+Why in the front end: the kernel is told the panel orientation
+(`panel_orientation` on the boot command line, which rotates the console and
+splash), but the cage compositor on Bookworm links a wlroots too old to honour
+it — a cabinet boots with a vertical console and then reverts to horizontal
+the moment the kiosk starts. Observed on hardware; rotating in the renderer
+is the path that cannot be taken away.
 
 ### Shutting down properly
 

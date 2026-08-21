@@ -208,6 +208,11 @@ var SETTINGS_DEFAULTS = {
   /* Low-latency (desynchronized) canvas. On by default because it is the
    * biggest single latency win; a setting because a few drivers tear. */
   lowLatency: true,
+  /* 'auto' | 'auto-left' | 'off'. When the surface is landscape, auto rotates
+   * the whole picture 90 degrees clockwise so a physically portrait-mounted
+   * panel reads upright and full-screen; auto-left for panels turned the
+   * other way; off letterboxes upright (a desk monitor lying normally). */
+  orientation: 'auto',
   /* Gamepad haptics. Separate from reducedMotion: rumble is touch, not
    * motion, and someone sensitive to screen shake may still want it. */
   rumble: true,
@@ -229,6 +234,8 @@ var Settings = (function () {
     out.reducedMotion = raw.reducedMotion === true;
     out.showFps = raw.showFps === true;
     out.lowLatency = raw.lowLatency !== false;
+    out.orientation = (raw.orientation === 'auto-left' || raw.orientation === 'off')
+      ? raw.orientation : 'auto';
     out.rumble = raw.rumble !== false;
     return out;
   }
@@ -252,6 +259,7 @@ var Settings = (function () {
     Store.set('settings', s);
     if (name === 'volume' || name === 'muted') audioRefresh();
     if (name === 'lowLatency') renderRebuild();
+    if (name === 'orientation') renderResize();
     return value;
   }
 
@@ -270,6 +278,10 @@ var Settings = (function () {
 
   function renderRebuild() {
     if (typeof Render !== 'undefined' && Render && Render.rebuild) Render.rebuild();
+  }
+
+  function renderResize() {
+    if (typeof Render !== 'undefined' && Render && Render.resize) Render.resize();
   }
 
   return { all: all, get: get, set: set, reset: reset, _validate: validate };
