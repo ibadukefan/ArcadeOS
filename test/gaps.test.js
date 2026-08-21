@@ -482,3 +482,54 @@ describe('GPU visibility', () => {
     assert.equal(Faults.count(), 0, JSON.stringify(Faults.latest()));
   });
 });
+
+describe('frame cost visibility', () => {
+  it('Loop.perf() reports sane numbers under harness driving', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Loop } = env.api();
+    const p = Loop.perf();
+    assert.ok(isFinite(p.fps) && p.fps > 0, `fps ${p.fps}`);
+    assert.ok(isFinite(p.cpuMean) && p.cpuMean >= 0, `cpu ${p.cpuMean}`);
+    assert.ok(p.cpuWorst >= p.cpuMean, 'worst is at least the mean');
+  });
+
+  it('the frame timer overlay draws with the cpu figure', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Settings, Faults } = env.api();
+    Settings.set('showFps', true);
+    for (let i = 0; i < 30; i++) env.tick(16.667);
+    assert.equal(Faults.count(), 0, JSON.stringify(Faults.latest()));
+  });
+
+  it('DIAGNOSTICS shows the surface the browser handed us', () => {
+    const env = makeEnv({ width: 1920, height: 1080 });
+    bootToMenu(env);
+    const { Shell, Faults } = env.api();
+    Shell._go('faults');
+    for (let i = 0; i < 10; i++) env.tick(16.667);
+    assert.equal(Faults.count(), 0, JSON.stringify(Faults.latest()));
+  });
+
+  it('relays a diag line through the agent when a cabinet has fetch', () => {
+    /* The kiosk unit journal drops Chromium stderr on real hardware; the
+     * agent journal is the channel that works. Pin the line's shape so the
+     * grep in the README keeps finding it. */
+    const sent = [];
+    const fakeFetch = (url, opts) => {
+      sent.push({ url: String(url), body: opts && opts.body });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    };
+    const env = makeEnv({ fetch: fakeFetch });
+    bootToMenu(env);
+    env.api()._diag();
+    const diag = sent.filter((r) => r.url.endsWith('/log'))
+      .map((r) => String(r.body))
+      .find((b) => b.indexOf('diag ') === 0);
+    assert.ok(diag, `a diag line was posted; saw ${sent.length} requests`);
+    assert.ok(/gpu="[^"]*"/.test(diag), 'names the GPU: ' + diag);
+    assert.ok(/dev=\d+x\d+ rot=\d+/.test(diag), 'names the surface: ' + diag);
+    assert.ok(/fps=[\d.]+ cpu=[\d.]+ms/.test(diag), 'names the cost: ' + diag);
+  });
+});

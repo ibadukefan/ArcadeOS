@@ -634,6 +634,14 @@ var Shell = (function () {
     return s.length > 44 ? s.slice(0, 43) + '…' : s;
   }
 
+  /** e.g. "1920×1080 · ROT 90° · SCALE 1.00" */
+  function resLabel() {
+    var s = Render.size();
+    return s.dw + '×' + s.dh +
+      (s.rot ? ' · ROT ' + s.rot + '°' : ' · NO ROT') +
+      ' · SCALE ' + s.scale.toFixed(2);
+  }
+
   function drawFaults(c) {
     wordmark(c, SW / 2, 110, 54);
     text(c, 'DIAGNOSTICS', SW / 2, 178, {
@@ -654,6 +662,9 @@ var Shell = (function () {
       /* The 22fps tell: SwiftShader here means Chromium is software
        * rendering and the launch flags need fixing, not the games. */
       ['GPU', gpuLabel(), Render.gpuIsSoftware() ? COL.bad : COL.good],
+      /* What surface the browser actually handed us, and what we did with
+       * it — ends the "what shape is it really in" photo forensics. */
+      ['RESOLUTION', resLabel(), COL.data],
       ['CONTROLLERS', String(Input.padCount()) + ' PAD' +
         (Input.padCount() === 1 ? '' : 'S') + ', ' +
         Input.kindOf(0).toUpperCase(), COL.data],
@@ -1638,7 +1649,12 @@ var Shell = (function () {
     dataText(c, fps.toFixed(1) + ' FPS', 32, SH - 302, {
       size: 20, color: bad ? COL.warn : COL.a1,
     });
-    dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) + 'ms',
+    /* cpu = time spent inside our frame callback. Near the avg: the JS (or
+     * a software canvas rasterising inside our draw calls) is the cost.
+     * Near zero with a slow avg: the pipeline below us is the cost. */
+    var lp = Loop.perf();
+    dataText(c, 'avg ' + mean.toFixed(1) + '  max ' + worst.toFixed(1) +
+      '  cpu ' + lp.cpuMean.toFixed(1) + 'ms',
       32, SH - 280, { size: 14, color: COL.dim });
 
     /*

@@ -17,13 +17,57 @@ var Loop = (function () {
    * game a 4-second dt and teleport everything through a wall. */
   var MAX_DT = 50;
 
+  /*
+   * How much of each frame is OUR work. Frame-to-frame time alone cannot
+   * distinguish "the JS is slow" from "the pipeline is slow" — the first
+   * cabinet sat at a steady 30ms/frame and this is the number that says
+   * which side of the canvas the problem is on. Software canvas raster
+   * happens synchronously inside the draw calls, so it shows up here;
+   * a GPU-rastered frame leaves this near zero.
+   */
+  var CPU_N = 60;
+  var cpuTimes = new Array(CPU_N);
+  for (var ci = 0; ci < CPU_N; ci++) cpuTimes[ci] = 0;
+  var cpuAt = 0;
+  var dtTimes = new Array(CPU_N);
+  for (var di = 0; di < CPU_N; di++) dtTimes[di] = 16.667;
+  var dtAt = 0;
+
+  function nowMs() {
+    try {
+      if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    } catch (e) { /* fall through */ }
+    return Date.now ? Date.now() : 0;
+  }
+
   function frame(now) {
     if (!running) return;
     var t = num(now, last + 16);
     var dt = last === 0 ? 16 : clamp(t - last, 0, MAX_DT);
     last = t;
+    var t0 = nowMs();
     tick(dt);
+    cpuTimes[cpuAt] = nowMs() - t0;
+    cpuAt = (cpuAt + 1) % CPU_N;
+    dtTimes[dtAt] = dt;
+    dtAt = (dtAt + 1) % CPU_N;
     rafId = requestAnimationFrame(frame);
+  }
+
+  /** Mean/worst over the last second or so, for the overlay and the relay. */
+  function perf() {
+    var cpuSum = 0, cpuWorst = 0, dtSum = 0;
+    for (var i = 0; i < CPU_N; i++) {
+      cpuSum += cpuTimes[i];
+      if (cpuTimes[i] > cpuWorst) cpuWorst = cpuTimes[i];
+      dtSum += dtTimes[i];
+    }
+    var dtMean = dtSum / CPU_N;
+    return {
+      cpuMean: cpuSum / CPU_N,
+      cpuWorst: cpuWorst,
+      fps: dtMean > 0 ? 1000 / dtMean : 0,
+    };
   }
 
   /** One logical frame. Exposed so the harness can drive it directly. */
@@ -51,8 +95,49 @@ var Loop = (function () {
     rafId = 0;
   }
 
-  return { start: start, stop: stop, tick: tick, running: function () { return running; } };
+  return {
+    start: start, stop: stop, tick: tick, perf: perf,
+    running: function () { return running; },
+  };
 })();
+
+/*
+ * Remote eyes. Chromium's stderr never reached the kiosk unit's journal on
+ * the real cabinet, so the front end reports through the agent instead:
+ *   journalctl -u arcadeos-agent | grep frontend
+ * One line shortly after boot (GPU, geometry), then a heartbeat-style perf
+ * line every minute. Armed only where fetch exists — a cabinet — so the
+ * test harness never leaks a timer.
+ */
+function armDiagRelay() {
+  if (typeof fetch !== 'function') return;
+  var t0 = Date.now ? Date.now() : 0;
+
+  function line() {
+    var s = Render.size();
+    var p = Loop.perf();
+    var up = t0 && Date.now ? Math.round((Date.now() - t0) / 1000) : 0;
+    return 'diag up=' + up + 's gpu="' + Render.gpuInfo() + '"' +
+      ' dev=' + s.dw + 'x' + s.dh + ' rot=' + s.rot +
+      ' scale=' + s.scale.toFixed(3) +
+      ' fps=' + p.fps.toFixed(1) +
+      ' cpu=' + p.cpuMean.toFixed(1) + 'ms' +
+      ' video=' + (Render.lowLatency() ? 'low-lat' : 'normal');
+  }
+
+  function report() {
+    try { System.log(line()); } catch (e) { /* diagnostics stay harmless */ }
+  }
+
+  /* First line once real frames exist, then a minute-ly heartbeat. Nothing
+   * fires during a test's lifetime, so fetch-counting tests stay exact; the
+   * console (and tests) can force a line with ArcadeOS._diag(). */
+  if (typeof setTimeout === 'function') setTimeout(report, 12000);
+  if (typeof setInterval === 'function') setInterval(report, 60000);
+  if (typeof globalThis !== 'undefined' && globalThis.ArcadeOS) {
+    globalThis.ArcadeOS._diag = report;
+  }
+}
 
 function boot() {
   var canvas = document.getElementById('screen');
@@ -84,6 +169,7 @@ function boot() {
   }
 
   Loop.start();
+  armDiagRelay();
 }
 
 /*

@@ -458,9 +458,16 @@ mkdir -p "\$PROFILE"
 #   --ignore-gpu-blocklist      the VideoCore VI is blocklisted by default,
 #                               which silently drops you to software raster
 #   --enable-gpu-rasterization  raster on the GPU, not the CPU
+#   --enable-accelerated-2d-canvas  the page IS one big 2D canvas; if this
+#                               path is off, every frame rasterises on the
+#                               CPU no matter how healthy the GPU process is
 #   --enable-zero-copy          no extra texture copy on upload
-#   --canvas-oop-rasterization  canvas raster off the main thread
 #   --force-device-scale-factor=1  never resample a 1080x1920 panel
+#
+# (Canvas OOP rasterisation used to be forced here via its flag. Same
+# lesson as the removed GL-backend flag: forcing a path the driver
+# blocklisted trades a slow frame for a broken one. Chromium picks the
+# canvas raster mode on its own.)
 #
 #   --enable-logging=stderr     Chromium's own GPU/crash lines land in
 #                               journalctl -u arcadeos. Without this the first
@@ -484,8 +491,8 @@ exec "\$CHROMIUM" \\
   --ozone-platform=wayland \\
   --ignore-gpu-blocklist \\
   --enable-gpu-rasterization \\
+  --enable-accelerated-2d-canvas \\
   --enable-zero-copy \\
-  --canvas-oop-rasterization \\
   --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\
   --disable-pinch \\

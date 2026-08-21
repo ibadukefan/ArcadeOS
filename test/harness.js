@@ -356,7 +356,11 @@ function makeEnv(opts = {}) {
     window, document, navigator, localStorage,
     requestAnimationFrame: () => rafSeq++,
     cancelAnimationFrame: () => {},
-    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    setTimeout: (fn, ms) => {
+      const h = setTimeout(fn, ms);
+      if (h && h.unref) h.unref();
+      return h;
+    },
     clearTimeout: (h) => clearTimeout(h),
     /* The input sampler runs on an interval. Tests that start it must stop
      * it; timers are unref'd so a leak cannot hold the process open. */

@@ -746,6 +746,19 @@ are relayed to the local agent, so they also appear in the journal:
 journalctl -u arcadeos-agent | grep frontend
 ```
 
+**How is it actually running, without standing at the cabinet**
+
+The front end posts a performance line through the agent shortly after boot
+and once a minute after that — GPU renderer, the surface the browser handed
+us, rotation, fps, and how much of each frame was spent in our own code
+(`cpu` high = the page is the cost; `cpu` near zero with low fps = the
+pipeline below is). Chromium's own stderr never reliably reaches the kiosk
+unit's journal, so this is the channel that works:
+
+```bash
+journalctl -u arcadeos-agent | grep "diag " | tail -5
+```
+
 **The screen froze and nothing recovers it**
 
 It should recover itself within about thirty seconds. The front end sends a
