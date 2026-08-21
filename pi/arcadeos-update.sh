@@ -86,8 +86,12 @@ BRANCH="${GIT_BRANCH:-main}"
 # root and the user actually exists (the test fixtures use a fake name).
 GIT=(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR")
 if [[ "$(id -u)" == 0 && -n "${ARCADE_USER:-}" ]] && id -u "$ARCADE_USER" >/dev/null 2>&1; then
-  # Self-heal checkouts already damaged by earlier root-run updates.
-  if [[ "$(stat -c %U "$SRC_DIR/.git" 2>/dev/null)" != "$ARCADE_USER" ]]; then
+  # Self-heal checkouts already damaged by earlier root-run updates. The
+  # damage is rarely at the top: a root git fetch drops root-owned files
+  # deep inside .git/objects while .git itself still belongs to the user —
+  # a top-level owner check walked straight past that on a real cabinet.
+  # Look for ANY wrong-owned file; -quit keeps the scan cheap when clean.
+  if [[ -n "$(find "$SRC_DIR" ! -user "$ARCADE_USER" -print -quit 2>/dev/null)" ]]; then
     chown -R "$ARCADE_USER" "$SRC_DIR" 2>/dev/null || true
   fi
   GIT=(runuser -u "$ARCADE_USER" -- git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR")
@@ -100,8 +104,17 @@ status "checking" "contacting the update server" 0 0
 FROM_SHA="$("${GIT[@]}" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
 FROM_FULL="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || echo "")"
 
-"${GIT[@]}" fetch --quiet origin "$BRANCH" \
-  || fail "could not reach the update server — check the network"
+# Capture stderr so a failure can be named for what it is. "Check the
+# network" was shown for a permissions failure on a real cabinet, and the
+# owner pinged github.com — fine — and rightly stopped trusting the screen.
+FETCH_ERR=""
+if ! FETCH_ERR="$("${GIT[@]}" fetch --quiet origin "$BRANCH" 2>&1 >/dev/null)"; then
+  if grep -qiE "insufficient permission|failed to write object|unpack-objects failed|permission denied" \
+      <<<"$FETCH_ERR"; then
+    fail "update files have the wrong owner — press TRY AGAIN to self-heal"
+  fi
+  fail "could not reach the update server — check the network"
+fi
 
 TO_SHA="$("${GIT[@]}" rev-parse --short=8 "origin/$BRANCH" 2>/dev/null || echo unknown)"
 

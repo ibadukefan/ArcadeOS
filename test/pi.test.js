@@ -226,6 +226,46 @@ describe('on-cabinet updater', () => {
     assert.equal(f.status().updated, false);
   });
 
+  it('a permissions failure is named as one, not blamed on the network', () => {
+    /* The second cabinet hit exactly this: root-owned wreckage in
+     * .git/objects made fetch fail, the screen said "check the network",
+     * the owner pinged github.com — fine — and rightly stopped trusting
+     * the screen. chmod stands in for root ownership; same git error. */
+    const f = fixture('exit 0');
+    /* A chmod cannot simulate this under a root test runner (root ignores
+     * permission bits), so shim git: fetch dies with the real error text,
+     * everything else passes through. */
+    const realGit = sh(f.dir, 'command -v git').trim();
+    const shimDir = path.join(f.dir, 'shim');
+    fs.mkdirSync(shimDir);
+    fs.writeFileSync(path.join(shimDir, 'git'), [
+      '#!/bin/bash',
+      'for a in "$@"; do',
+      '  if [ "$a" = fetch ]; then',
+      '    echo "error: insufficient permission for adding an object to repository database .git/objects" >&2',
+      '    exit 1',
+      '  fi',
+      'done',
+      `exec ${JSON.stringify(realGit)} "$@"`,
+    ].join('\n'));
+    fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+    f.env.PATH = shimDir + ':' + process.env.PATH;
+
+    assert.notEqual(f.run(), 0, 'updater must report failure');
+    const st = f.status();
+    assert.equal(st.phase, 'failed');
+    assert.ok(/wrong owner/.test(st.error), st.error);
+    assert.notOk(/network/.test(st.error), 'network is not blamed: ' + st.error);
+  });
+
+  it('heals wrong-owned files anywhere in the checkout, not just the top', () => {
+    /* The old heal checked the owner of .git itself — which the user owned,
+     * while root-owned objects sat deep inside .git/objects. It walked
+     * straight past the damage on a real cabinet. */
+    const src = read(UPDATER);
+    assert.ok(/find "\$SRC_DIR" ! -user "\$ARCADE_USER" -print -quit/.test(src));
+  });
+
   it('runs git as the cabinet user, never as root', () => {
     /* A root-run fetch writes root-owned objects into the user's checkout,
      * after which the user's own git pull is broken. Real-cabinet scar. */
