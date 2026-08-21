@@ -2,10 +2,11 @@
  * TETRIS — the flagship. 10x20 well, 7-bag randomiser, ghost piece, hold,
  * lock delay, soft/hard drop.
  *
- * Controls (d-pad + one button is enough to play; hold is optional):
- *   left/right  move          up       rotate clockwise
- *   down        soft drop     confirm  hard drop
- *   alt         hold          pause    pause
+ * Controls, modern-Tetris style (requested from the cabinet, live):
+ *   left/right  move            confirm  rotate clockwise
+ *   back        rotate counter-clockwise
+ *   down        soft drop       up       hard drop (slam)
+ *   alt         hold/swap       pause    pause
  */
 
 var TETRIS = (function () {
@@ -291,9 +292,12 @@ var TETRIS = (function () {
     for (i = 0; i < stepsR; i++) if (tryMove(1, 0) && grounded) lockTimer = 0;
     if (stepsL || stepsR) Audio2.sfx('move');
 
-    if (Input.hit('up')) tryRotate(1);
+    /* Modern-Tetris mapping: rotation on the face buttons (both ways), the
+     * whole d-pad for movement, up as the slam. Requested at the cabinet. */
+    if (Input.hit('confirm')) tryRotate(1);
+    if (Input.hit('back')) tryRotate(-1);
     if (Input.hit('alt')) doHold();
-    if (Input.hit('confirm')) { hardDrop(); return; }
+    if (Input.hit('up')) { hardDrop(); return; }
 
     /* Soft drop. */
     var soft = dasD.step(Input.down('down'), dt);
@@ -476,7 +480,7 @@ var TETRIS = (function () {
     title: 'TETRIS',
     tag: 'Stack, clear, survive the climb',
     accent: ACCENT.tetris,
-    hint: '◀▶ MOVE · ▼ DROP · ▲ ROTATE · {A} SLAM · {X} HOLD',
+    hint: '◀▶ MOVE · ▼ SOFT · ▲ SLAM · {A} ROTATE · {X} HOLD',
     /**
      * Attract-mode pilot: slide toward the shallowest column and slam. Plays
      * like a distracted human, which is exactly what a demo should look like.
@@ -495,7 +499,7 @@ var TETRIS = (function () {
       }
       if (cur.x < bestCol - 1) out.right = true;
       else if (cur.x > bestCol) out.left = true;
-      else out.confirm = true;
+      else out.up = true;
       return out;
     },
 
@@ -506,6 +510,17 @@ var TETRIS = (function () {
     /* Exposed for the versus mode, which reuses this engine's rules. */
     _internals: {
       COLS: COLS, ROWS: ROWS, NAMES: NAMES, SHAPES: SHAPES, KICKS: KICKS,
+    },
+    /* Test seam: the control mapping is a contract with the cabinet. */
+    _test: {
+      cur: function () { return { type: cur.type, rot: cur.rot, x: cur.x, y: cur.y }; },
+      holdType: function () { return holdType; },
+      score: function () { return score; },
+      filled: function () {
+        var n = 0;
+        for (var i = 0; i < grid.length; i++) if (grid[i] !== 0) n++;
+        return n;
+      },
     },
   });
 })();

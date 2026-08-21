@@ -49,7 +49,7 @@ html, body {
 </head>
 <body>
 <canvas id="screen"></canvas>
-<script>window.ARCADEOS_BUILD='fce0718a';
+<script>window.ARCADEOS_BUILD='29a5ebf1';
 (function(){
 'use strict';
 
@@ -2862,10 +2862,11 @@ var System = (function () {
  * TETRIS — the flagship. 10x20 well, 7-bag randomiser, ghost piece, hold,
  * lock delay, soft/hard drop.
  *
- * Controls (d-pad + one button is enough to play; hold is optional):
- *   left/right  move          up       rotate clockwise
- *   down        soft drop     confirm  hard drop
- *   alt         hold          pause    pause
+ * Controls, modern-Tetris style (requested from the cabinet, live):
+ *   left/right  move            confirm  rotate clockwise
+ *   back        rotate counter-clockwise
+ *   down        soft drop       up       hard drop (slam)
+ *   alt         hold/swap       pause    pause
  */
 
 var TETRIS = (function () {
@@ -3151,9 +3152,12 @@ var TETRIS = (function () {
     for (i = 0; i < stepsR; i++) if (tryMove(1, 0) && grounded) lockTimer = 0;
     if (stepsL || stepsR) Audio2.sfx('move');
 
-    if (Input.hit('up')) tryRotate(1);
+    /* Modern-Tetris mapping: rotation on the face buttons (both ways), the
+     * whole d-pad for movement, up as the slam. Requested at the cabinet. */
+    if (Input.hit('confirm')) tryRotate(1);
+    if (Input.hit('back')) tryRotate(-1);
     if (Input.hit('alt')) doHold();
-    if (Input.hit('confirm')) { hardDrop(); return; }
+    if (Input.hit('up')) { hardDrop(); return; }
 
     /* Soft drop. */
     var soft = dasD.step(Input.down('down'), dt);
@@ -3336,7 +3340,7 @@ var TETRIS = (function () {
     title: 'TETRIS',
     tag: 'Stack, clear, survive the climb',
     accent: ACCENT.tetris,
-    hint: '◀▶ MOVE · ▼ DROP · ▲ ROTATE · {A} SLAM · {X} HOLD',
+    hint: '◀▶ MOVE · ▼ SOFT · ▲ SLAM · {A} ROTATE · {X} HOLD',
     /**
      * Attract-mode pilot: slide toward the shallowest column and slam. Plays
      * like a distracted human, which is exactly what a demo should look like.
@@ -3355,7 +3359,7 @@ var TETRIS = (function () {
       }
       if (cur.x < bestCol - 1) out.right = true;
       else if (cur.x > bestCol) out.left = true;
-      else out.confirm = true;
+      else out.up = true;
       return out;
     },
 
@@ -3366,6 +3370,17 @@ var TETRIS = (function () {
     /* Exposed for the versus mode, which reuses this engine's rules. */
     _internals: {
       COLS: COLS, ROWS: ROWS, NAMES: NAMES, SHAPES: SHAPES, KICKS: KICKS,
+    },
+    /* Test seam: the control mapping is a contract with the cabinet. */
+    _test: {
+      cur: function () { return { type: cur.type, rot: cur.rot, x: cur.x, y: cur.y }; },
+      holdType: function () { return holdType; },
+      score: function () { return score; },
+      filled: function () {
+        var n = 0;
+        for (var i = 0; i < grid.length; i++) if (grid[i] !== 0) n++;
+        return n;
+      },
     },
   });
 })();
@@ -4003,6 +4018,15 @@ var SNAKE = (function () {
    * four flood fills run seven times a second, not sixty. */
   var stepSeq = 0;
   var demoSeq = -1, demoOut = {};
+  /*
+   * SMOOTH MOTION. The grid is the game; the eye gets a glide. Per step only
+   * two things actually move — the head extends into a new cell and the tail
+   * vacates one — so those two tiles are drawn at a position interpolated by
+   * the step timer, and every other segment stays put. Reported from the
+   * cabinet as "choppy": at 140ms per step the head visibly teleported.
+   */
+  var prevHead = -1;   /* cell the head occupied before the last step */
+  var poppedTail = -1; /* cell the tail vacated on the last step, -1 if grew */
   var score = 0, eaten = 0, over = false;
   var eatFlash = 0;
   var particles = makeParticles(48);
@@ -4053,6 +4077,7 @@ var SNAKE = (function () {
     gold = -1; goldTimer = 9000;
     stepMs = 140; acc = 0;
     stepSeq = 0; demoSeq = -1; demoOut = {};
+    prevHead = -1; poppedTail = -1;
     score = 0; eaten = 0; over = false;
     eatFlash = 0;
     particles.clear();
@@ -4118,6 +4143,8 @@ var SNAKE = (function () {
     if (queued.length) dir = queued.shift();
 
     var h = headCell();
+    prevHead = h;
+    poppedTail = -1;
     var nx = cx(h) + dir.x;
     var ny = cy(h) + dir.y;
     if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) { die(); return; }
@@ -4128,7 +4155,7 @@ var SNAKE = (function () {
     if (occupied[ni] && !(ni === tailCell && ni !== food && ni !== gold)) { die(); return; }
 
     var ate = (ni === food), ateGold = (ni === gold);
-    if (!ate && !ateGold) pop();
+    if (!ate && !ateGold) { poppedTail = body[tail]; pop(); }
 
     push(ni);
 
@@ -4195,10 +4222,11 @@ var SNAKE = (function () {
 
     /* Field. */
     panel(c, X0 - 8, Y0 - 8, COLS * CELL + 16, ROWS * CELL + 16, {
-      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.20), radius: 12,
+      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.45), radius: 12,
     });
 
-    c.globalAlpha = 0.045;
+    /* 0.045 was invisible on a real panel ("you can't see the board"). */
+    c.globalAlpha = 0.12;
     c.strokeStyle = COL.a1;
     c.lineWidth = 1;
     var i;
@@ -4223,6 +4251,17 @@ var SNAKE = (function () {
       tile(c, gxp, gyp, CELL, '#F0C64E', '#F7DE93', 'solid');
     }
 
+    /* Progress through the current grid step, for the glide. */
+    var p = over ? 1 : clamp(acc / stepMs, 0, 1);
+
+    /* The vacated tail cell, sliding out toward the current tail. */
+    if (poppedTail >= 0 && p < 1 && length > 0) {
+      var tc = body[tail];
+      var txp = X0 + lerp(cx(poppedTail), cx(tc), p) * CELL;
+      var typ = Y0 + lerp(cy(poppedTail), cy(tc), p) * CELL;
+      tile(c, txp, typ, CELL, ACCENT.snake, shade(ACCENT.snake, 0.20), 'solid');
+    }
+
     /* Body, tail-to-head so the head paints last. */
     var n = length;
     for (var k = 0; k < n; k++) {
@@ -4231,7 +4270,12 @@ var SNAKE = (function () {
       var f = n > 1 ? k / (n - 1) : 1;
       var base = isHead ? shade(ACCENT.snake, 0.30) : ACCENT.snake;
       var top = isHead ? shade(ACCENT.snake, 0.62) : shade(ACCENT.snake, 0.20 + f * 0.20);
-      var px = X0 + cx(ci) * CELL, py = Y0 + cy(ci) * CELL;
+      var gx2 = cx(ci), gy2 = cy(ci);
+      if (isHead && prevHead >= 0 && p < 1) {
+        gx2 = lerp(cx(prevHead), gx2, p);
+        gy2 = lerp(cy(prevHead), gy2, p);
+      }
+      var px = X0 + gx2 * CELL, py = Y0 + gy2 * CELL;
       if (isHead) Render.glow(c, px + CELL / 2, py + CELL / 2, CELL * 1.6, ACCENT.snake, 0.7);
       tile(c, px, py, CELL, base, top, (isHead && eatFlash > 0) ? 'flash' : 'solid');
     }
@@ -4336,6 +4380,16 @@ var SNAKE = (function () {
     update: update,
     draw: draw,
     preview: preview,
+    /** Test seam: the interpolation inputs the draw uses. */
+    _anim: function () {
+      return { p: clamp(acc / stepMs, 0, 1), prevHead: prevHead, poppedTail: poppedTail };
+    },
+    _test: {
+      head: function () { var h = headCell(); return { x: cx(h), y: cy(h) }; },
+      dir: function () { return { x: dir.x, y: dir.y }; },
+      setFood: function (x, y) { food = idx(x, y); },
+      eaten: function () { return eaten; },
+    },
   });
 })();
 
@@ -6397,9 +6451,10 @@ var VERSUS = (function () {
     }
     if (stepsL || stepsR) Audio2.sfx('move');
 
-    if (pad.hit('up')) tryRotate(b, 1);
+    if (pad.hit('confirm')) tryRotate(b, 1);
+    if (pad.hit('back')) tryRotate(b, -1);
 
-    if (pad.hit('confirm')) {
+    if (pad.hit('up')) {
       var target = ghostY(b);
       b.score += Math.max(0, target - b.cur.y) * 2;
       b.cur.y = target;
@@ -6687,7 +6742,7 @@ var VERSUS = (function () {
     title: 'VERSUS',
     tag: 'Two wells, one pile of garbage',
     accent: ACCENT.versus,
-    hint: 'TWO PADS · ▲ ROTATE · {A} SLAM',
+    hint: 'TWO PADS · {A} ROTATE · ▲ SLAM',
     start: start,
     update: update,
     draw: draw,

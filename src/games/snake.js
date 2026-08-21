@@ -31,6 +31,15 @@ var SNAKE = (function () {
    * four flood fills run seven times a second, not sixty. */
   var stepSeq = 0;
   var demoSeq = -1, demoOut = {};
+  /*
+   * SMOOTH MOTION. The grid is the game; the eye gets a glide. Per step only
+   * two things actually move — the head extends into a new cell and the tail
+   * vacates one — so those two tiles are drawn at a position interpolated by
+   * the step timer, and every other segment stays put. Reported from the
+   * cabinet as "choppy": at 140ms per step the head visibly teleported.
+   */
+  var prevHead = -1;   /* cell the head occupied before the last step */
+  var poppedTail = -1; /* cell the tail vacated on the last step, -1 if grew */
   var score = 0, eaten = 0, over = false;
   var eatFlash = 0;
   var particles = makeParticles(48);
@@ -81,6 +90,7 @@ var SNAKE = (function () {
     gold = -1; goldTimer = 9000;
     stepMs = 140; acc = 0;
     stepSeq = 0; demoSeq = -1; demoOut = {};
+    prevHead = -1; poppedTail = -1;
     score = 0; eaten = 0; over = false;
     eatFlash = 0;
     particles.clear();
@@ -146,6 +156,8 @@ var SNAKE = (function () {
     if (queued.length) dir = queued.shift();
 
     var h = headCell();
+    prevHead = h;
+    poppedTail = -1;
     var nx = cx(h) + dir.x;
     var ny = cy(h) + dir.y;
     if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) { die(); return; }
@@ -156,7 +168,7 @@ var SNAKE = (function () {
     if (occupied[ni] && !(ni === tailCell && ni !== food && ni !== gold)) { die(); return; }
 
     var ate = (ni === food), ateGold = (ni === gold);
-    if (!ate && !ateGold) pop();
+    if (!ate && !ateGold) { poppedTail = body[tail]; pop(); }
 
     push(ni);
 
@@ -223,10 +235,11 @@ var SNAKE = (function () {
 
     /* Field. */
     panel(c, X0 - 8, Y0 - 8, COLS * CELL + 16, ROWS * CELL + 16, {
-      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.20), radius: 12,
+      fill: 'rgba(8,6,18,0.5)', stroke: rgba(ACCENT.snake, 0.45), radius: 12,
     });
 
-    c.globalAlpha = 0.045;
+    /* 0.045 was invisible on a real panel ("you can't see the board"). */
+    c.globalAlpha = 0.12;
     c.strokeStyle = COL.a1;
     c.lineWidth = 1;
     var i;
@@ -251,6 +264,17 @@ var SNAKE = (function () {
       tile(c, gxp, gyp, CELL, '#F0C64E', '#F7DE93', 'solid');
     }
 
+    /* Progress through the current grid step, for the glide. */
+    var p = over ? 1 : clamp(acc / stepMs, 0, 1);
+
+    /* The vacated tail cell, sliding out toward the current tail. */
+    if (poppedTail >= 0 && p < 1 && length > 0) {
+      var tc = body[tail];
+      var txp = X0 + lerp(cx(poppedTail), cx(tc), p) * CELL;
+      var typ = Y0 + lerp(cy(poppedTail), cy(tc), p) * CELL;
+      tile(c, txp, typ, CELL, ACCENT.snake, shade(ACCENT.snake, 0.20), 'solid');
+    }
+
     /* Body, tail-to-head so the head paints last. */
     var n = length;
     for (var k = 0; k < n; k++) {
@@ -259,7 +283,12 @@ var SNAKE = (function () {
       var f = n > 1 ? k / (n - 1) : 1;
       var base = isHead ? shade(ACCENT.snake, 0.30) : ACCENT.snake;
       var top = isHead ? shade(ACCENT.snake, 0.62) : shade(ACCENT.snake, 0.20 + f * 0.20);
-      var px = X0 + cx(ci) * CELL, py = Y0 + cy(ci) * CELL;
+      var gx2 = cx(ci), gy2 = cy(ci);
+      if (isHead && prevHead >= 0 && p < 1) {
+        gx2 = lerp(cx(prevHead), gx2, p);
+        gy2 = lerp(cy(prevHead), gy2, p);
+      }
+      var px = X0 + gx2 * CELL, py = Y0 + gy2 * CELL;
       if (isHead) Render.glow(c, px + CELL / 2, py + CELL / 2, CELL * 1.6, ACCENT.snake, 0.7);
       tile(c, px, py, CELL, base, top, (isHead && eatFlash > 0) ? 'flash' : 'solid');
     }
@@ -364,5 +393,15 @@ var SNAKE = (function () {
     update: update,
     draw: draw,
     preview: preview,
+    /** Test seam: the interpolation inputs the draw uses. */
+    _anim: function () {
+      return { p: clamp(acc / stepMs, 0, 1), prevHead: prevHead, poppedTail: poppedTail };
+    },
+    _test: {
+      head: function () { var h = headCell(); return { x: cx(h), y: cy(h) }; },
+      dir: function () { return { x: dir.x, y: dir.y }; },
+      setFood: function (x, y) { food = idx(x, y); },
+      eaten: function () { return eaten; },
+    },
   });
 })();

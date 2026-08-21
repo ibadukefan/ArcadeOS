@@ -269,9 +269,10 @@ var VERSUS = (function () {
     }
     if (stepsL || stepsR) Audio2.sfx('move');
 
-    if (pad.hit('up')) tryRotate(b, 1);
+    if (pad.hit('confirm')) tryRotate(b, 1);
+    if (pad.hit('back')) tryRotate(b, -1);
 
-    if (pad.hit('confirm')) {
+    if (pad.hit('up')) {
       var target = ghostY(b);
       b.score += Math.max(0, target - b.cur.y) * 2;
       b.cur.y = target;
@@ -559,7 +560,7 @@ var VERSUS = (function () {
     title: 'VERSUS',
     tag: 'Two wells, one pile of garbage',
     accent: ACCENT.versus,
-    hint: 'TWO PADS · ▲ ROTATE · {A} SLAM',
+    hint: 'TWO PADS · {A} ROTATE · ▲ SLAM',
     start: start,
     update: update,
     draw: draw,
