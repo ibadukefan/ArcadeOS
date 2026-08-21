@@ -79,6 +79,14 @@ TOKEN = ""
 # Hosts we will answer to. Anything else is a rebinding attempt.
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
 
+# Software updates. The agent only ever runs this one fixed script — nothing
+# about the request chooses what executes — and runs it as a detached systemd
+# unit so a slow git fetch can never wedge the agent. The script reports its
+# progress into STATUS_FILE, which GET /update/status relays to the front end.
+UPDATE_SCRIPT = "/opt/arcadeos/arcadeos-update.sh"
+UPDATE_STATUS_FILE = "/var/lib/arcadeos/update-status.json"
+UPDATE_UNIT = "arcadeos-update"
+
 # Control characters are stripped from anything that reaches the journal: a
 # log line carrying ANSI escapes can clear or recolour the terminal of whoever
 # is reading `journalctl`, which is a cheap way to hide or fake a message.
@@ -108,6 +116,70 @@ def load_token():
 def clean_text(text, limit=500):
     """Make caller-supplied text safe to print into the journal."""
     return CONTROL_CHARS.sub(" ", str(text))[:limit]
+
+
+def read_update_status():
+    """Parse the status file the updater writes. None when absent or bad."""
+    try:
+        with open(UPDATE_STATUS_FILE, "r") as fh:
+            raw = fh.read(4096)
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def update_running():
+    """True while the update unit is active — refuses double-starts."""
+    binary = shutil.which("systemctl")
+    if not binary:
+        return False
+    try:
+        rc = subprocess.call(
+            [binary, "is-active", "--quiet", UPDATE_UNIT + ".service"],
+            timeout=5,
+        )
+        return rc == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def start_update():
+    """
+    Launch the updater detached. systemd-run gives it its own unit, so it
+    survives an agent restart (the updater restarts services, including this
+    one) and its logs land in the journal under its own name.
+    """
+    if not os.path.isfile(UPDATE_SCRIPT) or not os.access(UPDATE_SCRIPT, os.X_OK):
+        return False, "updater not installed"
+    if update_running():
+        return True, "already running"
+    try:
+        os.makedirs(os.path.dirname(UPDATE_STATUS_FILE), exist_ok=True)
+        with open(UPDATE_STATUS_FILE, "w") as fh:
+            json.dump({"phase": "starting", "msg": "starting", "done": False,
+                       "updated": False, "error": ""}, fh)
+    except OSError:
+        pass
+    runner = shutil.which("systemd-run")
+    try:
+        if runner:
+            # systemd-run returns as soon as the unit is queued, so waiting on
+            # it is cheap — and its exit code is the only way to notice that
+            # systemd rejected the launch (e.g. running outside systemd).
+            rc = subprocess.call(
+                [runner, "--unit=" + UPDATE_UNIT, "--collect", UPDATE_SCRIPT],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            if rc == 0:
+                return True, "started"
+            log("systemd-run failed (rc=%d); running updater directly" % rc)
+        # Development fallback: detach by session so we never wait on it.
+        subprocess.Popen([UPDATE_SCRIPT], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True, "started"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "could not start updater: %s" % exc
 
 
 class Liveness:
@@ -323,6 +395,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log("refused status: %s" % why)
             self._reply(403, {"ok": False, "error": "forbidden"})
             return
+        if self._command() == "update/status":
+            state = read_update_status()
+            if state is None:
+                self._reply(200, {"phase": "idle", "msg": "no update has run",
+                                  "done": False, "updated": False, "error": ""})
+            else:
+                self._reply(200, state)
+            return
         if self._command() in ("", "status", "health"):
             state = LIVENESS.snapshot()
             self._reply(200, {
@@ -369,6 +449,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # terminal of whoever runs `journalctl`.
             log("frontend: %s" % clean_text(self._body()))
             self._reply(200, {"ok": True})
+            return
+
+        if command == "update":
+            ok2, why2 = start_update()
+            if ok2:
+                log("accepted update (%s)" % why2)
+                self._reply(200, {"ok": True, "command": "update", "state": why2})
+            else:
+                log("refused update: %s" % why2)
+                self._reply(503, {"ok": False, "error": why2})
             return
 
         if command in COMMANDS:

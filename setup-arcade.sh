@@ -337,6 +337,29 @@ install_page() {
   info "installed arcade.html (token bound)"
 }
 
+# Record where this cabinet was installed from, so SOFTWARE UPDATE on the
+# dashboard can pull the same branch later without anyone at a keyboard.
+# Best effort: a cabinet installed from a tarball simply has no self-update,
+# and the update screen says so instead of failing cryptically.
+write_update_conf() {
+  local branch remote
+  if git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    branch="$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+    remote="$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)"
+    cat > "$CONF_DIR/update.conf" <<CONF
+# Written by setup-arcade.sh — where SOFTWARE UPDATE pulls from.
+SRC_DIR=$SRC_DIR
+GIT_BRANCH=$branch
+GIT_REMOTE=$remote
+CONF
+    chmod 0644 "$CONF_DIR/update.conf"
+    info "updates will pull $branch from this checkout"
+  else
+    rm -f "$CONF_DIR/update.conf"
+    warn "not a git checkout — on-cabinet SOFTWARE UPDATE will be unavailable"
+  fi
+}
+
 install_app() {
   step "Installing ArcadeOS to ${APP_DIR}"
 
@@ -350,6 +373,7 @@ install_app() {
 
   install -d -m 0755 "$APP_DIR"
   install_page
+  write_update_conf
   install -d -m 0755 "$DATA_DIR"
   chown -R "$ARCADE_USER":"$ARCADE_USER" "$DATA_DIR"
 
@@ -419,6 +443,7 @@ LAUNCH
   chmod 0755 "$APP_DIR/launch.sh"
 
   install -m 0755 "$SRC_DIR/pi/arcadeos-agent.py" "$APP_DIR/arcadeos-agent.py"
+  install -m 0755 "$SRC_DIR/pi/arcadeos-update.sh" "$APP_DIR/arcadeos-update.sh"
   install -m 0755 "$SRC_DIR/pi/arcadeos-gpio.py" "$APP_DIR/arcadeos-gpio.py"
   install -m 0755 "$SRC_DIR/pi/make-splash.py" "$APP_DIR/make-splash.py"
 }

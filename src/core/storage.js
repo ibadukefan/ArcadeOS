@@ -208,6 +208,9 @@ var SETTINGS_DEFAULTS = {
   /* Low-latency (desynchronized) canvas. On by default because it is the
    * biggest single latency win; a setting because a few drivers tear. */
   lowLatency: true,
+  /* Gamepad haptics. Separate from reducedMotion: rumble is touch, not
+   * motion, and someone sensitive to screen shake may still want it. */
+  rumble: true,
 };
 
 var Settings = (function () {
@@ -226,6 +229,7 @@ var Settings = (function () {
     out.reducedMotion = raw.reducedMotion === true;
     out.showFps = raw.showFps === true;
     out.lowLatency = raw.lowLatency !== false;
+    out.rumble = raw.rumble !== false;
     return out;
   }
 

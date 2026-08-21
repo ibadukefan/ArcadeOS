@@ -191,6 +191,11 @@ var PULSE = (function () {
        * making the first minute irrelevant. */
       var mult = 1 + Math.min(3, Math.floor(combo / 12));
       score += JUDGE_SCORE[j] * mult;
+      Audio2.sfx('note', j);
+      if (combo > 0 && combo % 25 === 0) {
+        Audio2.sfx('powerup');
+        Input.rumble(0.3, 0.4, 110);
+      }
       laneFlash[n.lane] = 220;
       particles.burst(laneX(n.lane) + LANE_W / 2, HIT_Y, j === 0 ? 12 : 6,
         LANE_COL[n.lane], { speed: 0.22, life: 380, size: 4 });
@@ -203,6 +208,7 @@ var PULSE = (function () {
     if (health <= 0 && !over) {
       over = true;
       Audio2.sfx('over');
+      Input.rumble(0.9, 0.7, 300);
       Shell.gameOver(score);
     }
   }

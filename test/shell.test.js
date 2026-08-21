@@ -185,6 +185,13 @@ describe('high score screen', () => {
 });
 
 describe('settings', () => {
+  /** Cursor position of a settings row by id — indexes shift as rows grow. */
+  function rowIndex(env, id) {
+    const items = env.api().Shell._settingsItems();
+    for (let i = 0; i < items.length; i++) if (items[i].id === id) return i;
+    throw new Error('no settings row: ' + id);
+  }
+
   function openSettings(env) {
     const { Shell } = env.api();
     bootToMenu(env);
@@ -215,7 +222,7 @@ describe('settings', () => {
     const env = makeEnv();
     const { Settings, Shell } = env.api();
     openSettings(env);
-    Shell._setCursor(0);              /* volume row */
+    Shell._setCursor(rowIndex(env, 'volume'));
     const before = Settings.get('volume');
     tap(env, 'ArrowLeft', 3);
     const after = Settings.get('volume');
@@ -232,8 +239,8 @@ describe('settings', () => {
     const env = makeEnv();
     const { Settings, Shell } = env.api();
     openSettings(env);
-    for (const [index, key] of [[1, 'muted'], [3, 'crt'], [4, 'reducedMotion']]) {
-      Shell._setCursor(index);
+    for (const key of ['muted', 'crt', 'reducedMotion', 'rumble']) {
+      Shell._setCursor(rowIndex(env, key));
       const before = Settings.get(key);
       tap(env, 'Enter');
       assert.equal(Settings.get(key), !before, `${key} toggled`);
@@ -244,7 +251,7 @@ describe('settings', () => {
     const env = makeEnv();
     const { Settings, Shell } = env.api();
     openSettings(env);
-    Shell._setCursor(2);
+    Shell._setCursor(rowIndex(env, 'layout'));
     const seen = new Set();
     for (let i = 0; i < 5; i++) {
       seen.add(Settings.get('layout'));
@@ -253,7 +260,9 @@ describe('settings', () => {
     assert.deep([...seen].sort(), ['auto', 'nintendo', 'playstation', 'xbox']);
   });
 
-  it('reduced motion suppresses rumble', () => {
+  it('the rumble toggle suppresses haptics; reduced motion does not', () => {
+    /* Haptics moved to their own switch: rumble is touch, not motion, and a
+     * player sensitive to screen shake may still want it. */
     const pad = makePad(PAD_IDS.xbox, { rumble: true });
     let effects = 0;
     pad.vibrationActuator = { playEffect: () => { effects++; return Promise.resolve(); } };
@@ -266,7 +275,11 @@ describe('settings', () => {
 
     Settings.set('reducedMotion', true);
     Input.rumble(0.5, 0.5, 100);
-    assert.equal(effects, 1, 'reduced motion suppresses rumble');
+    assert.equal(effects, 2, 'reduced motion leaves haptics alone');
+
+    Settings.set('rumble', false);
+    Input.rumble(0.5, 0.5, 100);
+    assert.equal(effects, 2, 'the rumble toggle turns them off');
   });
 
   it('resets high scores only after an explicit confirm', () => {
@@ -434,7 +447,10 @@ describe('gamepad-only reachability', () => {
     /* Reach the shutdown entry and back out again — all on the pad. */
     const items = Shell._settingsItems();
     const shutdownIndex = items.findIndex((i) => i.id === 'shutdown');
-    padTap(env, pad, 13, shutdownIndex);
+    /* Headers are skipped by the cursor, so count selectable rows only. */
+    const downs = items.slice(0, shutdownIndex + 1)
+      .filter((i) => i.type !== 'header').length - 1;
+    padTap(env, pad, 13, downs);
     padTap(env, pad, 0);
     assert.ok(Shell._confirm(), 'shutdown is reachable on the pad alone');
     padTap(env, pad, 1);                       /* B cancels */

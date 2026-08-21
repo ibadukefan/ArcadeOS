@@ -108,6 +108,7 @@ var DROP = (function () {
       grid[idx(piece.col, r)] = piece.gems[i] + 1;
     }
     Audio2.sfx('lock');
+    Input.rumble(0.2, 0.15, 50);
     chain = 0;
     phase = 'resolve';
     settleTimer = 0;

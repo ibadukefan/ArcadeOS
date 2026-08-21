@@ -107,6 +107,10 @@ var VERSUS = (function () {
     doneT = 0;
     Audio2.sfx('over');
     Input.rumble(0.9, 0.7, 400, b.p);
+    if (winner >= 0) {
+      Audio2.sfx('highscore');
+      Input.rumble(0.4, 0.6, 260, winner);
+    }
   }
 
   function ghostY(b) {

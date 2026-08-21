@@ -210,6 +210,17 @@ var Audio2 = (function () {
         tone({ freq: seq[i], dur: 0.18, type: 'square', gain: 0.11, when: i * 0.11 });
       }
     },
+    /**
+     * Rhythm-game note hit, pitched by judgement (0 perfect .. 2 good) so the
+     * quality of a hit is audible without reading the screen.
+     */
+    note: function (j) {
+      var q = clamp(num(j, 0), 0, 2);
+      var base = [1047, 784, 587][q];
+      tone({ freq: base, dur: 0.05, type: 'triangle', gain: 0.10 });
+      if (q === 0) tone({ freq: base * 1.5, dur: 0.07, type: 'triangle', gain: 0.07, when: 0.03 });
+    },
+    crumble: function () { noise({ freq: 700, freq2: 120, dur: 0.16, gain: 0.11, q: 0.7 }); },
     start: function () {
       tone({ freq: 330, freq2: 660, dur: 0.18, type: 'triangle', gain: 0.13 });
       tone({ freq: 660, freq2: 990, dur: 0.22, type: 'square', gain: 0.08, when: 0.10 });

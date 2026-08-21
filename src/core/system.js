@@ -62,6 +62,20 @@ var System = (function () {
     return out;
   }
 
+  function getJson(path, onDone) {
+    var done = function (ok, value) {
+      if (onDone) { try { onDone(ok, value); } catch (e) { /* ignore */ } }
+    };
+    if (typeof fetch !== 'function') { done(false, null); return; }
+    try {
+      fetch(ENDPOINT + path, { cache: 'no-store' }).then(function (res) {
+        if (!res || !res.ok) { done(false, null); return; }
+        res.json().then(function (body) { done(true, body); },
+          function () { done(false, null); });
+      }, function () { done(false, null); });
+    } catch (e) { done(false, null); }
+  }
+
   function send(command, onDone) {
     lastResult = 'pending';
     var done = function (ok, detail) {
@@ -138,12 +152,30 @@ var System = (function () {
     log: log,
     heartbeat: heartbeat,
     HEARTBEAT_MS: HEARTBEAT_MS,
-    /** command: 'shutdown' | 'restart' | 'pair' */
+    /** command: 'shutdown' | 'restart' | 'pair' | 'update' */
     request: function (command, onDone) {
-      if (command !== 'shutdown' && command !== 'restart' && command !== 'pair') return;
+      if (command !== 'shutdown' && command !== 'restart' &&
+        command !== 'pair' && command !== 'update') {
+        return;
+      }
+      if (typeof fetch !== 'function' && onDone) { onDone(false, 'no fetch'); return; }
       send(command, onDone);
     },
     pair: function (onDone) { send('pair', onDone); },
+    /**
+     * Read the update status file the updater script writes, relayed by the
+     * agent. Read-only, so like GET / it needs no token — the same curl that
+     * checks agent health can watch an update.
+     */
+    updateStatus: function (onDone) {
+      getJson('update/status', onDone);
+    },
+
+    /** Agent health, for the ABOUT screen. */
+    status: function (onDone) {
+      getJson('', onDone);
+    },
+
     endpoint: function () { return ENDPOINT; },
     lastResult: function () { return lastResult; },
     /** Test seam: has a cabinet token been baked in? Never returns the value. */

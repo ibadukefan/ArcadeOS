@@ -90,6 +90,7 @@ var STACK = (function () {
       streak = 0;
       score += 10;
       Audio2.sfx('lock');
+      Input.rumble(0.3, 0.2, 60);
       /* Shear the overhang and let it tumble. */
       if (cur.x < l) shed(cur.x, l - cur.x, cur.k, -1);
       if (cur.x + cur.w > r) shed(r, cur.x + cur.w - r, cur.k, 1);

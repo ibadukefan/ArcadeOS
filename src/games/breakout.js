@@ -132,6 +132,7 @@ var BREAKOUT = (function () {
       score += 50 + (ROWS - r) * 10 + (level - 1) * 5;
       particles.burst(bx, by, 8, col, { speed: 0.24, life: 420, size: 4 });
       Audio2.sfx('hit');
+      Input.rumble(0.2, 0.15, 35);
       /* One brick in twelve carries something. */
       if (rndInt(1, 12) === 1) {
         var d = drops.spawn();
@@ -215,6 +216,7 @@ var BREAKOUT = (function () {
       paddle.w = Math.min(PADDLE_W * 1.8, paddle.w * 1.35);
       paddle.wide = 12000;
       Audio2.sfx('powerup');
+      Input.rumble(0.35, 0.45, 110);
     } else if (kind === 1) {
       /* Split every live ball once. */
       var spawned = [];
@@ -230,9 +232,11 @@ var BREAKOUT = (function () {
         spawned.push(n);
       });
       Audio2.sfx('powerup');
+      Input.rumble(0.35, 0.45, 110);
     } else {
       lives++;
       Audio2.sfx('coin');
+      Input.rumble(0.2, 0.3, 80);
     }
     flashT = 200;
   }

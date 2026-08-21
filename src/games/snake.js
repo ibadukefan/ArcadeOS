@@ -167,6 +167,7 @@ var SNAKE = (function () {
       stepMs = Math.max(60, 140 - eaten * 2.2);
       eatFlash = 140;
       Audio2.sfx('eat');
+      Input.rumble(0.15, 0.25, 45);
       particles.burst(X0 + nx * CELL + CELL / 2, Y0 + ny * CELL + CELL / 2,
         8, ACCENT.snake, { speed: 0.2, life: 340, size: 4 });
       if (food < 0) { die(); return; }   /* board full: a perfect game */

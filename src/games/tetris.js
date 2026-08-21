@@ -223,6 +223,7 @@ var TETRIS = (function () {
       }
     } else {
       Audio2.sfx('lock');
+      Input.rumble(0.2, 0.15, 50);
       pullNext();
     }
   }

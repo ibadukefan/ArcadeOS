@@ -45,6 +45,25 @@ var Shell = (function () {
   var overCursor = 0;
   var scoresGame = 0;
   var setCursor = 0;
+  var setScroll = 0, setScrollT = 0;
+  /*
+   * Where BACK goes. Screens push where they came from, so DIAGNOSTICS opened
+   * from SETTINGS returns to SETTINGS, and a future screen opened from
+   * somewhere else returns there — no hardcoded return targets.
+   */
+  var navStack = [];
+  /*
+   * Hold-to-home. START taps keep their local meaning (pause in game, resume
+   * in pause); holding it for HOME_HOLD_MS from anywhere returns to the
+   * dashboard. This is the one navigation rule that works in every state, so
+   * a player can never be stranded.
+   */
+  var HOME_HOLD_MS = 900;
+  var homeHold = 0, homeArmed = true;
+  /* Software update screen state. The agent does the work; this reflects it. */
+  var upd = { phase: 'idle', cursor: 0, poll: 0, status: null, error: '' };
+  /* About screen: last agent status reply, null until asked. */
+  var aboutAgent = null;
   var confirmBox = null;      /* {text, onYes, cursor} */
   var toast = null;           /* {text, life} */
   var lastPadsVersion = -1;
@@ -143,6 +162,41 @@ var Shell = (function () {
     Input.flush();
   }
 
+  function navPush(next) { navStack.push(state); go(next); }
+
+  function navBack() { go(navStack.length ? navStack.pop() : 'menu'); }
+
+  /** The one exit that always works. Clears everything modal on the way out. */
+  function goHome() {
+    if (state === 'attract') leaveAttract();
+    activeGame = null;
+    confirmBox = null;
+    navStack.length = 0;
+    go('menu');
+    Audio2.sfx('back');
+    say('DASHBOARD');
+  }
+
+  /**
+   * Track the START hold. Runs every frame in every state except boot, ahead
+   * of the per-state handlers, so nothing can swallow it.
+   */
+  function homeUpdate(dt) {
+    if (state === 'boot') { homeHold = 0; homeArmed = true; return; }
+    if (Input.down('pause')) {
+      if (!homeArmed) return;
+      homeHold += dt;
+      if (homeHold >= HOME_HOLD_MS) {
+        homeArmed = false;
+        homeHold = 0;
+        if (state !== 'menu') goHome();
+      }
+    } else {
+      homeHold = 0;
+      homeArmed = true;
+    }
+  }
+
   function say(msg) { toast = { text: String(msg), life: 2600 }; }
 
   /**
@@ -226,8 +280,11 @@ var Shell = (function () {
       var e = currentEntry();
       if (!e) return;
       if (e.kind === 'game') startGame(e.game, e.versus);
-      else if (e.id === 'scores') { scoresGame = 0; go('scores'); Audio2.sfx('select'); }
-      else if (e.id === 'settings') { setCursor = 0; go('settings'); Audio2.sfx('select'); }
+      else if (e.id === 'scores') { scoresGame = 0; navPush('scores'); Audio2.sfx('select'); }
+      else if (e.id === 'settings') {
+        setCursor = 0; setScroll = 0; setScrollT = 0;
+        navPush('settings'); Audio2.sfx('select');
+      }
     }
 
     scrollY = approach(scrollY, scrollTarget, 14, dt);
@@ -358,24 +415,64 @@ var Shell = (function () {
   function settingsItems() {
     var s = Settings.all();
     return [
+      { type: 'header', label: 'AUDIO & FEEDBACK' },
       { id: 'volume', label: 'VOLUME', type: 'range',
         value: Math.round(s.volume * 100) + '%' },
       { id: 'muted', label: 'MUTE', type: 'toggle', on: s.muted },
-      { id: 'layout', label: 'CONTROLLER', type: 'choice',
-        value: layoutLabel(s.layout) },
+      { id: 'rumble', label: 'CONTROLLER RUMBLE', type: 'toggle', on: s.rumble },
+      { type: 'header', label: 'DISPLAY' },
       { id: 'crt', label: 'CRT VEIL', type: 'toggle', on: s.crt },
       { id: 'reducedMotion', label: 'REDUCED MOTION', type: 'toggle', on: s.reducedMotion },
       { id: 'showFps', label: 'FRAME TIMER', type: 'toggle', on: s.showFps },
       { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
+      { type: 'header', label: 'CONTROLS' },
+      { id: 'layout', label: 'CONTROLLER', type: 'choice',
+        value: layoutLabel(s.layout) },
       { id: 'pairing', label: 'PAIR BLUETOOTH PAD', type: 'action' },
+      { type: 'header', label: 'SYSTEM' },
+      { id: 'update', label: 'SOFTWARE UPDATE', type: 'action', value: 'V' + VERSION_STR },
+      { id: 'about', label: 'ABOUT THIS CABINET', type: 'action' },
       { id: 'faults', label: 'DIAGNOSTICS', type: 'action',
         value: Faults.count() ? Faults.count() + ' FAULT' + (Faults.count() === 1 ? '' : 'S') : 'NONE',
         warn: Faults.count() > 0 },
       { id: 'reset', label: 'RESET HIGH SCORES', type: 'action', danger: true },
+      { id: 'resetSettings', label: 'RESET ALL SETTINGS', type: 'action', danger: true },
       { id: 'restart', label: 'RESTART', type: 'action', danger: true },
       { id: 'shutdown', label: 'SHUT DOWN', type: 'action', danger: true },
       { id: 'back', label: 'BACK', type: 'action' },
     ];
+  }
+
+  var VERSION_STR = '1.0.0';
+
+  function buildId() {
+    try {
+      var b = (typeof window !== 'undefined') && window.ARCADEOS_BUILD;
+      return typeof b === 'string' ? b : 'DEV';
+    } catch (e) { return 'DEV'; }
+  }
+
+  /* Row layout for the settings list: headers are shorter than rows, and the
+   * list is taller than the screen now, so it scrolls like the dashboard. */
+  var SET_ROW_H = 84, SET_HEADER_H = 56, SET_TOP = 250, SET_BOT = SH - 120;
+
+  function settingsLayout(items) {
+    var ys = [], y = 0;
+    for (var i = 0; i < items.length; i++) {
+      ys.push(y);
+      y += items[i].type === 'header' ? SET_HEADER_H : SET_ROW_H;
+    }
+    return { ys: ys, total: y };
+  }
+
+  function settingsEnsureVisible(items) {
+    var lay = settingsLayout(items);
+    var viewH = SET_BOT - SET_TOP;
+    var top = lay.ys[setCursor];
+    var h = items[setCursor].type === 'header' ? SET_HEADER_H : SET_ROW_H;
+    if (top < setScrollT) setScrollT = top;
+    else if (top + h > setScrollT + viewH) setScrollT = top + h - viewH;
+    setScrollT = clamp(setScrollT, 0, Math.max(0, lay.total - viewH));
   }
 
   function layoutLabel(v) {
@@ -391,11 +488,21 @@ var Shell = (function () {
     if (confirmBox) { confirmUpdate(dt); return; }
 
     var items = settingsItems();
+    /* Never rest on a header — they are labels, not rows. */
+    while (items[setCursor] && items[setCursor].type === 'header') {
+      setCursor = (setCursor + 1) % items.length;
+    }
     var steps = Input.repCount('down') - Input.repCount('up');
     if (steps) {
-      setCursor = (setCursor + steps + items.length * 8) % items.length;
+      var dir = steps > 0 ? 1 : -1;
+      for (var m = Math.abs(steps); m > 0; m--) {
+        do { setCursor = (setCursor + dir + items.length) % items.length; }
+        while (items[setCursor].type === 'header');
+      }
       Audio2.sfx('move');
+      settingsEnsureVisible(items);
     }
+    setScroll = approach(setScroll, setScrollT, 14, dt);
 
     var it = items[setCursor];
     var h = Input.repCount('right') - Input.repCount('left');
@@ -415,7 +522,7 @@ var Shell = (function () {
     }
 
     if (Input.hit('confirm')) activate(it);
-    if (Input.hit('back')) { go('menu'); Audio2.sfx('back'); }
+    if (Input.hit('back')) { navBack(); Audio2.sfx('back'); }
   }
 
   function activate(it) {
@@ -431,8 +538,17 @@ var Shell = (function () {
       Audio2.sfx('select');
       return;
     }
-    if (it.id === 'back') { go('menu'); Audio2.sfx('back'); return; }
-    if (it.id === 'faults') { go('faults'); Audio2.sfx('select'); return; }
+    if (it.id === 'back') { navBack(); Audio2.sfx('back'); return; }
+    if (it.id === 'faults') { navPush('faults'); Audio2.sfx('select'); return; }
+    if (it.id === 'update') { updOpen(); return; }
+    if (it.id === 'about') { aboutOpen(); return; }
+    if (it.id === 'resetSettings') {
+      ask('RESET ALL SETTINGS TO DEFAULTS?', function () {
+        Settings.reset();
+        say('SETTINGS RESTORED TO DEFAULTS');
+      });
+      return;
+    }
     if (it.id === 'reset') {
       ask('ERASE ALL HIGH SCORES?', function () {
         Scores.reset();
@@ -486,7 +602,7 @@ var Shell = (function () {
 
   function faultsUpdate(dt) {
     if (confirmBox) { confirmUpdate(dt); return; }
-    if (Input.hit('back')) { go('settings'); Audio2.sfx('back'); return; }
+    if (Input.hit('back')) { navBack(); Audio2.sfx('back'); return; }
     if (Input.hit('confirm') && Faults.count()) {
       ask('CLEAR THE FAULT LOG?', function () {
         Faults.clear();
@@ -580,7 +696,7 @@ var Shell = (function () {
       scoresGame = (scoresGame + v + GAMES.length * 8) % GAMES.length;
       Audio2.sfx('move');
     }
-    if (Input.hit('back') || Input.hit('confirm')) { go('menu'); Audio2.sfx('back'); }
+    if (Input.hit('back') || Input.hit('confirm')) { navBack(); Audio2.sfx('back'); }
   }
 
   /* --------------------------------------------------------- attract --- */
@@ -645,6 +761,94 @@ var Shell = (function () {
     idleT = 0;
   }
 
+  /* ------------------------------------------------- software update --- */
+
+  /*
+   * The update screen is a thin window onto work the agent does. Pressing
+   * CHECK FOR UPDATES POSTs /update; the agent launches the updater script as
+   * a detached unit and this screen polls GET /update/status once a second to
+   * render whatever the script reports. If the update replaces the bundle,
+   * the script restarts the kiosk and this page simply gets reloaded — the
+   * screen never needs to orchestrate anything itself.
+   */
+  function updOpen() {
+    upd.phase = 'idle';
+    upd.cursor = 0;
+    upd.poll = 0;
+    upd.status = null;
+    upd.error = '';
+    navPush('update');
+    Audio2.sfx('select');
+  }
+
+  function updStart() {
+    upd.phase = 'starting';
+    upd.status = null;
+    upd.error = '';
+    System.request('update', function (ok, detail) {
+      if (upd.phase !== 'starting') return;   /* screen was left meanwhile */
+      if (ok) { upd.phase = 'running'; upd.poll = 800; return; }
+      upd.phase = 'error';
+      upd.error = (detail === 'no fetch')
+        ? 'UPDATES NEED THE INSTALLED CABINET BUILD'
+        : 'CANNOT REACH THE UPDATE AGENT';
+    });
+  }
+
+  function updateScreenUpdate(dt) {
+    if (upd.phase === 'starting' || upd.phase === 'running') {
+      upd.poll += dt;
+      if (upd.phase === 'running' && upd.poll >= 1000) {
+        upd.poll = 0;
+        System.updateStatus(function (ok, st) {
+          if (!ok || !st || upd.phase !== 'running') return;
+          upd.status = st;
+          if (st.error) { upd.phase = 'error'; upd.error = String(st.error).toUpperCase(); }
+          else if (st.done) { upd.phase = 'done'; upd.cursor = 0; Audio2.sfx(st.updated ? 'powerup' : 'select'); }
+        });
+      }
+      /* BACK leaves the screen; the update keeps running on the agent side. */
+      if (Input.hit('back')) { navBack(); Audio2.sfx('back'); }
+      return;
+    }
+
+    /* idle / error / done: a small vertical menu. */
+    var items = updItems();
+    var steps = Input.repCount('down') - Input.repCount('up');
+    if (steps) {
+      upd.cursor = (upd.cursor + steps + items.length * 8) % items.length;
+      Audio2.sfx('move');
+    }
+    if (Input.hit('confirm')) {
+      var it = items[upd.cursor];
+      if (it === 'CHECK FOR UPDATES' || it === 'TRY AGAIN') { updStart(); Audio2.sfx('select'); }
+      else { navBack(); Audio2.sfx('back'); }
+    }
+    if (Input.hit('back')) { navBack(); Audio2.sfx('back'); }
+  }
+
+  function updItems() {
+    if (upd.phase === 'error') return ['TRY AGAIN', 'BACK'];
+    if (upd.phase === 'done') return ['BACK'];
+    return ['CHECK FOR UPDATES', 'BACK'];
+  }
+
+  /* ------------------------------------------------------------ about --- */
+
+  function aboutOpen() {
+    aboutAgent = null;
+    /* Best-effort: a dev build without fetch just shows NOT AVAILABLE. */
+    if (System.status) {
+      System.status(function (ok, st) { aboutAgent = ok && st ? st : { ok: false }; });
+    }
+    navPush('about');
+    Audio2.sfx('select');
+  }
+
+  function aboutUpdate(dt) {
+    if (Input.hit('back') || Input.hit('confirm')) { navBack(); Audio2.sfx('back'); }
+  }
+
   /* ------------------------------------------------------------ frame --- */
 
   function update(dt) {
@@ -679,6 +883,8 @@ var Shell = (function () {
       lastPadsVersion = pv;
     }
 
+    homeUpdate(dt);
+
     /* Idle tracking for attract mode: only the dashboard idles. */
     if (state === 'menu') {
       if (Input.consumeActivity()) idleT = 0;
@@ -699,6 +905,8 @@ var Shell = (function () {
       case 'settings': settingsUpdate(dt); break;
       case 'scores': scoresUpdate(dt); break;
       case 'faults': faultsUpdate(dt); break;
+      case 'update': updateScreenUpdate(dt); break;
+      case 'about': aboutUpdate(dt); break;
       case 'attract': attractUpdate(dt); break;
     }
   }
@@ -726,10 +934,13 @@ var Shell = (function () {
       case 'settings': drawSettings(c); break;
       case 'scores': drawScores(c); break;
       case 'faults': drawFaults(c); break;
+      case 'update': drawUpdate(c); break;
+      case 'about': drawAbout(c); break;
       case 'attract': drawAttract(c); break;
     }
 
     drawFrameTimer(c);
+    drawHomeHold(c);
     drawToast(c);
 
     if (fade > 0) {
@@ -1127,23 +1338,44 @@ var Shell = (function () {
     });
 
     var items = settingsItems();
+    var lay = settingsLayout(items);
     var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
-    var y0 = 250, rowH = 92;
+
+    c.save();
+    c.beginPath();
+    c.rect(0, SET_TOP - 10, SW, (SET_BOT - SET_TOP) + 20);
+    c.clip();
 
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      var y = y0 + i * rowH;
+      var y = SET_TOP + lay.ys[i] - setScroll;
+      var rh = it.type === 'header' ? SET_HEADER_H : SET_ROW_H;
+      if (y + rh < SET_TOP - 20 || y > SET_BOT + 20) continue;
+
+      if (it.type === 'header') {
+        text(c, it.label, x + 6, y + rh - 18, {
+          size: 15, weight: '700', track: 6, color: rgba(COL.a2, 0.75),
+        });
+        c.strokeStyle = rgba(COL.a2, 0.22);
+        c.lineWidth = 1;
+        c.beginPath();
+        c.moveTo(x + 6, y + rh - 8);
+        c.lineTo(x + w - 6, y + rh - 8);
+        c.stroke();
+        continue;
+      }
+
       var sel = (i === setCursor);
       if (sel) {
-        panel(c, x, y, w, rowH - 12, {
+        panel(c, x, y, w, rh - 12, {
           fill: 'rgba(30,24,62,.72)',
           stroke: rgba(it.danger ? COL.bad : COL.a2, 0.5), lineWidth: 2,
         });
       } else {
-        panel(c, x, y, w, rowH - 12, { fill: COL.card, stroke: COL.cardLine });
+        panel(c, x, y, w, rh - 12, { fill: COL.card, stroke: COL.cardLine });
       }
 
-      var cy = y + (rowH - 12) / 2 + 1;
+      var cy = y + (rh - 12) / 2 + 1;
       text(c, it.label, x + 26, cy, {
         size: 21, weight: sel ? '700' : '500', track: 3,
         color: it.danger ? (sel ? COL.bad : rgba(COL.bad, 0.75)) : (sel ? COL.text : COL.text2),
@@ -1165,14 +1397,19 @@ var Shell = (function () {
           align: 'center', baseline: 'middle',
         });
         text(c, '▶', x + w - 34, cy, { size: 16, color: sel ? COL.a1 : COL.dim, align: 'right', baseline: 'middle' });
+      } else if (it.value) {
+        dataText(c, it.value, x + w - 26, cy, {
+          size: 16, align: 'right', baseline: 'middle',
+          color: it.warn ? COL.warn : (sel ? COL.data : COL.dim),
+        });
       }
     }
+    c.restore();
 
-    var y2 = y0 + items.length * rowH + 12;
     text(c, Store.persistent()
       ? 'SETTINGS AND SCORES ARE SAVED ON THIS CABINET'
       : 'STORAGE UNAVAILABLE — CHANGES LAST FOR THIS SESSION ONLY',
-      SW / 2, y2 + 20, {
+      SW / 2, SET_BOT + 34, {
         size: 14, weight: '500', track: 2,
         color: Store.persistent() ? COL.dim : COL.warn, align: 'center',
       });
@@ -1420,6 +1657,138 @@ var Shell = (function () {
     c.globalAlpha = 1;
   }
 
+  /* -------------------------------------------------- update + about --- */
+
+  function drawUpdate(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'SOFTWARE UPDATE', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+    });
+
+    var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
+    panel(c, x, 260, w, 190, { fill: COL.card, stroke: COL.cardLine });
+    text(c, 'INSTALLED VERSION', x + 30, 310, { size: 15, weight: '600', track: 4, color: COL.dim });
+    dataText(c, 'V' + VERSION_STR + '  ·  BUILD ' + buildId().toUpperCase(), x + 30, 360, {
+      size: 26, color: COL.text,
+    });
+    text(c, 'UPDATES INSTALL NEW GAMES AND FIXES TOGETHER', x + 30, 412, {
+      size: 14, weight: '500', track: 2, color: COL.dim,
+    });
+
+    var midY = 560;
+    if (upd.phase === 'starting' || upd.phase === 'running') {
+      var st = upd.status;
+      var msg = upd.phase === 'starting' ? 'CONTACTING THE UPDATE AGENT'
+        : (st && st.msg ? String(st.msg).toUpperCase() : 'CHECKING');
+      var dots = '';
+      for (var d = 0; d < 1 + ((t / 400) | 0) % 3; d++) dots += '.';
+      text(c, msg + dots, SW / 2, midY, {
+        size: 24, weight: '600', track: 3, color: COL.a1, align: 'center',
+      });
+      if (st && st.phase) {
+        text(c, String(st.phase).toUpperCase(), SW / 2, midY + 56, {
+          size: 15, weight: '500', track: 4, color: COL.dim, align: 'center',
+        });
+      }
+      text(c, 'THE CABINET RESTARTS BY ITSELF IF AN UPDATE IS INSTALLED',
+        SW / 2, midY + 130, { size: 14, track: 2, color: COL.dim, align: 'center' });
+      text(c, formatHint('{B} LEAVE — THE UPDATE KEEPS RUNNING'), SW / 2, SH - 90, {
+        size: 15, weight: '500', track: 2, color: COL.dim, align: 'center',
+      });
+      return;
+    }
+
+    if (upd.phase === 'error') {
+      text(c, upd.error || 'UPDATE FAILED', SW / 2, midY, {
+        size: 22, weight: '700', track: 2, color: COL.bad, align: 'center',
+      });
+    } else if (upd.phase === 'done') {
+      var stt = upd.status || {};
+      text(c, stt.updated ? 'UPDATE INSTALLED — RESTARTING THE CABINET'
+        : 'YOU ARE UP TO DATE', SW / 2, midY, {
+        size: 24, weight: '700', track: 2, color: stt.updated ? COL.good : COL.text, align: 'center',
+      });
+      if (stt.from && stt.to && stt.updated) {
+        dataText(c, String(stt.from).slice(0, 8) + '  →  ' + String(stt.to).slice(0, 8),
+          SW / 2, midY + 60, { size: 18, align: 'center', color: COL.data });
+      }
+    }
+
+    var items = updItems();
+    drawList(c, items, upd.cursor, MARGIN + 80, midY + 150, SW - (MARGIN + 80) * 2, 74);
+  }
+
+  function drawAbout(c) {
+    wordmark(c, SW / 2, 110, 54);
+    text(c, 'ABOUT THIS CABINET', SW / 2, 178, {
+      size: 20, weight: '600', track: 7, color: COL.text2, align: 'center',
+    });
+
+    var rowsA = [
+      ['VERSION', 'V' + VERSION_STR],
+      ['BUILD', buildId().toUpperCase()],
+      ['GAMES', String(GAMES.length + VERSUS_GAMES.length)],
+      ['STORAGE', Store.persistent() ? 'SAVED ON THIS CABINET' : 'SESSION ONLY'],
+      ['CONTROLLER', Input.padCount()
+        ? Input.kindOf(0).toUpperCase() + ' (' + Input.layoutOf(0).toUpperCase() + ' LAYOUT)'
+        : 'NONE DETECTED'],
+      ['UPDATE AGENT', aboutAgent === null ? 'CHECKING…'
+        : (aboutAgent.ok ? 'RUNNING' : 'NOT AVAILABLE')],
+      ['KIOSK WATCHDOG', aboutAgent && aboutAgent.ok
+        ? (aboutAgent.frontend === 'alive' ? 'ARMED' : 'WAITING FOR FIRST FRAME')
+        : '—'],
+      ['FAULTS RECORDED', String(Faults.count())],
+      ['SESSION', Math.floor(t / 60000) + ' MIN'],
+    ];
+
+    var x = MARGIN + 20, w = SW - (MARGIN + 20) * 2;
+    var y0 = 270, rh = 96;
+    for (var i = 0; i < rowsA.length; i++) {
+      var y = y0 + i * rh;
+      panel(c, x, y, w, rh - 14, { fill: COL.card, stroke: COL.cardLine });
+      text(c, rowsA[i][0], x + 28, y + (rh - 14) / 2, {
+        size: 16, weight: '600', track: 4, color: COL.dim, baseline: 'middle',
+      });
+      dataText(c, rowsA[i][1], x + w - 28, y + (rh - 14) / 2, {
+        size: 19, align: 'right', color: COL.text, baseline: 'middle',
+      });
+    }
+
+    text(c, formatHint('{B} BACK'), SW / 2, SH - 90, {
+      size: 15, weight: '500', track: 2, color: COL.dim, align: 'center',
+    });
+  }
+
+  /**
+   * Progress ring while START is held. Appears only after a beat so a normal
+   * tap never flashes it, and only where going home means anything.
+   */
+  function drawHomeHold(c) {
+    if (state === 'boot' || state === 'menu') return;
+    if (!homeArmed || homeHold < 220) return;
+    var p = clamp((homeHold - 220) / (HOME_HOLD_MS - 220), 0, 1);
+    var cx = SW / 2, cy = 120, r = 44;
+    Render.enterShell();
+    c.globalAlpha = 0.92;
+    c.fillStyle = 'rgba(7,5,14,.78)';
+    c.beginPath();
+    c.arc(cx, cy, r + 16, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = rgba(COL.a2, 0.35);
+    c.lineWidth = 6;
+    c.beginPath();
+    c.arc(cx, cy, r, 0, Math.PI * 2);
+    c.stroke();
+    c.strokeStyle = COL.a1;
+    c.beginPath();
+    c.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+    c.stroke();
+    text(c, 'HOME', cx, cy, {
+      size: 15, weight: '700', track: 3, color: COL.text, align: 'center', baseline: 'middle',
+    });
+    c.globalAlpha = 1;
+  }
+
   /* ----------------------------------------------------------- toast --- */
 
   function drawToast(c) {
@@ -1472,6 +1841,10 @@ var Shell = (function () {
     _toast: function () { return toast; },
     _confirm: function () { return confirmBox; },
     _setCursor: function (i) { setCursor = i; },
+    _settingsCursor: function () { return setCursor; },
+    _navStack: function () { return navStack.slice(); },
+    _upd: function () { return upd; },
+    _homeHoldMs: HOME_HOLD_MS,
     _settingsItems: settingsItems,
     _formatHint: formatHint,
     _idle: function () { return idleT; },
@@ -1492,6 +1865,10 @@ var Shell = (function () {
       activeGame = null; lastScore = 0; lastRank = -1;
       pauseCursor = 0; overCursor = 0; scoresGame = 0; setCursor = 0;
       confirmBox = null; toast = null; lastPadsVersion = -1;
+      navStack.length = 0; homeHold = 0; homeArmed = true;
+      setScroll = 0; setScrollT = 0;
+      upd.phase = 'idle'; upd.cursor = 0; upd.poll = 0; upd.status = null; upd.error = '';
+      aboutAgent = null;
       attract.game = null; attract.timer = 0; attract.index = 0;
       Input.setDemo(null);
       buildMenu();

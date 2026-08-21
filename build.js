@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const ROOT = __dirname;
 const SRC = path.join(ROOT, 'src');
@@ -87,6 +88,14 @@ function bundle(opts) {
   opts = opts || {};
   let js = bundleJs();
   if (opts.minify) js = minify(js);
+  /*
+   * Build id: a hash of the source, not a timestamp — the committed bundle
+   * must rebuild byte-identically in CI, and a clock would break that. Shown
+   * on the ABOUT and SOFTWARE UPDATE screens so a cabinet can say exactly
+   * what it is running.
+   */
+  const buildId = crypto.createHash('sha256').update(js).digest('hex').slice(0, 8);
+  js = `window.ARCADEOS_BUILD='${buildId}';\n` + js;
   const css = bundleCss();
   const html = read('index.html')
     .replace('/*{{CSS}}*/', () => css)

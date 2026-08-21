@@ -99,6 +99,7 @@ var ASCENT = (function () {
     score += def.score;
     particles.burst(f.x, f.y, 12, def.col, { speed: 0.28, life: 460, size: 5 });
     Audio2.sfx('hit');
+    Input.rumble(0.15, 0.2, 40);
   }
 
   function hitShip() {
@@ -145,7 +146,11 @@ var ASCENT = (function () {
 
     /* Wave pacing. */
     waveTimer += dt;
-    if (waveTimer > 18000) { waveTimer = 0; wave++; Audio2.sfx('powerup'); }
+    if (waveTimer > 18000) {
+      waveTimer = 0; wave++;
+      Audio2.sfx('powerup');
+      Input.rumble(0.3, 0.3, 90);
+    }
     spawnTimer -= dt;
     if (spawnTimer <= 0) {
       spawnFoe();

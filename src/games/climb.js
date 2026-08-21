@@ -116,6 +116,8 @@ var CLIMB = (function () {
     if (p.kind === 2) {
       /* Crumbling platforms give exactly one bounce. */
       p.used = 1;
+      Audio2.sfx('crumble');
+      Input.rumble(0.2, 0.1, 70);
       particles.burst(p.x + p.w / 2, p.y, 8, PLAT_COL[2], { speed: 0.2, life: 500, size: 4 });
     }
   }

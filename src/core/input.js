@@ -553,7 +553,8 @@ var Input = (function () {
     var slot = players[playerIndex || 0];
     if (!slot || slot.padIndex === -1) return;
     try {
-      if (Settings.get('reducedMotion')) return;
+      /* Haptics have their own switch; reducedMotion governs the screen. */
+      if (Settings.get('rumble') === false) return;
       var gp = pads()[slot.padIndex];
       if (!gp) return;
       var act = gp.vibrationActuator || gp.hapticActuators && gp.hapticActuators[0];

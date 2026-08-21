@@ -22,6 +22,7 @@ black screen  →  ARCADE wordmark  →  dashboard
 - [Controls](#controls)
 - [The games](#the-games)
 - [Settings](#settings)
+- [Updating and adding games](#updating-and-adding-games)
 - [Adding a game](#adding-a-game)
 - [Wiring arcade buttons to a USB encoder](#wiring-arcade-buttons-to-a-usb-encoder)
 - [Development](#development)
@@ -189,6 +190,11 @@ including settings and shutdown — needs a keyboard.
 | Pause | Start | P, Tab, 1 |
 | Join as player 2 | Start on a second pad | — |
 
+
+**Hold START for one second to return to the dashboard from anywhere** — mid-game,
+in a menu, on the pause screen, anywhere. A progress ring appears while you hold.
+A quick tap of START keeps its usual meaning (pause in a game).
+
 ### The face-button swap
 
 Xbox and PlayStation confirm with the **bottom** face button. Nintendo pads
@@ -274,6 +280,12 @@ up by playing.
 
 ## Settings
 
+Settings is grouped into sections — AUDIO & FEEDBACK, DISPLAY, CONTROLS,
+SYSTEM — and every row works with the d-pad alone. Beyond the basics it has
+CONTROLLER RUMBLE (haptics have their own switch, separate from REDUCED
+MOTION), SOFTWARE UPDATE, ABOUT THIS CABINET (version, build id, storage and
+agent health), RESET ALL SETTINGS, and the crash log under DIAGNOSTICS.
+
 Reachable from the dashboard with the d-pad.
 
 | Setting | |
@@ -303,6 +315,39 @@ The pairing window stays open for two minutes. It will reconnect automatically
 on every subsequent boot.
 
 ---
+
+## Updating and adding games
+
+The cabinet updates itself. **SETTINGS → SOFTWARE UPDATE → CHECK FOR UPDATES**
+pulls the newest ArcadeOS from the same git branch the cabinet was installed
+from, reinstalls it, and restarts the display — all from the couch, no
+keyboard, no SSH. New games ship inside the same bundle, so installing an
+update installs every new game at once.
+
+How it works: the front end asks the control agent (`POST /update`, token
+required); the agent launches `/opt/arcadeos/arcadeos-update.sh` as a detached
+systemd unit; the script fetches the branch recorded in
+`/etc/arcadeos/update.conf`, sanity-checks the new bundle, keeps the running
+page as `arcade.html.prev`, re-runs the installer (`--skip-apt`), and restarts
+the kiosk. Any failure restores the previous page and reports the reason on
+the update screen. Progress is written to
+`/var/lib/arcadeos/update-status.json`, which you can also watch over SSH:
+
+```bash
+curl -s http://127.0.0.1:8127/update/status
+journalctl -u arcadeos-update -n 50 --no-pager
+```
+
+Requirements: the cabinet needs network access at the moment you press the
+button (gameplay stays fully offline), and the checkout it was installed from
+must be able to `git fetch` — for a **private** repository that means stored
+credentials readable by root, an SSH deploy key, or making the repository
+public. If none of that is set up, the screen says the update server is
+unreachable and nothing is touched.
+
+A cabinet installed from a tarball rather than a git clone has no update
+source; the SOFTWARE UPDATE screen will say so. Reinstall once from a clone
+to enable it.
 
 ## Adding a game
 
