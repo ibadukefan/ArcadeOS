@@ -580,5 +580,7 @@ describe('frame cost visibility', () => {
     assert.ok(/fps=[\d.]+ cpu=[\d.]+ms/.test(diag), 'names the cost: ' + diag);
     assert.ok(/upd=[\d.]+ drw=[\d.]+/.test(diag),
       'splits the cost into logic and paint: ' + diag);
+    assert.ok(/ state=\w+/.test(diag),
+      'says which screen was up, so readings are comparable: ' + diag);
   });
 });

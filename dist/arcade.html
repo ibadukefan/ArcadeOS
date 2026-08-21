@@ -49,7 +49,7 @@ html, body {
 </head>
 <body>
 <canvas id="screen"></canvas>
-<script>window.ARCADEOS_BUILD='94bda48f';
+<script>window.ARCADEOS_BUILD='322aab87';
 (function(){
 'use strict';
 
@@ -8849,6 +8849,43 @@ var Loop = (function () {
  * line every minute. Armed only where fetch exists — a cabinet — so the
  * test harness never leaks a timer.
  */
+/**
+ * One-shot canvas raster benchmark. Our per-frame cpu number cannot see
+ * where 2D canvas raster actually happens: paint commands are recorded on
+ * the main thread and rastered later on Chromium's raster threads — in
+ * software, invisibly, if canvas acceleration is off. The cabinet sat at a
+ * hard 30fps with only 6ms of visible cpu; this measures the invisible
+ * part. Twenty full-surface fills forced to completion: GPU raster lands
+ * well under ~15ms, software takes several times that.
+ */
+var benchRan = false;
+var benchMs = -1;
+function canvasBench() {
+  if (benchRan) return benchMs;
+  benchRan = true;
+  try {
+    if (typeof document === 'undefined' || !document.createElement) return benchMs;
+    var s = Render.size();
+    var cv = document.createElement('canvas');
+    cv.width = Math.max(64, Math.min(s.dw || 1280, 2048));
+    cv.height = Math.max(64, Math.min(s.dh || 720, 2048));
+    var x = cv.getContext('2d');
+    if (!x || typeof x.fillRect !== 'function' ||
+        typeof x.getImageData !== 'function') return benchMs;
+    var now = (typeof performance !== 'undefined' && performance.now)
+      ? function () { return performance.now(); }
+      : function () { return Date.now ? Date.now() : 0; };
+    var t0 = now();
+    for (var i = 0; i < 20; i++) {
+      x.fillStyle = (i & 1) ? '#123456' : '#654321';
+      x.fillRect(0, 0, cv.width, cv.height);
+    }
+    x.getImageData(0, 0, 1, 1); /* forces every queued fill to raster */
+    benchMs = now() - t0;
+  } catch (e) { /* a probe must never hurt the cabinet */ }
+  return benchMs;
+}
+
 function armDiagRelay() {
   if (typeof fetch !== 'function') return;
   var t0 = Date.now ? Date.now() : 0;
@@ -8857,12 +8894,15 @@ function armDiagRelay() {
     var s = Render.size();
     var p = Loop.perf();
     var up = t0 && Date.now ? Math.round((Date.now() - t0) / 1000) : 0;
+    var bench = canvasBench();
     return 'diag up=' + up + 's gpu="' + Render.gpuInfo() + '"' +
       ' dev=' + s.dw + 'x' + s.dh + ' rot=' + s.rot +
       ' scale=' + s.scale.toFixed(3) +
+      ' state=' + Shell.state() +
       ' fps=' + p.fps.toFixed(1) +
       ' cpu=' + p.cpuMean.toFixed(1) + 'ms' +
       ' upd=' + p.updMean.toFixed(1) + ' drw=' + p.drwMean.toFixed(1) +
+      (bench >= 0 ? ' raster20=' + Math.round(bench) + 'ms' : '') +
       ' video=' + (Render.lowLatency() ? 'low-lat' : 'normal');
   }
 
