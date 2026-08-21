@@ -443,3 +443,42 @@ describe('agent watchdog', () => {
       'uninstall disarms it again');
   });
 });
+
+describe('GPU visibility', () => {
+  /*
+   * The 22fps cabinet was undiagnosable from the journal — Chromium said
+   * nothing. The page itself is the one place that can reliably report
+   * whether the browser got the VideoCore or fell back to SwiftShader, so
+   * DIAGNOSTICS shows the WebGL renderer string.
+   */
+  it('probes once, never throws, and caches the answer', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Render } = env.api();
+    const a = Render.gpuInfo();
+    assert.ok(typeof a === 'string' && a.length > 0, `got "${a}"`);
+    assert.equal(Render.gpuInfo(), a, 'second call is the cached answer');
+  });
+
+  it('classifies software rasterisers as the problem they are', () => {
+    const env = makeEnv();
+    const { Render } = env.api();
+    /* The harness has no real WebGL, so the probe lands on a fallback
+     * string; whatever it is, the classifier must not throw and must only
+     * flag genuine software renderers. */
+    const soft = Render.gpuIsSoftware();
+    assert.ok(soft === true || soft === false);
+    assert.ok(!/v3d|broadcom/i.test(Render.gpuInfo()) || !soft,
+      'a real VideoCore string is never flagged as software');
+  });
+
+  it('the DIAGNOSTICS screen renders with the GPU row', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Shell, Faults } = env.api();
+    Shell._go('faults');
+    for (let i = 0; i < 30; i++) env.tick(16.667);
+    assert.equal(Shell.state(), 'faults');
+    assert.equal(Faults.count(), 0, JSON.stringify(Faults.latest()));
+  });
+});

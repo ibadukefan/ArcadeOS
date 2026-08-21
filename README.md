@@ -309,7 +309,7 @@ Reachable from the dashboard with the d-pad.
 | **REDUCED MOTION** | Stills the drifting aurora and disables rumble |
 | **FRAME TIMER** | On-screen diagnostics: fps, mean/worst frame time, controller sample rate, audio latency, taps saved, full-screen ops |
 | **LOW LATENCY VIDEO** | Desynchronized canvas. On by default; turn off only if your panel tears |
-| **DIAGNOSTICS** | Storage, schema version, video mode, controllers, and any recorded faults |
+| **DIAGNOSTICS** | Storage, schema version, video mode, GPU renderer, controllers, and any recorded faults. The GPU row is the 22fps tell: `SWIFTSHADER` in red means Chromium fell back to software rendering — a launch-flag problem, not a game problem |
 | **PAIR BLUETOOTH PAD** | Opens a two-minute pairing window |
 | **RESET HIGH SCORES** | Asks first |
 | **RESTART** / **SHUT DOWN** | Ask first, then do it properly |

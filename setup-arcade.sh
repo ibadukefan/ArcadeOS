@@ -466,8 +466,18 @@ mkdir -p "\$PROFILE"
 #                               journalctl -u arcadeos. Without this the first
 #                               real cabinet was undiagnosable: 22fps and
 #                               renderer crashes with an empty journal.
+#   --log-level=0               ...and stderr alone printed nothing on the
+#                               cabinet: GL initialisation is logged at INFO,
+#                               which is below the default threshold.
+#
+# There is deliberately NO --use-gl here. The value this script used to pass
+# (egl) was removed from Chromium years ago; an unrecognised GL backend makes
+# Chromium fall back to SwiftShader — software rendering, which on a Pi 4 at
+# 1080p is almost exactly the 22fps the first cabinet measured. The Raspberry
+# Pi OS chromium package picks the right V3D/ANGLE path on its own.
 exec "\$CHROMIUM" \\
   --enable-logging=stderr \\
+  --log-level=0 \\
   --kiosk \\
   --app="\$PAGE" \\
   --user-data-dir="\$PROFILE" \\
@@ -490,8 +500,7 @@ exec "\$CHROMIUM" \\
   --disable-session-crashed-bubble \\
   --hide-scrollbars \\
   --check-for-update-interval=31536000 \\
-  --password-store=basic \\
-  --use-gl=egl
+  --password-store=basic
 LAUNCH
   chmod 0755 "$APP_DIR/launch.sh"
 
@@ -529,6 +538,11 @@ Environment=WLR_LIBINPUT_NO_DEVICES=1
 # -s keeps Ctrl+Alt+F2 working, which is the only local way back into a
 # machine whose one screen is owned by the kiosk.
 Environment=ARCADEOS_ROTATE=${ROTATE}
+# The first cabinet quick-exited six times per boot: cage starts before the
+# HDMI connector reports connected, finds no output, and exits 0. Wait for a
+# live connector (bounded — start anyway after 15s so a headless cabinet
+# still comes up and keeps the agent's watchdog meaningful).
+ExecStartPre=-/usr/bin/timeout 15 /bin/sh -c 'until grep -qs ^connected /sys/class/drm/card*-*/status; do sleep 0.3; done'
 ExecStart=/usr/bin/cage -ds -- ${APP_DIR}/launch.sh
 Restart=always
 RestartSec=2

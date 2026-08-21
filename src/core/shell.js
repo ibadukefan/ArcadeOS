@@ -627,6 +627,13 @@ var Shell = (function () {
     }
   }
 
+  /** Renderer strings can be paragraphs ("ANGLE (Broadcom, V3D 4.2, …)");
+   * keep the interesting head and make it fit the row. */
+  function gpuLabel() {
+    var s = String(Render.gpuInfo()).toUpperCase();
+    return s.length > 44 ? s.slice(0, 43) + '…' : s;
+  }
+
   function drawFaults(c) {
     wordmark(c, SW / 2, 110, 54);
     text(c, 'DIAGNOSTICS', SW / 2, 178, {
@@ -644,6 +651,9 @@ var Shell = (function () {
       ['SCHEMA', 'v' + Store.VERSION +
         (Store.migrated() ? '  (' + Store.migrated() + ' MIGRATED)' : ''), COL.data],
       ['VIDEO', Render.lowLatency() ? 'LOW LATENCY' : 'NORMAL', COL.data],
+      /* The 22fps tell: SwiftShader here means Chromium is software
+       * rendering and the launch flags need fixing, not the games. */
+      ['GPU', gpuLabel(), Render.gpuIsSoftware() ? COL.bad : COL.good],
       ['CONTROLLERS', String(Input.padCount()) + ' PAD' +
         (Input.padCount() === 1 ? '' : 'S') + ', ' +
         Input.kindOf(0).toUpperCase(), COL.data],

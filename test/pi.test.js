@@ -302,6 +302,28 @@ describe('kiosk service unit', () => {
     assert.ok(/180\)\s+po=upside_down/.test(src));
   });
 
+  it('never picks a GL backend by hand', () => {
+    /* The launcher used to pass --use-gl=egl. That value was removed from
+     * Chromium years ago, and an unrecognised backend silently drops the
+     * browser to SwiftShader: software rendering, 22fps at 1080p on a Pi 4 —
+     * exactly what the first cabinet measured. Let the OS package choose. */
+    assert.notOk(/--use-gl=/.test(src), 'no --use-gl flag anywhere');
+  });
+
+  it('waits for a connected display before starting cage', () => {
+    /* cage exits 0 when it finds no output; the first cabinet quick-exited
+     * six times per boot racing the HDMI connector. The wait is bounded and
+     * tolerant (=-) so a headless cabinet still starts. */
+    const pre = src.match(/ExecStartPre=([^\n]*)/);
+    assert.ok(pre, 'unit has a pre-start gate');
+    assert.ok(/^-/.test(pre[1].trim()), 'a timeout must not fail the start');
+    assert.ok(/timeout/.test(pre[1]), 'the wait is bounded');
+    assert.ok(/\/sys\/class\/drm\/card\*-\*\/status/.test(pre[1]),
+      'it watches connector status, not the card device');
+    assert.ok(src.indexOf('ExecStartPre=') < src.indexOf('ExecStart=/usr/bin/cage'),
+      'the gate precedes the kiosk');
+  });
+
   it('configures the cmdline even when plymouth is missing', () => {
     /* The edit used to live inside install_splash, which returns early
      * without plymouth — rotation would silently never apply. */

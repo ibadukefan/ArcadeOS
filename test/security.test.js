@@ -152,6 +152,9 @@ describe('setup script', () => {
   it('captures Chromium logs in the journal', () => {
     /* The first cabinet crash-looped with an empty journal — undiagnosable. */
     assert.ok(/--enable-logging=stderr/.test(SETUP));
+    /* ...and stderr alone printed nothing: GL initialisation logs at INFO,
+     * below Chromium's default threshold. */
+    assert.ok(/--log-level=0/.test(SETUP), 'INFO-level logging is on');
   });
 
   it('removes the token directory on uninstall', () => {

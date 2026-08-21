@@ -421,6 +421,42 @@ var Render = (function () {
     c.globalAlpha = prev;
   }
 
+  /**
+   * One-shot GPU probe. The first real cabinet ran at 22fps with an empty
+   * journal; the only place that reliably says whether Chromium got the
+   * VideoCore or fell back to software (SwiftShader) is the page itself,
+   * via WebGL's renderer string. Probed once, shown on DIAGNOSTICS.
+   */
+  var gpuName = null;
+  function gpuInfo() {
+    if (gpuName !== null) return gpuName;
+    gpuName = 'UNKNOWN';
+    try {
+      if (typeof document === 'undefined' || !document.createElement) return gpuName;
+      var cv = document.createElement('canvas');
+      var gl = cv.getContext('webgl') || cv.getContext('experimental-webgl');
+      if (!gl) { gpuName = 'NO WEBGL'; return gpuName; }
+      if (typeof gl.getParameter !== 'function') return gpuName;
+      var name = null;
+      if (typeof gl.getExtension === 'function') {
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) name = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+      }
+      if (typeof name !== 'string' || !name) name = gl.getParameter(gl.RENDERER);
+      if (typeof name === 'string' && name) gpuName = name;
+      if (typeof gl.getExtension === 'function') {
+        var lose = gl.getExtension('WEBGL_lose_context');
+        if (lose && lose.loseContext) lose.loseContext();
+      }
+    } catch (e) { /* a diagnostics probe must never take the cabinet down */ }
+    return gpuName;
+  }
+
+  /** True when the renderer string smells like a software rasteriser. */
+  function gpuIsSoftware() {
+    return /swiftshader|llvmpipe|softpipe|software|no webgl/i.test(gpuInfo());
+  }
+
   return {
     init: init,
     resize: resize,
@@ -448,6 +484,8 @@ var Render = (function () {
       try { return !!(ctx && ctx.getContextAttributes &&
         ctx.getContextAttributes().desynchronized); } catch (e) { return false; }
     },
+    gpuInfo: gpuInfo,
+    gpuIsSoftware: gpuIsSoftware,
     /** Full-screen blits/fills issued since the last reset. Two per frame. */
     fullScreenOps: function () { return fullScreenOps; },
     _resetOps: function () { fullScreenOps = 0; },
