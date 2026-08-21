@@ -31,7 +31,27 @@ CONF_DIR="/etc/arcadeos"
 TOKEN_FILE="/etc/arcadeos/agent.token"
 DATA_LABEL="ARCADEDATA"
 
-ARCADE_USER="${SUDO_USER:-${ARCADE_USER:-pi}}"
+# Whose cabinet is this? Tried in order:
+#   1. sudo's caller            — the normal hand-run install
+#   2. explicit ARCADE_USER     — power users and tests
+#   3. the last install's conf  — recorded below on every install
+#   4. the owner of this checkout — the updater runs setup as plain root with
+#                                   none of the above; whoever cloned the
+#                                   source is the cabinet user. Without this,
+#                                   an on-cabinet update on any box whose user
+#                                   is not "pi" died at the id check — after
+#                                   the version pointer had already moved.
+#   5. pi                       — the traditional default
+ARCADE_USER="${SUDO_USER:-${ARCADE_USER:-}}"
+if [[ -z "$ARCADE_USER" && -r "$CONF_DIR/update.conf" ]]; then
+  ARCADE_USER="$(sed -n 's/^ARCADE_USER=//p' "$CONF_DIR/update.conf" | head -1)"
+fi
+if [[ -z "$ARCADE_USER" ]]; then
+  _owner="$(stat -c %U "$SRC_DIR" 2>/dev/null || true)"
+  [[ -n "$_owner" && "$_owner" != "root" && "$_owner" != "UNKNOWN" ]] && ARCADE_USER="$_owner"
+  unset _owner
+fi
+ARCADE_USER="${ARCADE_USER:-pi}"
 
 # Flags
 DO_UNINSTALL=0
@@ -372,6 +392,7 @@ write_update_conf() {
 SRC_DIR=$SRC_DIR
 GIT_BRANCH=$branch
 GIT_REMOTE=$remote
+ARCADE_USER=$ARCADE_USER
 CONF
     chmod 0644 "$CONF_DIR/update.conf"
     info "updates will pull $branch from this checkout"

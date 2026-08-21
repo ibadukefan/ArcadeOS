@@ -132,6 +132,109 @@ describe('setup-arcade.sh', () => {
   });
 });
 
+describe('on-cabinet updater', () => {
+  /*
+   * Run the real arcadeos-update.sh against a throwaway git origin. This is
+   * the path a cabinet takes when CHECK FOR UPDATES is pressed, and it broke
+   * on real hardware in a way no text assertion would catch: a failed install
+   * left HEAD at the new version, so the next check said "already up to
+   * date" about an update that never happened.
+   */
+  const UPDATER = path.join(PI, 'arcadeos-update.sh');
+
+  function sh(cwd, cmd, env) {
+    return execFileSync('bash', ['-c', cmd], {
+      cwd, encoding: 'utf8',
+      env: Object.assign({}, process.env, env || {}),
+    });
+  }
+
+  /** Build origin + cabinet checkout. setupBody is the installer at v2. */
+  function fixture(setupBody) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arcadeos-up-'));
+    const G = '-c user.name=t -c user.email=t@t -c commit.gpgsign=false';
+    sh(dir, 'git init --bare -q origin.git');
+    sh(dir, `git clone -q origin.git seed 2>/dev/null`);
+    const seed = path.join(dir, 'seed');
+    fs.mkdirSync(path.join(seed, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(seed, 'dist', 'arcade.html'), '<html>ArcadeOS v1</html>');
+    fs.writeFileSync(path.join(seed, 'setup-arcade.sh'), '#!/bin/bash\nexit 0\n');
+    fs.chmodSync(path.join(seed, 'setup-arcade.sh'), 0o755);
+    sh(seed, `git add -A && git ${G} commit -qm v1 && git branch -M cab && git push -q origin cab`);
+    const v1 = sh(seed, 'git rev-parse HEAD').trim();
+
+    sh(dir, 'git clone -q -b cab origin.git cabinet 2>/dev/null');
+    const cabinet = path.join(dir, 'cabinet');
+
+    fs.writeFileSync(path.join(seed, 'dist', 'arcade.html'), '<html>ArcadeOS v2</html>');
+    fs.writeFileSync(path.join(seed, 'setup-arcade.sh'), '#!/bin/bash\n' + setupBody + '\n');
+    fs.chmodSync(path.join(seed, 'setup-arcade.sh'), 0o755);
+    sh(seed, `git add -A && git ${G} commit -qm v2 && git push -q origin cab`);
+    const v2 = sh(seed, 'git rev-parse HEAD').trim();
+
+    const appDir = path.join(dir, 'opt');
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'arcade.html'), 'running-page');
+    const conf = path.join(dir, 'update.conf');
+    fs.writeFileSync(conf, `SRC_DIR=${cabinet}\nGIT_BRANCH=cab\nARCADE_USER=cabuser\n`);
+    return {
+      dir, cabinet, v1, v2,
+      env: {
+        ARCADEOS_UPDATE_CONF: conf,
+        ARCADEOS_UPDATE_STATUS: path.join(dir, 'status.json'),
+        ARCADEOS_UPDATE_APP_DIR: appDir,
+      },
+      head: () => sh(cabinet, 'git rev-parse HEAD').trim(),
+      status: () => JSON.parse(fs.readFileSync(path.join(dir, 'status.json'), 'utf8')),
+      run: function () {
+        try { sh(dir, `bash ${UPDATER}`, this.env); return 0; }
+        catch (e) { return e.status || 1; }
+      },
+    };
+  }
+
+  it('a failed install rolls the version pointer back, so TRY AGAIN retries', () => {
+    const f = fixture('echo boom >&2; exit 1');
+    assert.notEqual(f.run(), 0, 'updater must report failure');
+    assert.equal(f.status().phase, 'failed');
+    assert.equal(f.head(), f.v1,
+      'HEAD must return to the running version — otherwise the next check says "up to date" about an update that never installed');
+    /* And the retry genuinely retries: it sees the update again. */
+    const again = f.run();
+    assert.notEqual(again, 0, 'still failing, but it TRIED — it did not say up to date');
+    assert.equal(f.status().phase, 'failed');
+  });
+
+  it('a successful install advances HEAD and hands the installer the cabinet user', () => {
+    const f = fixture('echo "$ARCADE_USER" > installed-as.txt; exit 0');
+    assert.equal(f.run(), 0, 'updater must succeed');
+    const st = f.status();
+    assert.equal(st.phase, 'done');
+    assert.equal(st.updated, true);
+    assert.equal(f.head(), f.v2, 'HEAD advances only on success');
+    assert.equal(fs.readFileSync(path.join(f.cabinet, 'installed-as.txt'), 'utf8').trim(),
+      'cabuser',
+      'ARCADE_USER from update.conf must reach the installer — without it, setup guessed "pi" and died on any cabinet with a different user');
+  });
+
+  it('no update means no writes at all', () => {
+    const f = fixture('exit 0');
+    /* Point the cabinet at the tip first. */
+    sh(f.cabinet, 'git fetch -q origin cab && git reset -q --hard origin/cab');
+    assert.equal(f.run(), 0);
+    assert.equal(f.status().phase, 'done');
+    assert.equal(f.status().updated, false);
+  });
+
+  it('records the cabinet user for the next update', () => {
+    const src = read(SETUP);
+    assert.ok(/^ARCADE_USER=\$ARCADE_USER$/m.test(src.slice(src.indexOf('write_update_conf'))),
+      'update.conf carries ARCADE_USER');
+    assert.ok(/stat -c %U "\$SRC_DIR"/.test(src),
+      'and a cabinet installed before that field existed falls back to the checkout owner');
+  });
+});
+
 describe('ssh enablement', () => {
   /*
    * A real cabinet ended the evening unreachable: the kiosk owned the screen,
