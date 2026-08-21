@@ -512,7 +512,11 @@ exec "\$CHROMIUM" \\
   --disable-session-crashed-bubble \\
   --hide-scrollbars \\
   --check-for-update-interval=31536000 \\
-  --password-store=basic
+  --password-store=basic > "${DATA_DIR}/chromium.log" 2>&1
+# ^ cage swallows its client's stdio — measured directly: a benchmark under
+# cage printed nothing anywhere, which is also why months of journals held
+# zero Chromium lines. The browser's own GL and vsync decisions land in
+# this file instead, truncated at each launch.
 LAUNCH
   chmod 0755 "$APP_DIR/launch.sh"
 

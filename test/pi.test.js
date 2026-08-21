@@ -402,6 +402,13 @@ describe('kiosk service unit', () => {
       'the gate precedes the kiosk');
   });
 
+  it('captures the browser\'s own words to a file', () => {
+    /* cage swallows client stdio — a benchmark under cage printed nothing,
+     * and months of journals held zero Chromium lines for the same reason.
+     * The 30fps investigation needs Chromium's vsync and GL decisions. */
+    assert.ok(/> "\$\{DATA_DIR\}\/chromium\.log" 2>&1/.test(read(SETUP)));
+  });
+
   it('configures the cmdline even when plymouth is missing', () => {
     /* The edit used to live inside install_splash, which returns early
      * without plymouth — rotation would silently never apply. */
