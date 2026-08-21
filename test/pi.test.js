@@ -132,6 +132,29 @@ describe('setup-arcade.sh', () => {
   });
 });
 
+describe('ssh enablement', () => {
+  /*
+   * A real cabinet ended the evening unreachable: the kiosk owned the screen,
+   * the VT-switch chord was swallowed, and sshd had never been enabled. The
+   * only remaining path was pulling the SD card. The installer (and therefore
+   * every on-cabinet update, which re-runs it) must keep ssh on.
+   */
+  const src = read(SETUP);
+
+  it('is enabled by the installer, before anything can go wrong', () => {
+    assert.ok(/enable_ssh\(\) \{/.test(src));
+    assert.ok(/systemctl enable --now ssh/.test(src));
+    const main = src.slice(src.indexOf('main() {'));
+    assert.ok(/enable_ssh/.test(main), 'main calls enable_ssh');
+  });
+
+  it('degrades with a warning rather than failing the install', () => {
+    const fn = src.slice(src.indexOf('enable_ssh() {'), src.indexOf('install_packages() {'));
+    assert.ok(/\|\| warn/.test(fn), 'a broken sshd must not block the kiosk install');
+    assert.ok(/openssh-server is not installed/.test(fn));
+  });
+});
+
 describe('kiosk service unit', () => {
   /*
    * The first boot on real hardware crash-looped on a black screen because

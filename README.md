@@ -602,6 +602,17 @@ ArcadeOS.Input.players()
 
 ## Troubleshooting
 
+**Can't reach a terminal — the kiosk owns the screen and SSH is refused**
+
+The installer enables sshd, so on any cabinet installed (or updated) after
+v1.1 this should not happen: `ssh <user>@raspberrypi.local` is always open.
+On an older install where SSH was never enabled, recover with the SD card:
+shut the cabinet down cleanly (SETTINGS → SYSTEM → SHUT DOWN), put the card
+in any computer, and create an empty file named exactly `ssh` in the boot
+partition (the FAT one, visible on Windows/Mac). On the next boot sshd starts
+permanently. Ctrl+Alt+F2 on an attached keyboard also switches to a login
+console on most keyboards; compact keyboards may need Fn held as well.
+
 **`E: Unable to locate package cage` during install**
 
 The card is running Bullseye or older. `cage`, `seatd` and `python3-lgpio` do

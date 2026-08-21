@@ -236,6 +236,27 @@ MSG
   fi
 }
 
+# --------------------------------------------------------------- ssh ---
+#
+# The kiosk owns the only screen. If sshd is not running, a machine with a
+# swallowed VT-switch chord has NO way in — the card comes out. Learned on a
+# real cabinet, the first evening it ran. Remote access is not a convenience
+# on this device; it is the only maintenance path, so the installer and every
+# on-cabinet update make sure it is on.
+enable_ssh() {
+  if systemctl cat ssh.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet ssh; then
+      info "ssh already running"
+    else
+      systemctl enable --now ssh >/dev/null 2>&1 \
+        && info "ssh enabled — this cabinet is reachable even when the kiosk owns the screen" \
+        || warn "could not enable ssh; the console is the only way in"
+    fi
+  else
+    warn "openssh-server is not installed; skipping ssh enablement"
+  fi
+}
+
 install_packages() {
   [[ $SKIP_APT -eq 1 ]] && { info "skipping apt (--skip-apt)"; return 0; }
   step "Updating the system and installing packages"
@@ -825,6 +846,7 @@ main() {
   fi
 
   install_packages
+  enable_ssh
   install_app
   install_services
   install_gpio
