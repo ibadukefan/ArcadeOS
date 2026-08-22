@@ -80,7 +80,7 @@ var Shell = (function () {
   var lastOps = 0;
 
   var ATTRACT_AFTER = 60000;
-  var attract = { game: null, timer: 0, index: 0 };
+  var attract = { game: null, timer: 0, index: 0, art: false };
 
   var initials = { chars: [0, 0, 0], pos: 0, gameId: '', score: 0 };
 
@@ -427,6 +427,8 @@ var Shell = (function () {
       { id: 'lowLatency', label: 'LOW LATENCY VIDEO', type: 'toggle', on: s.lowLatency },
       { id: 'orientation', label: 'ORIENTATION', type: 'choice',
         value: orientationLabel(s.orientation) },
+      { id: 'attract', label: 'WHEN IDLE', type: 'choice',
+        value: attractLabel(s.attract) },
       { type: 'header', label: 'CONTROLS' },
       { id: 'layout', label: 'CONTROLLER', type: 'choice',
         value: layoutLabel(s.layout) },
@@ -489,7 +491,8 @@ var Shell = (function () {
   /* Every multi-value settings row, keyed by id, so the cycle logic is one
    * function instead of one hardcoded special case per row. */
   var ORIENTATIONS = ['auto', 'auto-left', 'off'];
-  var CHOICES = { layout: LAYOUTS, orientation: ORIENTATIONS };
+  var ATTRACTS = ['art', 'demos'];
+  var CHOICES = { layout: LAYOUTS, orientation: ORIENTATIONS, attract: ATTRACTS };
 
   function cycleChoice(id, dir) {
     var list = CHOICES[id];
@@ -503,6 +506,10 @@ var Shell = (function () {
     if (v === 'auto-left') return 'AUTO PORTRAIT \u2190';
     if (v === 'off') return 'NO ROTATION';
     return 'AUTO PORTRAIT \u2192';
+  }
+
+  function attractLabel(v) {
+    return v === 'demos' ? 'GAME DEMOS' : 'ART';
   }
 
   function settingsUpdate(dt) {
@@ -740,9 +747,19 @@ var Shell = (function () {
 
   function enterAttract() {
     Input.setDemo(null);
+    attract.timer = 0;
+    var mode = 'art';
+    try { mode = Settings.get('attract') || 'art'; } catch (e) { mode = 'art'; }
+    if (mode === 'art') {
+      /* The silent art piece: no game, no cycling — it just runs. */
+      attract.art = true;
+      attract.game = null;
+      go('attract');
+      return;
+    }
+    attract.art = false;
     attract.index = (attract.index + 1) % Math.max(1, GAMES.length);
     attract.game = GAMES[attract.index] || null;
-    attract.timer = 0;
     if (attract.game) {
       seedRng(0xA77AC7 + attract.index);
       try { attract.game.start(); } catch (e) { attract.game = null; }
@@ -760,6 +777,9 @@ var Shell = (function () {
       return;
     }
     attract.timer += dt;
+    /* The art piece has nothing to simulate and never cycles — it just runs
+     * until a real button press drops back to the dashboard. */
+    if (attract.art) return;
     if (attract.game) {
       try { attract.game.update(dt); }
       catch (e) { fault(e, attract.game.id + '.update'); attract.game = null; }
@@ -1614,6 +1634,12 @@ var Shell = (function () {
   /* ------------------------------------------------------- attract UI --- */
 
   function drawAttract(c) {
+    if (attract.art) {
+      /* Edge-to-edge, no text, no chrome — just the art. */
+      Render.enterShell();
+      Artscape.draw(sx, t);
+      return;
+    }
     if (attract.game) {
       Render.enterGame();
       try { attract.game.draw(); }

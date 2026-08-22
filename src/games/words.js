@@ -120,7 +120,7 @@ var WORDS = (function () {
   var cursor = { r: 1, c: 3 };
   var score = 0, solved = 0, over = false;
   var msg = '', msgT = 0;
-  var solveT = 0, revealT = 0, shakeT = 0;
+  var solveT = 0, shakeT = 0;
   var used = null;
   var particles = makeParticles(48);
 
@@ -143,7 +143,7 @@ var WORDS = (function () {
     answer = pickWord();
     guesses = [];
     cur = '';
-    solveT = 0; revealT = 0;
+    solveT = 0;
     /* Each word is its own puzzle — the keyboard hints start clean. */
     letterState = Object.create(null);
   }
@@ -201,7 +201,6 @@ var WORDS = (function () {
     guesses.push({ word: g, states: states });
     for (var i = 0; i < LEN; i++) noteLetter(g.charAt(i), states[i]);
     cur = '';
-    revealT = LEN * 90 + 120;
 
     if (g === answer) {
       solved++;
@@ -237,7 +236,6 @@ var WORDS = (function () {
   function update(dt) {
     particles.update(dt, 0.0003);
     if (msgT > 0) msgT = Math.max(0, msgT - dt);
-    if (revealT > 0) revealT = Math.max(0, revealT - dt);
     if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
 
     if (solveT > 0) {

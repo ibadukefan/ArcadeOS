@@ -216,6 +216,10 @@ var SETTINGS_DEFAULTS = {
   /* Gamepad haptics. Separate from reducedMotion: rumble is touch, not
    * motion, and someone sensitive to screen shake may still want it. */
   rumble: true,
+  /* What plays when the cabinet sits idle. 'art' is a silent full-screen
+   * generative piece (the default — it is the prettier thing to walk past);
+   * 'demos' self-plays each game in turn. */
+  attract: 'art',
 };
 
 var Settings = (function () {
@@ -237,6 +241,7 @@ var Settings = (function () {
     out.orientation = (raw.orientation === 'auto-left' || raw.orientation === 'off')
       ? raw.orientation : 'auto';
     out.rumble = raw.rumble !== false;
+    out.attract = (raw.attract === 'demos') ? 'demos' : 'art';
     return out;
   }
 

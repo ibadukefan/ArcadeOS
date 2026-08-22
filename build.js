@@ -23,6 +23,7 @@ const CORE_PRE = [
   'core/audio.js',
   'core/input.js',
   'core/render.js',
+  'core/artscape.js',
   'core/system.js',
 ];
 

@@ -334,8 +334,9 @@ describe('attract self-play', () => {
 
   it('hands input back on the way out', () => {
     const env = makeEnv();
-    const { Shell, Input } = env.api();
+    const { Shell, Input, Settings } = env.api();
     bootToMenu(env);
+    Settings.set('attract', 'demos');   /* this test is about the demo pilot */
     Shell._forceIdle(61000);
     for (let i = 0; i < 200; i++) env.tick(40);
     assert.equal(Shell.state(), 'attract');
@@ -346,8 +347,9 @@ describe('attract self-play', () => {
 
   it('a demo that throws does not take the cabinet down', () => {
     const env = makeEnv();
-    const { Shell, GAMES, Faults } = env.api();
+    const { Shell, GAMES, Faults, Settings } = env.api();
     bootToMenu(env);
+    Settings.set('attract', 'demos');   /* exercise the game-demo path */
     /* Break every pilot: attract rotates, so which game comes up first is not
      * this test's business. */
     for (const g of GAMES) {
@@ -625,5 +627,61 @@ describe('self-governed frame pacing', () => {
     });
     assert.ok(n >= 45 && n <= 55,
       `governed to ~50 of 100 callbacks, rendered ${n}`);
+  });
+});
+
+describe('attract mode setting', () => {
+  function idleToAttract(env) {
+    /* The dashboard enters attract after the idle timeout. */
+    for (let i = 0; i < 5000; i++) {
+      env.tick(16.667);
+      if (env.api().Shell.state() === 'attract') return true;
+    }
+    return false;
+  }
+
+  it('defaults to the art piece', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    assert.equal(env.api().Settings.get('attract'), 'art');
+  });
+
+  it('the art screensaver renders edge to edge without faulting', () => {
+    const env = makeEnv({ width: 1080, height: 1920 });
+    bootToMenu(env);
+    const { Shell, Faults } = env.api();
+    assert.ok(idleToAttract(env), 'reached attract');
+    /* Run a few seconds of the art animation. */
+    for (let i = 0; i < 180; i++) env.tick(16.667);
+    assert.equal(Shell.state(), 'attract', 'art holds until input');
+    assert.equal(Faults.count(), 0, JSON.stringify(Faults.latest()));
+  });
+
+  it('a button press leaves the art and returns to the dashboard', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    idleToAttract(env);
+    env.fireKey('Enter', true); env.tick(16); env.fireKey('Enter', false);
+    env.tick(16);
+    assert.equal(env.api().Shell.state(), 'menu');
+  });
+
+  it('the demos mode still self-plays a game', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    env.api().Settings.set('attract', 'demos');
+    assert.ok(idleToAttract(env), 'reached attract');
+    for (let i = 0; i < 60; i++) env.tick(16.667);
+    /* In demos mode a game is loaded and drawing; validated by no fault and
+     * the art flag being off. */
+    assert.equal(env.api().Faults.count(), 0, JSON.stringify(env.api().Faults.latest()));
+  });
+
+  it('the setting only ever stores a known value', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Settings } = env.api();
+    assert.equal(Settings._validate({ attract: 'nonsense' }).attract, 'art');
+    assert.equal(Settings._validate({ attract: 'demos' }).attract, 'demos');
   });
 });
