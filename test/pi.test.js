@@ -385,8 +385,10 @@ describe('kiosk service unit', () => {
      * stock pacing — a locked, playable 30fps — with the one-line upgrade
      * path (WaylandExternalBeginFrameSource) documented beside the flags
      * for when the repaired scheduler ships. */
-    assert.notOk(/--disable-gpu-vsync/.test(src), 'no vsync uncap');
-    assert.notOk(/--disable-frame-rate-limit/.test(src), 'no frame-rate uncap');
+    /* Anchored to flag lines (leading whitespace) so the KNOWN ISSUE
+     * comment, which names the flags to warn about them, does not match. */
+    assert.notOk(/^\s+--disable-gpu-vsync/m.test(src), 'no vsync uncap');
+    assert.notOk(/^\s+--disable-frame-rate-limit/m.test(src), 'no frame-rate uncap');
     assert.ok(/KNOWN ISSUE/.test(src) && /WaylandExternalBeginFrameSource/.test(src),
       'the investigation and the upgrade path are recorded where the flags live');
     /* Chromium honours only the LAST --enable-features switch; a second
