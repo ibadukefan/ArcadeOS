@@ -767,14 +767,25 @@ unit's journal, so this is the channel that works:
 journalctl -u arcadeos-agent | grep "diag " | tail -5
 ```
 
-**Frames are healthy but fps sits at exactly half the refresh rate**
+**Known issue: fps reads exactly half the panel's refresh rate**
 
-That is the compositor's frame pacing, not the page — the first cabinet
-measured 2.9ms frames delivered at 30.0fps under cage, on the wayland and
-Xwayland paths alike. The kiosk supports three compositors, selected by
-`/etc/arcadeos/compositor` (`cage`, the default; `labwc`, what Raspberry Pi
-OS itself composites with and where Chromium paces at full rate; `weston`,
-the embedded-world kiosk shell):
+This is Chromium's Wayland frame pacing, not the page, the compositor, the
+GPU or the kernel — each was measured healthy in isolation on the first
+cabinet (vsynced KMS benchmark 59fps; fullscreen GL client under cage
+780fps; identical halving under cage, labwc and weston; page frames of
+2.9ms). Chromium's scheduler waits on a buffer release that lands just
+after every vblank and loses that race every frame. Its upstream fix
+(`WaylandExternalBeginFrameSource`, rolling out as of mid-2026) is present
+but immature in the Chromium these images ship — enabling it, or uncapping
+the browser, was measured to make things worse (a frozen picture under a
+happy fps counter). The cabinet therefore ships stock pacing: a locked,
+consistent 30fps. Games step by delta-time and animations interpolate, so
+play stays smooth. Re-test the feature flag when Raspberry Pi OS ships a
+newer Chromium — it is a one-line change in `setup-arcade.sh`, documented
+beside the launch flags.
+
+The kiosk's compositor stays selectable via `/etc/arcadeos/compositor`
+(`cage`, the default; `labwc`; `weston`):
 
 ```bash
 echo labwc | sudo tee /etc/arcadeos/compositor

@@ -486,22 +486,28 @@ mkdir -p "\$PROFILE"
 # 1080p is almost exactly the 22fps the first cabinet measured. The Raspberry
 # Pi OS chromium package picks the right V3D/ANGLE path on its own.
 #
-# --disable-gpu-vsync --disable-frame-rate-limit: the 30fps fix, and it is
-# deliberate that the browser's scheduler is bypassed rather than tuned.
+# KNOWN ISSUE — 30fps on a 60Hz panel, and why no flag here fixes it.
 # Chromium's Wayland pacing is a timer phase-locked to vblank that refuses
 # the next frame until the compositor releases the last buffer; on a
 # fullscreen surface that release lands just AFTER each vblank, the unblock
-# loses the race every frame, and rAF settles at exactly half refresh —
-# measured at 2.9ms/frame identically under cage, labwc AND weston, with
-# the kernel proven good (vsynced KMS benchmark: 59fps) and the compositor
-# proven good (fullscreen GL client: 780fps). Chromium's own replacement
-# scheduler (Bug 477649985, present in this binary behind
-# WaylandExternalBeginFrameSource) measured WORSE here (25fps) — the M151
-# snapshot predates its follow-up fixes. So: uncap the browser entirely and
-# let the front end pace itself — Loop in boot.js renders on its own 60Hz
-# clock and skips the excess callbacks, which also keeps input responsive
-# (drawing every uncapped callback starved it). The compositor still
-# vsyncs its own output, so nothing tears on glass.
+# loses the race every frame, and rAF settles at exactly half refresh.
+# Everything else was measured healthy on the first cabinet: vsynced KMS
+# benchmark 59fps (kernel good), fullscreen GL client 780fps under cage
+# (compositor good), identical halving under cage, labwc AND weston
+# (Chromium is the common factor). Every escape was tried and measured:
+#   WaylandExternalBeginFrameSource (Chromium's own upstream fix,
+#     Bug 477649985, in this binary but default-off): 25fps — the M151
+#     snapshot predates its follow-up fixes.
+#   --disable-gpu-vsync alone: 31fps — the release gate is not the vsync.
+#   Full uncap (+ --disable-frame-rate-limit, page self-paced to 60):
+#     counter said 50-57fps while the GLASS froze — presents stalled,
+#     the exact deadlock class the upstream follow-ups fix.
+# So the cabinet ships the stable, playable configuration: stock pacing at
+# a locked 30fps. Games are dt-stepped and animation is interpolated, so
+# play is smooth and consistent. When Raspberry Pi OS ships a Chromium
+# with the repaired scheduler (rolling out upstream as of 2026-08),
+# enabling WaylandExternalBeginFrameSource here is the one-line upgrade
+# to 60 — re-test it per Chromium release.
 # NOTE: Chromium honours only the LAST --enable-features switch, so every
 # feature must live in the single list above.
 exec "\$CHROMIUM" \\
@@ -516,8 +522,6 @@ exec "\$CHROMIUM" \\
   --enable-accelerated-2d-canvas \\
   --canvas-oop-rasterization \\
   --enable-features=CanvasOopRasterization \\
-  --disable-gpu-vsync \\
-  --disable-frame-rate-limit \\
   --enable-zero-copy \\
   --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\

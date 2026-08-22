@@ -378,15 +378,17 @@ describe('kiosk service unit', () => {
       'legacy switch kept for older Chromium builds');
   });
 
-  it('uncaps the browser so the front end can pace itself', () => {
-    /* Chromium's Wayland scheduler halves a fullscreen kiosk's frame rate
-     * (buffer-release race, measured identically under cage, labwc and
-     * weston at 2.9ms/frame). Rather than tune a broken scheduler, the
-     * browser is uncapped and Loop governs its own 60Hz — code this
-     * project owns and tests. Both flags are required: vsync alone left
-     * the release gate in place (measured: still ~31fps). */
-    assert.ok(/--disable-gpu-vsync/.test(src));
-    assert.ok(/--disable-frame-rate-limit/.test(src));
+  it('ships stock frame pacing, with the 30fps story documented in place', () => {
+    /* Every uncap variant was tried on the real cabinet and made things
+     * worse: counters read 50-57fps while the glass froze (a stall class
+     * whose fixes postdate this Chromium). The stable configuration is
+     * stock pacing — a locked, playable 30fps — with the one-line upgrade
+     * path (WaylandExternalBeginFrameSource) documented beside the flags
+     * for when the repaired scheduler ships. */
+    assert.notOk(/--disable-gpu-vsync/.test(src), 'no vsync uncap');
+    assert.notOk(/--disable-frame-rate-limit/.test(src), 'no frame-rate uncap');
+    assert.ok(/KNOWN ISSUE/.test(src) && /WaylandExternalBeginFrameSource/.test(src),
+      'the investigation and the upgrade path are recorded where the flags live');
     /* Chromium honours only the LAST --enable-features switch; a second
      * list anywhere on the line silently discards the first. */
     const launches = src.match(/--enable-features=/g) || [];
