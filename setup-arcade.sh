@@ -485,6 +485,19 @@ mkdir -p "\$PROFILE"
 # Chromium fall back to SwiftShader — software rendering, which on a Pi 4 at
 # 1080p is almost exactly the 22fps the first cabinet measured. The Raspberry
 # Pi OS chromium package picks the right V3D/ANGLE path on its own.
+#
+# WaylandExternalBeginFrameSource: THE 30fps fix. Chromium's default Wayland
+# pacing is a timer phase-locked to vblank that refuses the next frame until
+# the compositor releases the last buffer; on a fullscreen direct-scanout
+# surface that release lands just AFTER each vblank, the unblock loses the
+# race every time, and rAF settles at exactly half refresh — measured here
+# on cage, labwc and weston alike, at 2.9ms/frame. Chromium's replacement
+# scheduler (Bug 477649985) ships inside this very binary behind this
+# disabled-by-default feature; Google enables it via a server-side trial
+# that Debian builds never receive. If a future build misbehaves with it,
+# the agent watchdog restarts the kiosk — the cabinet cannot be lost to it.
+# NOTE: Chromium honours only the LAST --enable-features switch, so every
+# feature must live in the single list above.
 exec "\$CHROMIUM" \\
   --enable-logging=stderr \\
   --log-level=0 \\
@@ -496,7 +509,7 @@ exec "\$CHROMIUM" \\
   --enable-gpu-rasterization \\
   --enable-accelerated-2d-canvas \\
   --canvas-oop-rasterization \\
-  --enable-features=CanvasOopRasterization \\
+  --enable-features=CanvasOopRasterization,WaylandExternalBeginFrameSource \\
   --enable-zero-copy \\
   --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\

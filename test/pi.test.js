@@ -378,6 +378,19 @@ describe('kiosk service unit', () => {
       'legacy switch kept for older Chromium builds');
   });
 
+  it('enables the Wayland frame scheduler that ends the 30fps lock', () => {
+    /* Chromium's default Wayland pacing loses a race against its own
+     * vblank-locked timer on fullscreen direct-scanout surfaces and halves
+     * the frame rate — measured on this cabinet at 2.9ms/frame across
+     * cage, labwc and weston. The replacement scheduler ships in the same
+     * binary behind this disabled-by-default feature. */
+    assert.ok(/WaylandExternalBeginFrameSource/.test(src));
+    /* Chromium honours only the LAST --enable-features switch; a second
+     * list anywhere on the line silently discards the first. */
+    const launches = src.match(/--enable-features=/g) || [];
+    assert.equal(launches.length, 1, 'exactly one --enable-features list');
+  });
+
   it('evicts the login prompt from its TTY', () => {
     /* getty@tty1 and the kiosk raced for tty1 on every boot. The display
      * wait handed getty a guaranteed win, and cage then wedged in PAM
