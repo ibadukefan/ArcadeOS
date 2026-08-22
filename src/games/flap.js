@@ -34,6 +34,16 @@ var FLAP = (function () {
     return Math.min(0.34, 0.24 + score * 0.004);
   }
 
+  /** The gap of the pair the bird is actually flying at, for the HUD. */
+  function nextGap() {
+    for (var i = 0; i < towers.length; i++) {
+      if (!towers[i].passed && towers[i].x + TOWER_W > BIRD_X - R) {
+        return towers[i].gapH;
+      }
+    }
+    return gapFor(score);
+  }
+
   function pushTower(x) {
     var gapH = gapFor(towers.length + score);
     var margin = 90;
@@ -159,7 +169,7 @@ var FLAP = (function () {
     gBackdrop(ACCENT.flap);
     gHud(ACCENT.flap, [
       { label: 'SCORE', value: fmtScore(score) },
-      { label: 'GAP', value: pad(Math.round(gapFor(score)), 3) },
+      { label: 'GAP', value: pad(Math.round(nextGap()), 3) },
       { label: 'SPEED', value: (speed() * 100).toFixed(0) },
     ]);
 

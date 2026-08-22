@@ -322,6 +322,19 @@ describe('2048 merge rules', () => {
     assert.equal(t.score() - s0, 16);
   });
 
+  it('buffers a press that lands mid-slide instead of eating it', () => {
+    /* Fast 2048 play chains presses ~150ms apart; the slide animation is
+     * 110ms. The second press's one-frame edge must not vanish. */
+    const { env, t } = fresh();
+    t.set(0, 0, 1); t.set(0, 3, 5);
+    t.move('down');                     /* slide begins, anim running */
+    env.fireKey('ArrowRight', true);
+    env.tick(16); env.tick(16);         /* press lands mid-anim */
+    env.fireKey('ArrowRight', false);
+    for (let i = 0; i < 12; i++) env.tick(16.667);
+    assert.equal(t.moves(), 2, 'the buffered right was played after the slide');
+  });
+
   it('detects a dead board', () => {
     const { t } = fresh();
     /* Checkerboard of unequal neighbours: no gaps, no fusible pair. */

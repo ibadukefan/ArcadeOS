@@ -26,7 +26,9 @@ var MERGE = (function () {
   /* One animation batch per slide: sprites lerp from->to while the logical
    * grid already holds the result. p runs 0..1 over SLIDE_MS. */
   var anim = null;   /* { sprites: [{v, fr, fc, tr, tc, merged}], t } */
-  var popT = 0;      /* spawn/merge pop timer */
+  var popT = 0;      /* pop timer for the cells in popCells */
+  var popCells = null; /* {cellIndex: true} — spawned + freshly fused tiles */
+  var pending = null;  /* direction pressed mid-slide, applied at its end */
   var particles = makeParticles(48);
 
   function idx(r, c) { return r * N + c; }
@@ -42,6 +44,11 @@ var MERGE = (function () {
     if (!empt.length) return;
     var at = empt[rndInt(0, empt.length - 1)];
     grid[at] = rnd() < 0.9 ? 1 : 2;
+    /* BEST TILE counts what is on the board, not only what has merged —
+     * a directly spawned 4 counts too. */
+    if (grid[at] > bestTile) bestTile = grid[at];
+    popCells = popCells || {};
+    popCells[at] = true;
     popT = 140;
   }
 
@@ -49,7 +56,7 @@ var MERGE = (function () {
     grid = [];
     for (var i = 0; i < N * N; i++) grid[i] = 0;
     score = 0; bestTile = 0; over = false; won = false; moves = 0;
-    anim = null; popT = 0;
+    anim = null; popT = 0; popCells = null; pending = null;
     particles.clear();
     spawn();
     spawn();
@@ -70,6 +77,7 @@ var MERGE = (function () {
     }
     var out = [];
     var gained = 0;
+    var biggest = 0;
     var moved = false;
     var write = 0;
     for (i = 0; i < vals.length; i++) {
@@ -77,10 +85,10 @@ var MERGE = (function () {
         var nv = vals[i] + 1;
         out.push(nv);
         gained += Math.pow(2, nv);
+        if (nv > biggest) biggest = nv;
         if (nv > bestTile) bestTile = nv;
         sprites.push({ v: vals[i], f: rcOf(cells[from[i]]), t: rcOf(cells[write]), merged: true });
         sprites.push({ v: vals[i], f: rcOf(cells[from[i + 1]]), t: rcOf(cells[write]), merged: true });
-        if (from[i] !== write || from[i + 1] !== write) moved = true;
         moved = true;
         i++;
       } else {
@@ -91,7 +99,7 @@ var MERGE = (function () {
       write++;
     }
     for (i = 0; i < N; i++) grid[cells[i]] = i < out.length ? out[i] : 0;
-    return { moved: moved, gained: gained };
+    return { moved: moved, gained: gained, biggest: biggest };
   }
 
   /** Build the four lines for a direction, front of the slide first. */
@@ -119,11 +127,13 @@ var MERGE = (function () {
     var sprites = [];
     var movedAny = false;
     var gained = 0;
+    var biggest = 0;
     var lines = linesFor(dir);
     for (var l = 0; l < lines.length; l++) {
       var res = slideLine(lines[l], sprites, rcOf);
       movedAny = movedAny || res.moved;
       gained += res.gained;
+      if (res.biggest > biggest) biggest = res.biggest;
     }
     if (!movedAny) { Audio2.sfx('denied'); return false; }
 
@@ -131,7 +141,10 @@ var MERGE = (function () {
     score += gained;
     anim = { sprites: sprites, t: 0 };
     if (gained > 0) {
-      Audio2.sfx(bestTile >= 7 ? 'powerup' : 'eat');
+      /* The sound tracks THIS move's largest fusion, so the escalation
+       * still means something after a big tile exists. 64 and up earn
+       * the powerup chime. */
+      Audio2.sfx(biggest >= 6 ? 'powerup' : 'eat');
       Input.rumble(0.2, 0.3, 60);
     } else {
       Audio2.sfx('move');
@@ -165,14 +178,34 @@ var MERGE = (function () {
 
     if (anim) {
       anim.t += dt;
+      /* A press mid-slide is a fast player, not a mistake: buffer it and
+       * play it the instant the slide lands. Hit edges last one frame, so
+       * without this a ~150ms left-right combo silently eats the second
+       * press. */
+      if (Input.hit('left')) pending = 'left';
+      else if (Input.hit('right')) pending = 'right';
+      else if (Input.hit('up')) pending = 'up';
+      else if (Input.hit('down')) pending = 'down';
+
       if (anim.t >= SLIDE_MS) {
+        /* Freshly fused tiles pop on landing, together with the spawn. */
+        popCells = {};
+        for (var i = 0; i < anim.sprites.length; i++) {
+          var sp = anim.sprites[i];
+          if (sp.merged) popCells[idx(sp.t.r, sp.t.c)] = true;
+        }
         anim = null;
         spawn();
         if (!anyMove()) {
+          pending = null;
           over = true;
           Audio2.sfx('over');
           Input.rumble(0.8, 0.6, 320);
           Shell.gameOver(score);
+        } else if (pending) {
+          var d = pending;
+          pending = null;
+          move(d);
         }
       }
       return;
@@ -255,8 +288,10 @@ var MERGE = (function () {
         for (col = 0; col < N; col++) {
           var v = grid[idx(r, col)];
           if (v === 0) continue;
-          var pop = popT > 0 ? 1 - (popT / 140) * 0.18 : 1;
-          drawTile(c, r, col, v, pop);
+          /* Only the spawned and freshly fused tiles pop — the rest of the
+           * board holds still. */
+          var pops = popT > 0 && popCells && popCells[idx(r, col)];
+          drawTile(c, r, col, v, pops ? 1 - (popT / 140) * 0.18 : 1);
         }
       }
     }
@@ -341,6 +376,7 @@ var MERGE = (function () {
       move: move,
       score: function () { return score; },
       over: function () { return over; },
+      moves: function () { return moves; },
       anyMove: anyMove,
       finishAnim: function () { if (anim) { anim.t = SLIDE_MS; update(0); } },
     },
