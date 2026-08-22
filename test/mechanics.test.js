@@ -453,6 +453,38 @@ describe('WORDS guessing', () => {
     assert.equal(ks.R, 'good');
   });
 
+  it('answers are common words but guesses check the full dictionary', () => {
+    const { t } = fresh('crane');
+    const counts = t.counts();
+    /* The first cut used one 669-word list for both jobs and most real
+     * guesses bounced off NOT IN WORD LIST. Never let the split regress. */
+    assert.ok(counts.answers >= 2000, `answer pool is large (${counts.answers})`);
+    assert.ok(counts.valid >= 14000, `guess dictionary is huge (${counts.valid})`);
+    t.type('soare');   /* classic probe word — valid guess, never an answer */
+    t.submit();
+    assert.equal(t.guesses().length, 1, 'an obscure but legal probe word is accepted');
+    assert.notOk(/WORD LIST/.test(t.lastMsg()), 'no rejection message');
+  });
+
+  it('every picked answer is itself a legal guess', () => {
+    const { env, t } = fresh(null);
+    for (let i = 0; i < 30; i++) {
+      assert.ok(t.isValid(t.answer()), `${t.answer()} is in the guess dictionary`);
+      t.type(t.answer());
+      t.submit();
+      for (let f = 0; f < 70; f++) env.tick(16.667);   /* solve → next word */
+    }
+  });
+
+  it('the keyboard clears the shell controls banner', () => {
+    const { t } = fresh('crane');
+    /* The shell draws the hint pill over the bottom of the game viewport
+     * (game-space y ≈ 950 and below). The first layout put DEL and ENTER
+     * exactly under it. */
+    assert.ok(t.layout().kbBottom <= 940,
+      `keyboard bottom ${t.layout().kbBottom} stays above the hint pill`);
+  });
+
   it('the attract pilot solves words and survives the slot', () => {
     const env = makeEnv();
     for (let i = 0; i < 200; i++) env.tick(16);

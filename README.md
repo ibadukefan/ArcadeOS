@@ -247,7 +247,7 @@ DualSense reads `✕`, a Switch Pro reads `A`, a keyboard reads `ENTER`:
 | **DROP** | red | Columns-style match-3, including diagonals, with cascades |
 | **2048** | gold | The sliding merge board — fuse equal tiles, double up |
 | **FLAP** | cyan | One-button flier. Thread the gaps between the towers |
-| **WORDS** | teal | Six tries to crack a five-letter word, endless — d-pad keyboard |
+| **WORDS** | teal | Six tries to crack a five-letter word, endless — d-pad keyboard. Answers come from 2,321 common words; guesses are checked against the full 14,855-word dictionary, so any real word is a legal probe |
 | **MINES** | blue | Minesweeper, endless — clear the field, flag the bombs, next board is denser |
 | **VERSUS** | purple | Head-to-head Tetris with garbage lines. Needs two pads |
 
@@ -268,7 +268,7 @@ conveniences, never requirements.
 | DROP | ◀▶ move · ▼ soft drop · **A** cycle gems · **X** hard drop |
 | 2048 | ◀▶▲▼ slide the whole board |
 | FLAP | **A** flap |
-| WORDS | ✚ move · **A** type · **B** delete · **X** enter |
+| WORDS | ✚ move · **A** type · **B** delete · **X** submit |
 | MINES | ✚ move · **A** dig · **X** flag |
 | VERSUS | As Tetris, per player |
 
@@ -596,11 +596,26 @@ it exists because of two real bugs:
 
 Both classes are now caught the moment they are drawn.
 
-Current coverage: 234 tests. Boot → dashboard → each game → pause → quit for
-all nine games; 1500+ randomised frames per game with varied `dt`; controller
+Current coverage: 389 tests. Boot → dashboard → each game → pause → quit for
+every game; 1500+ randomised frames per game with varied `dt`; controller
 detection for Xbox, PlayStation, Nintendo and unknown pads; storage fresh,
 populated, corrupt and unavailable; per-frame draw and full-screen-op budgets;
 sub-frame input latching; and the Pi assets.
+
+**Browser E2E (optional).** `test/e2e.drive.cjs` drives the real bundle in
+real Chromium via Playwright: it launches every game from the dashboard,
+plays it with genuine keyboard events (WORDS gets a full solve, typed letter
+by letter on the on-screen grid), pauses, quits, screenshots each stage, and
+fails on any page error or recorded fault. It needs Playwright and a
+Chromium — neither ships with the repo — so it is not part of
+`node test/run.js`; run it where they exist:
+
+```sh
+node build.js && NODE_PATH=$(npm root -g) node test/e2e.drive.cjs
+```
+
+Screenshots land in `$E2E_SHOTS_DIR` (default: a temp dir) — the fastest way
+to see every screen of the front end without a cabinet.
 
 Failures reproduce: every random source is seeded.
 

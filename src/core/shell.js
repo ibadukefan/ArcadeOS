@@ -458,7 +458,12 @@ var Shell = (function () {
 
   /* Row layout for the settings list: headers are shorter than rows, and the
    * list is taller than the screen now, so it scrolls like the dashboard. */
-  var SET_ROW_H = 84, SET_HEADER_H = 56, SET_TOP = 250, SET_BOT = SH - 120;
+  /* SET_BOT leaves room BELOW the list for the storage note and then the
+   * footer legend. The list clips at SET_BOT+20, the note sits at
+   * FOOTER_Y-52 and the legend at FOOTER_Y: three bands that must never
+   * touch — the note once printed straight through the legend, and a second
+   * cut printed it through the list's last row instead. */
+  var SET_ROW_H = 84, SET_HEADER_H = 56, SET_TOP = 250, SET_BOT = SH - 190;
 
   function settingsLayout(items) {
     var ys = [], y = 0;
@@ -580,24 +585,38 @@ var Shell = (function () {
       return;
     }
     if (it.id === 'pairing') {
-      System.pair();
+      System.pair(powerResult('PAIRING'));
       say('PAIRING MODE — HOLD SYNC ON THE PAD');
       return;
     }
     if (it.id === 'restart') {
       ask('RESTART THE CABINET?', function () {
         say('RESTARTING…');
-        System.request('restart');
+        System.request('restart', powerResult('RESTART'));
       });
       return;
     }
     if (it.id === 'shutdown') {
       ask('SHUT DOWN THE CABINET?', function () {
         say('SHUTTING DOWN — WAIT FOR THE GREEN LED TO STOP');
-        System.request('shutdown');
+        System.request('shutdown', powerResult('SHUTDOWN'));
       });
       return;
     }
+  }
+
+  /**
+   * A cabinet command that fails must SAY so. "RESTARTING…" followed by
+   * nothing — because the agent was down, or refused the token — looked
+   * exactly like success on a real cabinet, and the owner sat waiting for a
+   * reboot that was never coming.
+   */
+  function powerResult(what) {
+    return function (ok, detail) {
+      if (ok) return;   /* success narrates itself: the machine acts */
+      say(what + ' FAILED (' + String(detail || 'no agent').toUpperCase() +
+        ') — CHECK SYSTEM ▸ ABOUT');
+    };
   }
 
   function ask(text, onYes) {
@@ -1501,7 +1520,7 @@ var Shell = (function () {
     text(c, Store.persistent()
       ? 'SETTINGS AND SCORES ARE SAVED ON THIS CABINET'
       : 'STORAGE UNAVAILABLE — CHANGES LAST FOR THIS SESSION ONLY',
-      SW / 2, SET_BOT + 34, {
+      SW / 2, FOOTER_Y - 52, {
         size: 14, weight: '500', track: 2,
         color: Store.persistent() ? COL.dim : COL.warn, align: 'center',
       });
