@@ -91,10 +91,18 @@ var PULSE = (function () {
       var offBeat = (inBar % 2 === 0);
       var density = 0.18 + progress * 0.34;
 
+      /* Ease-in: the opening used to arrive at near-full density on the very
+       * first playable bar, which read as an advanced level from note one.
+       * The fills (everything but the on-beat pulse) now phase in over the
+       * first eight bars, so the song teaches its own rhythm before it asks
+       * for the busy stuff. The r() draw itself is unconditional so the
+       * chart stays deterministic. */
+      var ramp = clamp((bar - 1) / 8, 0, 1);
+
       var place = false;
       if (onBeat) place = true;                       /* the pulse itself */
-      else if (offBeat) place = r() < density + 0.18;
-      else place = r() < density * 0.55;
+      else if (offBeat) place = r() < (density + 0.18) * ramp;
+      else place = r() < density * 0.55 * ramp;
 
       /* Breathe: drop a bar every eight so it is not relentless. */
       if (bar % 8 === 7 && inBar >= 8) place = onBeat && r() < 0.5;
