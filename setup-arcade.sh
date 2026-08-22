@@ -510,13 +510,19 @@ mkdir -p "\$PROFILE"
 # to 60 — re-test it per Chromium release.
 # NOTE: Chromium honours only the LAST --enable-features switch, so every
 # feature must live in the single list above.
+# The dispatcher picks the display stack: wayland under cage/labwc/weston,
+# x11 under the native-Xorg experiment (see kiosk.sh). Chromium's X11
+# present path paces frames with entirely different machinery than its
+# Wayland one, which is the point of offering it.
+OZONE="\${ARCADEOS_OZONE:-wayland}"
+
 exec "\$CHROMIUM" \\
   --enable-logging=stderr \\
   --log-level=0 \\
   --kiosk \\
   --app="\$PAGE" \\
   --user-data-dir="\$PROFILE" \\
-  --ozone-platform=wayland \\
+  --ozone-platform="\$OZONE" \\
   --ignore-gpu-blocklist \\
   --enable-gpu-rasterization \\
   --enable-accelerated-2d-canvas \\
@@ -553,9 +559,24 @@ LAUNCH
   # composites with, where Chromium demonstrably paces at full rate on
   # this hardware, and it is what maintained Pi kiosk projects ship;
   # weston's kiosk shell is the embedded-world alternative.
-  # /etc/arcadeos/compositor selects: "cage" (default), "labwc", or
-  # "weston". Every branch verifies its binary and falls back to cage,
-  # so an update that cannot run apt can never black-screen a cabinet.
+  # /etc/arcadeos/compositor selects: "cage" (default), "labwc",
+  # "weston", or "x11". Every branch verifies its binary and falls back
+  # to cage, so an update that cannot run apt can never black-screen a
+  # cabinet.
+  #
+  # "x11" is the half-refresh experiment: every Wayland compositor above
+  # measured identical 30fps because the halving lives in Chromium's
+  # Wayland frame-callback pacing — including Xwayland, which still rides
+  # the compositor's frame clock. Native Xorg is the one present path
+  # with none of that machinery. It is not installed by default; to try:
+  #   sudo apt install xserver-xorg xinit xserver-xorg-legacy
+  #   sudo sh -c 'echo allowed_users=anybody > /etc/X11/Xwrapper.config'
+  #   sudo sh -c 'echo needs_root_rights=yes >> /etc/X11/Xwrapper.config'
+  #   sudo sh -c 'echo x11 > /etc/arcadeos/compositor'
+  #   sudo systemctl restart arcadeos
+  # (Xorg does not honour panel_orientation, so the screen comes up
+  # landscape — the front end's auto-portrait mode rotates the page
+  # itself, so the picture is unchanged.) Revert: echo cage > the file.
   cat > "$APP_DIR/kiosk.sh" <<KIOSK
 #!/usr/bin/env bash
 # ArcadeOS compositor dispatcher. Managed by setup-arcade.sh.
@@ -564,6 +585,13 @@ set -Eeuo pipefail
 CHOICE="cage"
 [[ -r /etc/arcadeos/compositor ]] \\
   && CHOICE="\$(head -1 /etc/arcadeos/compositor | tr -d '[:space:]')"
+
+if [[ "\$CHOICE" == "x11" ]] && command -v xinit >/dev/null 2>&1; then
+  # Native Xorg, no Wayland anywhere. Deliberately NOT exec'd: if Xorg
+  # cannot start (rootless X needs the Xwrapper config, see setup), this
+  # falls through to cage instead of crash-looping a black screen.
+  ARCADEOS_OZONE=x11 xinit ${APP_DIR}/launch.sh -- :0 vt1 -keeptty -nolisten tcp -nocursor || true
+fi
 
 if [[ "\$CHOICE" == "labwc" ]] && command -v labwc >/dev/null 2>&1; then
   # labwc has no single-app mode; a private config dir whose autostart

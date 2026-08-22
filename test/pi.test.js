@@ -335,6 +335,21 @@ describe('kiosk service unit', () => {
       'chromium waits for the weston socket instead of racing it');
   });
 
+  it('offers native Xorg as the half-refresh escape hatch', () => {
+    const start = src.indexOf('kiosk.sh" <<KIOSK');
+    const kiosk = src.slice(start, src.indexOf('\nKIOSK', start));
+    assert.ok(/command -v xinit/.test(kiosk), 'xinit is verified before use');
+    /* NOT exec'd: a machine without the Xwrapper config must fall through
+     * to cage, not crash-loop a black screen. */
+    const line = kiosk.match(/^\s*ARCADEOS_OZONE=x11 .*$/m);
+    assert.ok(line, 'the x11 branch flips the ozone platform');
+    assert.notOk(/exec xinit/.test(line[0]), 'xinit is not exec\'d');
+    assert.ok(/\|\| true/.test(line[0]), 'an Xorg failure falls through to cage');
+    /* launch.sh must honour that flip while defaulting to wayland. */
+    assert.ok(/--ozone-platform="\\\$OZONE"/.test(src), 'the ozone platform is a variable');
+    assert.ok(/ARCADEOS_OZONE:-wayland/.test(src), 'wayland stays the default');
+  });
+
   it('starts cage with real flags only', () => {
     const exec = src.match(/exec \/usr\/bin\/cage ([^\n]*)/);
     assert.ok(exec, 'the dispatcher execs cage');

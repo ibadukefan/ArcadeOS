@@ -808,7 +808,7 @@ newer Chromium — it is a one-line change in `setup-arcade.sh`, documented
 beside the launch flags.
 
 The kiosk's compositor stays selectable via `/etc/arcadeos/compositor`
-(`cage`, the default; `labwc`; `weston`):
+(`cage`, the default; `labwc`; `weston`; `x11`):
 
 ```bash
 echo labwc | sudo tee /etc/arcadeos/compositor
@@ -817,6 +817,27 @@ sudo systemctl restart arcadeos
 
 Anything missing or misspelled falls back to cage — the cabinet can never
 black-screen over this file.
+
+**The `x11` option is the half-refresh escape hatch.** Every Wayland
+compositor measures the same 30fps because the bug lives in Chromium's
+Wayland frame pacing — and Xwayland still rides the compositor's frame
+clock. Native Xorg is the one display path with none of that machinery, so
+it is the remaining candidate for true 60fps. It needs packages that are
+not installed by default:
+
+```bash
+sudo apt install xserver-xorg xinit xserver-xorg-legacy
+printf 'allowed_users=anybody\nneeds_root_rights=yes\n' | sudo tee /etc/X11/Xwrapper.config
+echo x11 | sudo tee /etc/arcadeos/compositor
+sudo systemctl restart arcadeos
+```
+
+Xorg does not honour the kernel's `panel_orientation`, so the display comes
+up landscape — the front end's auto-portrait mode rotates the page itself,
+so the picture looks the same. Check the FRAME TIMER (settings) or the
+`diag` journal line for the verdict; `echo cage | sudo tee
+/etc/arcadeos/compositor` reverts. If Xorg fails to start, the dispatcher
+falls through to cage automatically.
 
 **The screen froze and nothing recovers it**
 
