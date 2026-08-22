@@ -18,20 +18,63 @@ var MERGE = (function () {
    * the same moulded plastic as everything else on the cabinet. */
   var RAMP = ['I', 'S', 'O', 'L', 'Z', 'T', 'J'];
 
+  /* Face labels ("2".."65536") by exponent, built once — draw() must never
+   * allocate a string per tile per frame on a Pi. */
+  var LABELS = (function () {
+    var out = [''];
+    for (var v = 1; v <= 16; v++) out[v] = String(Math.pow(2, v));
+    return out;
+  })();
+
+  /* The cell indices each direction slides, front-of-slide first, precomputed
+   * once — move() and the attract pilot both read these every frame, and the
+   * mapping never changes. */
+  var LINES = (function () {
+    var dirs = ['left', 'right', 'up', 'down'];
+    var all = {};
+    for (var d = 0; d < dirs.length; d++) {
+      var dir = dirs[d], lines = [];
+      for (var k = 0; k < N; k++) {
+        var line = [];
+        for (var j = 0; j < N; j++) {
+          var r, c;
+          if (dir === 'left') { r = k; c = j; }
+          else if (dir === 'right') { r = k; c = N - 1 - j; }
+          else if (dir === 'up') { r = j; c = k; }
+          else { r = N - 1 - j; c = k; }
+          line.push(r * N + c);
+        }
+        lines.push(line);
+      }
+      all[dir] = lines;
+    }
+    return all;
+  })();
+
   /* Board state: exponents, 0 = empty (1 -> "2", 2 -> "4", ...). */
   var grid = [];
-  var score = 0, bestTile = 0, over = false, won = false;
+  var score = 0, over = false, won = false;
   var moves = 0;
 
-  /* One animation batch per slide: sprites lerp from->to while the logical
-   * grid already holds the result. p runs 0..1 over SLIDE_MS. */
-  var anim = null;   /* { sprites: [{v, fr, fc, tr, tc, merged}], t } */
+  /* One animation batch per slide: sprites lerp from->to (cell indices) while
+   * the logical grid already holds the result. */
+  var anim = null;   /* { sprites: [{v, f, t, merged}], t } */
   var popT = 0;      /* pop timer for the cells in popCells */
   var popCells = null; /* {cellIndex: true} — spawned + freshly fused tiles */
   var pending = null;  /* direction pressed mid-slide, applied at its end */
   var particles = makeParticles(48);
 
   function idx(r, c) { return r * N + c; }
+  function cellX(i) { return X0 + GAP + (i % N) * (CELL + GAP); }
+  function cellY(i) { return Y0 + GAP + Math.floor(i / N) * (CELL + GAP); }
+
+  /** Largest exponent on the board — derived, never stored, so it can never
+   * drift from the grid. */
+  function maxTile() {
+    var m = 0;
+    for (var i = 0; i < N * N; i++) if (grid[i] > m) m = grid[i];
+    return m;
+  }
 
   function emptyCells() {
     var out = [];
@@ -44,9 +87,6 @@ var MERGE = (function () {
     if (!empt.length) return;
     var at = empt[rndInt(0, empt.length - 1)];
     grid[at] = rnd() < 0.9 ? 1 : 2;
-    /* BEST TILE counts what is on the board, not only what has merged —
-     * a directly spawned 4 counts too. */
-    if (grid[at] > bestTile) bestTile = grid[at];
     popCells = popCells || {};
     popCells[at] = true;
     popT = 140;
@@ -55,45 +95,49 @@ var MERGE = (function () {
   function start() {
     grid = [];
     for (var i = 0; i < N * N; i++) grid[i] = 0;
-    score = 0; bestTile = 0; over = false; won = false; moves = 0;
+    score = 0; over = false; won = false; moves = 0;
     anim = null; popT = 0; popCells = null; pending = null;
     particles.clear();
     spawn();
     spawn();
   }
 
+  /** Which direction was pressed this frame, or null. */
+  function dirHit() {
+    if (Input.hit('left')) return 'left';
+    if (Input.hit('right')) return 'right';
+    if (Input.hit('up')) return 'up';
+    if (Input.hit('down')) return 'down';
+    return null;
+  }
+
   /**
-   * Slide one line (as indices into grid, front first). Returns the moved
-   * sprites and gained score; mutates grid. Classic rules: each tile merges
-   * at most once per move.
+   * Slide one line (cell indices, front first). Pushes moved sprites, returns
+   * whether it moved plus the score and largest exponent gained. Classic
+   * rules: each tile merges at most once per move.
    */
-  function slideLine(cells, sprites, rcOf) {
-    var vals = [];
-    var from = [];
+  function slideLine(cells, sprites) {
+    var vals = [], from = [];
     var i, v;
     for (i = 0; i < N; i++) {
       v = grid[cells[i]];
       if (v !== 0) { vals.push(v); from.push(i); }
     }
     var out = [];
-    var gained = 0;
-    var biggest = 0;
-    var moved = false;
-    var write = 0;
+    var gained = 0, biggest = 0, moved = false, write = 0;
     for (i = 0; i < vals.length; i++) {
       if (i + 1 < vals.length && vals[i] === vals[i + 1]) {
         var nv = vals[i] + 1;
         out.push(nv);
         gained += Math.pow(2, nv);
         if (nv > biggest) biggest = nv;
-        if (nv > bestTile) bestTile = nv;
-        sprites.push({ v: vals[i], f: rcOf(cells[from[i]]), t: rcOf(cells[write]), merged: true });
-        sprites.push({ v: vals[i], f: rcOf(cells[from[i + 1]]), t: rcOf(cells[write]), merged: true });
+        sprites.push({ v: vals[i], f: cells[from[i]], t: cells[write], merged: true });
+        sprites.push({ v: vals[i], f: cells[from[i + 1]], t: cells[write], merged: true });
         moved = true;
         i++;
       } else {
         out.push(vals[i]);
-        sprites.push({ v: vals[i], f: rcOf(cells[from[i]]), t: rcOf(cells[write]), merged: false });
+        sprites.push({ v: vals[i], f: cells[from[i]], t: cells[write], merged: false });
         if (from[i] !== write) moved = true;
       }
       write++;
@@ -102,35 +146,13 @@ var MERGE = (function () {
     return { moved: moved, gained: gained, biggest: biggest };
   }
 
-  /** Build the four lines for a direction, front of the slide first. */
-  function linesFor(dir) {
-    var lines = [];
-    var r, c, line;
-    for (var k = 0; k < N; k++) {
-      line = [];
-      for (var j = 0; j < N; j++) {
-        if (dir === 'left') { r = k; c = j; }
-        else if (dir === 'right') { r = k; c = N - 1 - j; }
-        else if (dir === 'up') { r = j; c = k; }
-        else { r = N - 1 - j; c = k; }
-        line.push(idx(r, c));
-      }
-      lines.push(line);
-    }
-    return lines;
-  }
-
-  function rcOf(i) { return { r: Math.floor(i / N), c: i % N }; }
-
   function move(dir) {
     if (over || anim) return false;
     var sprites = [];
-    var movedAny = false;
-    var gained = 0;
-    var biggest = 0;
-    var lines = linesFor(dir);
+    var movedAny = false, gained = 0, biggest = 0;
+    var lines = LINES[dir];
     for (var l = 0; l < lines.length; l++) {
-      var res = slideLine(lines[l], sprites, rcOf);
+      var res = slideLine(lines[l], sprites);
       movedAny = movedAny || res.moved;
       gained += res.gained;
       if (res.biggest > biggest) biggest = res.biggest;
@@ -149,7 +171,7 @@ var MERGE = (function () {
     } else {
       Audio2.sfx('move');
     }
-    if (!won && bestTile >= 11) {
+    if (!won && maxTile() >= 11) {
       /* 2048 reached: celebrate, keep playing. */
       won = true;
       Audio2.sfx('clear', 4);
@@ -158,6 +180,23 @@ var MERGE = (function () {
         { speed: 0.3, life: 640, size: 5 });
     }
     return true;
+  }
+
+  /** Would this direction change the board? Pure check, no mutation — the
+   * attract pilot uses it to look before it leaps. */
+  function wouldMove(dir) {
+    var lines = LINES[dir];
+    for (var l = 0; l < lines.length; l++) {
+      var seenGap = false, prev = 0;
+      for (var j = 0; j < N; j++) {
+        var v = grid[lines[l][j]];
+        if (v === 0) { seenGap = true; continue; }
+        if (seenGap) return true;          /* a tile can slide into a gap */
+        if (prev !== 0 && prev === v) return true;  /* a pair can fuse */
+        prev = v;
+      }
+    }
+    return false;
   }
 
   function anyMove() {
@@ -182,17 +221,15 @@ var MERGE = (function () {
        * play it the instant the slide lands. Hit edges last one frame, so
        * without this a ~150ms left-right combo silently eats the second
        * press. */
-      if (Input.hit('left')) pending = 'left';
-      else if (Input.hit('right')) pending = 'right';
-      else if (Input.hit('up')) pending = 'up';
-      else if (Input.hit('down')) pending = 'down';
+      var buf = dirHit();
+      if (buf) pending = buf;
 
       if (anim.t >= SLIDE_MS) {
         /* Freshly fused tiles pop on landing, together with the spawn. */
         popCells = {};
         for (var i = 0; i < anim.sprites.length; i++) {
           var sp = anim.sprites[i];
-          if (sp.merged) popCells[idx(sp.t.r, sp.t.c)] = true;
+          if (sp.merged) popCells[sp.t] = true;
         }
         anim = null;
         spawn();
@@ -212,10 +249,8 @@ var MERGE = (function () {
     }
     if (over) return;
 
-    if (Input.hit('left')) move('left');
-    else if (Input.hit('right')) move('right');
-    else if (Input.hit('up')) move('up');
-    else if (Input.hit('down')) move('down');
+    var dir = dirHit();
+    if (dir) move(dir);
   }
 
   /* ------------------------------------------------------------ draw --- */
@@ -224,24 +259,12 @@ var MERGE = (function () {
     return PIECE_COL[RAMP[((v - 1) % RAMP.length + RAMP.length) % RAMP.length]];
   }
 
-  function cellXY(r, c) {
-    return {
-      x: X0 + GAP + c * (CELL + GAP),
-      y: Y0 + GAP + r * (CELL + GAP),
-    };
-  }
-
-  function drawTile(c2, r, c, v, scale) {
-    var p = cellXY(r, c);
-    drawTileAt(c2, p.x, p.y, v, scale);
-  }
-
   function drawTileAt(c2, x, y, v, scale) {
     var s = CELL * (scale || 1);
     var off = (CELL - s) / 2;
     var col = faceOf(v);
     tile(c2, x + off, y + off, s, col[0], col[1], 'solid');
-    var label = String(Math.pow(2, v));
+    var label = LABELS[v] || String(Math.pow(2, v));
     /* Bigger numbers, smaller type. */
     var size = label.length <= 2 ? 44 : label.length === 3 ? 36 : 28;
     dataText(c2, label, x + CELL / 2, y + CELL / 2 + size * 0.36, {
@@ -251,10 +274,11 @@ var MERGE = (function () {
 
   function draw() {
     var c = gx;
+    var best = maxTile();
     gBackdrop(ACCENT.merge);
     gHud(ACCENT.merge, [
       { label: 'SCORE', value: fmtScore(score) },
-      { label: 'BEST TILE', value: bestTile ? String(Math.pow(2, bestTile)) : '-' },
+      { label: 'BEST TILE', value: best ? LABELS[best] : '-' },
       { label: 'MOVES', value: pad(moves, 3) },
     ]);
 
@@ -263,36 +287,29 @@ var MERGE = (function () {
     });
 
     /* Empty wells. */
-    var r, col;
-    for (r = 0; r < N; r++) {
-      for (col = 0; col < N; col++) {
-        var p = cellXY(r, col);
-        panel(c, p.x, p.y, CELL, CELL, {
-          fill: 'rgba(140,150,255,.05)', stroke: 'rgba(140,150,255,.06)', radius: 10,
-        });
-      }
+    var i;
+    for (i = 0; i < N * N; i++) {
+      panel(c, cellX(i), cellY(i), CELL, CELL, {
+        fill: 'rgba(140,150,255,.05)', stroke: 'rgba(140,150,255,.06)', radius: 10,
+      });
     }
 
     if (anim) {
-      var t = clamp(anim.t / SLIDE_MS, 0, 1);
+      var tt = clamp(anim.t / SLIDE_MS, 0, 1);
       /* Ease-out so the slide lands rather than stops. */
-      var e = 1 - (1 - t) * (1 - t);
-      for (var i = 0; i < anim.sprites.length; i++) {
+      var e = 1 - (1 - tt) * (1 - tt);
+      for (i = 0; i < anim.sprites.length; i++) {
         var s = anim.sprites[i];
-        var f = cellXY(s.f.r, s.f.c);
-        var to = cellXY(s.t.r, s.t.c);
-        drawTileAt(c, lerp(f.x, to.x, e), lerp(f.y, to.y, e), s.v, 1);
+        drawTileAt(c, lerp(cellX(s.f), cellX(s.t), e),
+          lerp(cellY(s.f), cellY(s.t), e), s.v, 1);
       }
     } else {
-      for (r = 0; r < N; r++) {
-        for (col = 0; col < N; col++) {
-          var v = grid[idx(r, col)];
-          if (v === 0) continue;
-          /* Only the spawned and freshly fused tiles pop — the rest of the
-           * board holds still. */
-          var pops = popT > 0 && popCells && popCells[idx(r, col)];
-          drawTile(c, r, col, v, pops ? 1 - (popT / 140) * 0.18 : 1);
-        }
+      for (i = 0; i < N * N; i++) {
+        var v = grid[i];
+        if (v === 0) continue;
+        /* Only the spawned and freshly fused tiles pop — the rest holds still. */
+        var pops = popT > 0 && popCells && popCells[i];
+        drawTileAt(c, cellX(i), cellY(i), v, pops ? 1 - (popT / 140) * 0.18 : 1);
       }
     }
 
@@ -322,7 +339,7 @@ var MERGE = (function () {
       var sz = s * (scale || 1);
       var off = (s - sz) / 2;
       tile(c, x + off, y + off, sz, col[0], col[1], 'solid');
-      dataText(c, String(Math.pow(2, v)), x + s / 2, y + s / 2 + s * 0.13, {
+      dataText(c, LABELS[v] || String(Math.pow(2, v)), x + s / 2, y + s / 2 + s * 0.13, {
         size: s * 0.34 * (scale || 1), align: 'center', color: COL.bgBot,
       });
     }
@@ -381,21 +398,4 @@ var MERGE = (function () {
       finishAnim: function () { if (anim) { anim.t = SLIDE_MS; update(0); } },
     },
   });
-
-  /** Would this direction change the board? Pure check, no mutation. */
-  function wouldMove(dir) {
-    var lines = linesFor(dir);
-    for (var l = 0; l < lines.length; l++) {
-      var seenGap = false;
-      var prev = 0;
-      for (var j = 0; j < N; j++) {
-        var v = grid[lines[l][j]];
-        if (v === 0) { seenGap = true; continue; }
-        if (seenGap) return true;          /* a tile can slide into a gap */
-        if (prev !== 0 && prev === v) return true;  /* a pair can fuse */
-        prev = v;
-      }
-    }
-    return false;
-  }
 })();

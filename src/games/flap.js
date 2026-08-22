@@ -34,14 +34,13 @@ var FLAP = (function () {
     return Math.min(0.34, 0.24 + score * 0.004);
   }
 
-  /** The gap of the pair the bird is actually flying at, for the HUD. */
-  function nextGap() {
+  /** The pair the bird is flying at — the first not-yet-passed tower still
+   * ahead of it. One definition, read by the HUD and the attract pilot. */
+  function nextTower() {
     for (var i = 0; i < towers.length; i++) {
-      if (!towers[i].passed && towers[i].x + TOWER_W > BIRD_X - R) {
-        return towers[i].gapH;
-      }
+      if (!towers[i].passed && towers[i].x + TOWER_W > BIRD_X - R) return towers[i];
     }
-    return gapFor(score);
+    return null;
   }
 
   function pushTower(x) {
@@ -144,7 +143,7 @@ var FLAP = (function () {
     slab(c, tw.x - 6, gapBot, TOWER_W + 12, lip, col[0], col[1], 'solid');
   }
 
-  function drawBird(c, bx, by, radius, t) {
+  function drawBird(c, bx, by, radius) {
     Render.glow(c, bx, by, radius * 3.4, ACCENT.flap, 0.5);
     c.fillStyle = ACCENT.flap;
     c.beginPath();
@@ -169,14 +168,14 @@ var FLAP = (function () {
     gBackdrop(ACCENT.flap);
     gHud(ACCENT.flap, [
       { label: 'SCORE', value: fmtScore(score) },
-      { label: 'GAP', value: pad(Math.round(nextGap()), 3) },
+      { label: 'GAP', value: pad(Math.round((nextTower() || { gapH: gapFor(score) }).gapH), 3) },
       { label: 'SPEED', value: (speed() * 100).toFixed(0) },
     ]);
 
     for (var i = 0; i < towers.length; i++) drawTowerPair(c, towers[i]);
     particles.draw(c);
 
-    if (!over) drawBird(c, BIRD_X, y, R, 0);
+    if (!over) drawBird(c, BIRD_X, y, R);
 
     if (ready) {
       text(c, 'PRESS TO FLAP', GW / 2, GH * 0.72, {
@@ -203,7 +202,7 @@ var FLAP = (function () {
     }
     /* Bobbing bird. */
     var by = h * 0.45 + Math.sin(t * 0.004) * h * 0.08;
-    drawBird(c, w * 0.22, by, Math.min(w, h) * 0.07, t);
+    drawBird(c, w * 0.22, by, Math.min(w, h) * 0.07);
   }
 
   return registerGame({
@@ -220,10 +219,8 @@ var FLAP = (function () {
       var out = {};
       if (over) return out;
       if (ready) { out.confirm = true; return out; }
-      var target = (TOP + BOT) / 2;
-      for (var i = 0; i < towers.length; i++) {
-        if (towers[i].x + TOWER_W > BIRD_X - R) { target = towers[i].gapY; break; }
-      }
+      var next = nextTower();
+      var target = next ? next.gapY : (TOP + BOT) / 2;
       if (y > target + 6 && vy > -0.1) out.confirm = true;
       return out;
     },
