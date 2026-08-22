@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=ArcadeOS
+Description=Black to wordmark to dashboard. Nothing else.
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/arcadeos
+ScriptFile=/usr/share/plymouth/themes/arcadeos/arcadeos.script

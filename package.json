@@ -1,0 +1,16 @@
+{
+  "name": "arcadeos",
+  "version": "1.0.0",
+  "description": "Boot-to-arcade console front end for a Raspberry Pi 4 in portrait orientation",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "build:min": "node build.js --minify",
+    "test": "node test/run.js",
+    "check": "node build.js && node test/run.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

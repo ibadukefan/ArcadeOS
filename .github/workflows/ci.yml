@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No `npm ci` — ArcadeOS has zero dependencies, by design. There is no
+      # lockfile to install and nothing to cache.
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        # The suite is headless: it mocks document, window, the canvas 2D
+        # context and navigator.getGamepads, so no browser is needed here.
+        run: npm test
+
+      - name: Check the committed bundle is current
+        # The Pi installs dist/arcade.html directly so it never needs Node.
+        # If it drifts from src/, a cabinet gets a stale build.
+        run: |
+          git diff --exit-code -- dist/arcade.html \
+            || { echo "::error::dist/arcade.html is stale — run 'npm run build' and commit it"; exit 1; }
+
+      - name: Check Pi helper scripts
+        run: |
+          bash -n setup-arcade.sh
+          python3 -m py_compile pi/*.py

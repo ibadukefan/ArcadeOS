@@ -1,0 +1,63 @@
+# ArcadeOS boot splash.
+#
+# The whole brief for this file is: black, then the wordmark, then the
+# dashboard. No spinner, no distro branding, no progress percentage. A cabinet
+# should look like it was switched on, not like it is booting an operating
+# system.
+#
+# Plymouth's script language has no floats-as-you-expect and no string
+# formatting worth using, so everything here is deliberately blunt.
+
+Window.SetBackgroundTopColor(0.113, 0.090, 0.282);      # #1D1748
+Window.SetBackgroundBottomColor(0.027, 0.019, 0.054);   # #07050E
+
+logo.image = Image("arcadeos-logo.png");
+logo.width = logo.image.GetWidth();
+logo.height = logo.image.GetHeight();
+
+# Scale down if the panel is narrower than the wordmark (portrait 1080 is).
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+if (logo.width > screen_width * 0.8)
+  {
+    scale = screen_width * 0.8 / logo.width;
+    logo.image = logo.image.Scale(logo.width * scale, logo.height * scale);
+    logo.width = logo.image.GetWidth();
+    logo.height = logo.image.GetHeight();
+  }
+
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetX((screen_width - logo.width) / 2);
+logo.sprite.SetY((screen_height - logo.height) / 2);
+logo.sprite.SetOpacity(0);
+
+# A slow fade in, so a fast boot does not flash the wordmark at you.
+progress = 0;
+
+fun refresh_callback()
+  {
+    progress++;
+    opacity = progress / 25;
+    if (opacity > 1)
+      opacity = 1;
+    logo.sprite.SetOpacity(opacity);
+  }
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# Password prompts should never appear on a cabinet, but if the disk is
+# encrypted the user still needs to be able to see the prompt.
+fun display_password_callback(prompt, bullets)
+  {
+    logo.sprite.SetOpacity(1);
+  }
+
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
+
+fun quit_callback()
+  {
+    logo.sprite.SetOpacity(1);
+  }
+
+Plymouth.SetQuitFunction(quit_callback);
