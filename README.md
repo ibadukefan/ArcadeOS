@@ -248,6 +248,7 @@ DualSense reads `✕`, a Switch Pro reads `A`, a keyboard reads `ENTER`:
 | **2048** | gold | The sliding merge board — fuse equal tiles, double up |
 | **FLAP** | cyan | One-button flier. Thread the gaps between the towers |
 | **WORDS** | teal | Six tries to crack a five-letter word, endless — d-pad keyboard |
+| **MINES** | blue | Minesweeper, endless — clear the field, flag the bombs, next board is denser |
 | **VERSUS** | purple | Head-to-head Tetris with garbage lines. Needs two pads |
 
 ### Per-game controls
@@ -268,6 +269,7 @@ conveniences, never requirements.
 | 2048 | ◀▶▲▼ slide the whole board |
 | FLAP | **A** flap |
 | WORDS | ✚ move · **A** type · **B** delete · **X** enter |
+| MINES | ✚ move · **A** dig · **X** flag |
 | VERSUS | As Tetris, per player |
 
 ### High scores

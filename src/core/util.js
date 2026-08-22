@@ -58,6 +58,7 @@ var ACCENT = {
   merge: '#F0C64E',   /* breakout's gold */
   flap: '#34D3E0',    /* pulse's cyan */
   words: '#37E1C4',   /* aurora teal */
+  mines: '#5B7BF0',   /* climb's blue */
 };
 
 /**

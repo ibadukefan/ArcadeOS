@@ -470,3 +470,92 @@ describe('WORDS guessing', () => {
     assert.ok(g._test.solved() >= 1, `pilot solved ${g._test.solved()} words`);
   });
 });
+
+describe('MINES sweeping', () => {
+  function fresh() {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng } = env.api();
+    seedRng(7);
+    const g = gameById('mines');
+    Shell._startGame(g);
+    return { env, g, t: g._test };
+  }
+
+  it('the first dig is always safe', () => {
+    const { t } = fresh();
+    assert.notOk(t.placed(), 'no mines before the first dig');
+    t.dig(6, 5);
+    assert.ok(t.placed(), 'mines laid on first dig');
+    assert.notOk(t.isMine(6, 5), 'never under the opening cell');
+    assert.ok(t.isShown(6, 5), 'and it opened');
+    assert.notOk(t.over(), 'the opening move cannot end the run');
+  });
+
+  it('flood-fills the open region from a zero cell', () => {
+    const { t } = fresh();
+    /* One mine in a far corner: digging the opposite corner opens a large
+     * connected region of zeros in one move. */
+    t.forceMines([[0, 0]]);
+    t.dig(12, 9);
+    assert.ok(t.cleared() > 1, `opened a region (${t.cleared()} cells)`);
+    assert.ok(t.isShown(12, 9));
+  });
+
+  it('digging a mine ends the run', () => {
+    const { t } = fresh();
+    t.dig(6, 5);                 /* lay mines safely first */
+    /* Find an actual mine and dig it. */
+    const { COLS, ROWS } = t.dims();
+    let hit = false;
+    for (let r = 0; r < ROWS && !hit; r++) {
+      for (let c = 0; c < COLS && !hit; c++) {
+        if (t.isMine(r, c)) { t.dig(r, c); hit = true; }
+      }
+    }
+    assert.ok(hit, 'the board has a mine to dig');
+    assert.ok(t.over(), 'digging it ended the run');
+  });
+
+  it('a flag protects a cell from being dug', () => {
+    const { t } = fresh();
+    t.forceMines([[0, 0]]);
+    t.flag(0, 0);
+    assert.ok(t.isFlag(0, 0));
+    t.dig(0, 0);
+    assert.notOk(t.over(), 'a flagged mine is not detonated by a dig');
+    assert.notOk(t.isShown(0, 0), 'and stays covered');
+  });
+
+  it('clearing every safe cell wins the board and advances', () => {
+    const { env, t } = fresh();
+    t.forceMines([[0, 0]]);
+    const { COLS, ROWS } = t.dims();
+    /* Dig every non-mine cell. */
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) if (!(r === 0 && c === 0)) t.dig(r, c);
+    }
+    assert.ok(t.won(), 'the board was cleared');
+    const b = t.board();
+    for (let i = 0; i < 70; i++) env.tick(16.667);
+    assert.equal(t.board(), b + 1, 'the next board loaded');
+    assert.notOk(t.over());
+  });
+
+  it('the attract pilot clears boards without hitting a mine', () => {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng, Input } = env.api();
+    seedRng(2024);
+    const g = gameById('mines');
+    Shell._startGame(g);
+    for (let i = 0; i < 14000 / 16.667; i++) {
+      Input.setDemo(g.demo());
+      env.tick(16.667);
+      if (g._test.over()) break;
+    }
+    Input.setDemo(null);
+    assert.notOk(g._test.over(), 'pilot never detonates a mine it can see');
+    assert.ok(g._test.score() > 0, `pilot cleared cells (score ${g._test.score()})`);
+  });
+});
