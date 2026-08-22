@@ -580,6 +580,27 @@ describe('arcadeos-agent', () => {
   it('sends CORS headers, because the page is a file:// origin', () => {
     assert.ok(/Access-Control-Allow-Origin/.test(read(src)));
   });
+
+  it('falls back to signalling PID 1 when the power binary is eaten', () => {
+    const s = read(src);
+    /* The unit runs under ProtectSystem=strict; on a real cabinet the
+     * sandboxed /sbin/reboot accepted RESTART and nothing rebooted. The
+     * signal interface (systemd(1)) needs no filesystem and no D-Bus, so
+     * it must stay: SIGRTMIN+5 → reboot.target, SIGRTMIN+4 → poweroff. */
+    assert.ok(/signal\.SIGRTMIN \+ 5/.test(s), 'restart maps to SIGRTMIN+5');
+    assert.ok(/signal\.SIGRTMIN \+ 4/.test(s), 'shutdown maps to SIGRTMIN+4');
+    assert.ok(/os\.kill\(1, POWER_SIGNALS\[command\]\)/.test(s),
+      'the fallback signals PID 1 from the fixed table');
+    assert.ok(/time\.sleep\(3\)/.test(s),
+      'the polite path gets a chance before the signal fires');
+  });
+
+  it('never puts a body on a 204', () => {
+    /* The preflight for every authorised command replies 204. A body there
+     * leaves stray bytes on the kept-alive socket and the next request on
+     * it parses garbage. */
+    assert.ok(/b"" if code == 204 else/.test(read(src)));
+  });
 });
 
 describe('arcadeos-gpio', () => {

@@ -43,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -105,6 +106,19 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 COMMANDS = {
     "shutdown": ["/sbin/poweroff"],
     "restart": ["/sbin/reboot"],
+}
+
+# Fallback: systemd's signal interface on PID 1 (systemd(1), "SIGNALS"):
+# SIGRTMIN+5 starts reboot.target, SIGRTMIN+4 starts poweroff.target — the
+# same clean paths the binaries take. This unit runs under ProtectSystem=
+# strict and friends, and on a real cabinet the sandboxed /sbin/reboot
+# accepted the command, exited quietly, and the machine stayed up — the
+# owner pressed RESTART three times into that silence. A signal needs no
+# filesystem, no D-Bus socket and no child process, so the sandbox cannot
+# eat it.
+POWER_SIGNALS = {
+    "shutdown": signal.SIGRTMIN + 4,
+    "restart": signal.SIGRTMIN + 5,
 }
 
 
@@ -324,17 +338,28 @@ def run_power(command):
     """
     argv = COMMANDS[command]
     binary = resolve(argv[0])
-    if not binary:
-        log("cannot find %s" % argv[0])
-        return
 
     def go():
         time.sleep(0.7)
-        log("executing %s" % binary)
+        if binary:
+            log("executing %s" % binary)
+            try:
+                subprocess.Popen([binary], close_fds=True)
+            except Exception as exc:  # noqa: BLE001 - last line of defence
+                log("power command failed: %s" % exc)
+        else:
+            log("cannot find %s" % argv[0])
+        # If the polite path worked, the system is tearing down and this
+        # thread dies with it. If we are STILL RUNNING a few seconds later,
+        # the command was eaten — by the unit's sandbox, a missing binary,
+        # or a systemctl that could not reach PID 1 — so use the signal
+        # interface, which none of those can block.
+        time.sleep(3)
+        log("still running after %s — signalling PID 1 directly" % command)
         try:
-            subprocess.Popen([binary], close_fds=True)
-        except Exception as exc:  # noqa: BLE001 - last line of defence
-            log("power command failed: %s" % exc)
+            os.kill(1, POWER_SIGNALS[command])
+        except Exception as exc:  # noqa: BLE001
+            log("signal fallback failed: %s" % exc)
 
     threading.Thread(target=go, daemon=True).start()
 
@@ -415,7 +440,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return True, ""
 
     def _reply(self, code, payload):
-        body = json.dumps(payload).encode("utf-8")
+        # A 204 carries no body, by RFC and in practice: sending one leaves
+        # stray bytes on a kept-alive connection, and the preflight for
+        # every authorised command is a 204 — the next request on that
+        # socket then parses garbage.
+        body = b"" if code == 204 else json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
