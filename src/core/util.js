@@ -54,6 +54,9 @@ var ACCENT = {
   pulse: '#34D3E0',
   drop: '#F0645E',
   versus: '#A46BF0',
+  /* New games reuse existing palette stops — no colour is ever invented. */
+  merge: '#F0C64E',   /* breakout's gold */
+  flap: '#34D3E0',    /* pulse's cyan */
 };
 
 /**

@@ -441,11 +441,14 @@ var TETRIS = (function () {
 
   /* --------------------------------------------------------- preview --- */
 
-  /* A short scripted loop: a piece falls into a partial stack and locks. */
+  /* A short scripted loop: a piece falls into a partial stack and locks.
+   * The stack's left three columns are a flat shelf the T settles onto —
+   * the earlier art dropped the piece at a half-cell offset and stopped a
+   * full cell above the pile, which read as a bug from across the room. */
   var PREV_STACK = [
-    [0, 0, 1, 1, 0, 0],
-    [0, 1, 1, 1, 1, 0],
-    [1, 1, 1, 0, 1, 1],
+    [0, 0, 0, 0, 0, 1],
+    [0, 0, 0, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1],
   ];
 
   function preview(c, w, h, t) {
@@ -463,14 +466,16 @@ var TETRIS = (function () {
       }
     }
 
-    /* Falling T piece on a 2.4s loop. */
+    /* Falling T piece on a 2.4s loop. Integer columns 0-2, and the final
+     * fy puts the T's bottom row exactly one cell above the shelf — flush
+     * on the stack, nub slotting beside the step. */
     var loop = (t % 2400) / 2400;
     var fall = Math.min(1, loop / 0.78);
-    var fy = lerp(-s * 1.5, oy - 2 * s, fall);
+    var fy = lerp(-s * 2.5, oy, fall);
     var cs = SHAPES.T[0];
     var landed = fall >= 1;
     for (var i = 0; i < cs.length; i++) {
-      tile(c, ox + (cs[i][0] + 1.5) * s, fy + cs[i][1] * s, s,
+      tile(c, ox + cs[i][0] * s, fy + cs[i][1] * s, s,
         PIECE_COL.T[0], PIECE_COL.T[1], landed ? 'flash' : 'glow');
     }
   }

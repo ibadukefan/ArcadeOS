@@ -36,6 +36,8 @@ const GAMES = [
   'games/climb.js',
   'games/pulse.js',
   'games/drop.js',
+  'games/merge.js',
+  'games/flap.js',
   'games/versus.js',
 ];
 

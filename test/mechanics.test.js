@@ -271,3 +271,106 @@ describe('CLIMB progression', () => {
     assert.ok(ended, 'falling below the view ends the run');
   });
 });
+
+describe('2048 merge rules', () => {
+  function fresh() {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng } = env.api();
+    seedRng(7);
+    const g = gameById('merge');
+    Shell._startGame(g);
+    g._test.clear();
+    return { env, t: g._test };
+  }
+
+  /** Values are exponents: 1 -> "2", 2 -> "4"... row 0 is the top. */
+  function row(t, r, g) {
+    return [0, 1, 2, 3].map((c) => g[r * 4 + c]);
+  }
+
+  it('a full line of equal tiles fuses into two, never one', () => {
+    const { t } = fresh();
+    t.set(0, 0, 1); t.set(0, 1, 1); t.set(0, 2, 1); t.set(0, 3, 1);
+    t.move('left'); t.finishAnim();
+    assert.deep(row(t, 0, t.grid()).slice(0, 2), [2, 2],
+      '2,2,2,2 -> 4,4 — a tile merges at most once per move');
+  });
+
+  it('merges pair from the front of the slide', () => {
+    const { t } = fresh();
+    t.set(0, 0, 2); t.set(0, 1, 1); t.set(0, 2, 1);
+    t.move('left'); t.finishAnim();
+    const r = row(t, 0, t.grid());
+    assert.equal(r[0], 2, 'the 4 stays');
+    assert.equal(r[1], 2, 'the two 2s fused into a 4 behind it');
+  });
+
+  it('a move that changes nothing is refused and spawns nothing', () => {
+    const { t } = fresh();
+    t.set(0, 0, 1); t.set(1, 0, 2);
+    const before = t.grid().filter((v) => v !== 0).length;
+    assert.notOk(t.move('left'), 'everything is already flush left');
+    assert.equal(t.grid().filter((v) => v !== 0).length, before, 'no spawn');
+  });
+
+  it('scores the value of the fused tile', () => {
+    const { t } = fresh();
+    t.set(2, 0, 3); t.set(2, 1, 3);  /* 8 + 8 -> 16 */
+    const s0 = t.score();
+    t.move('left'); t.finishAnim();
+    assert.equal(t.score() - s0, 16);
+  });
+
+  it('detects a dead board', () => {
+    const { t } = fresh();
+    /* Checkerboard of unequal neighbours: no gaps, no fusible pair. */
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 4; c++) t.set(r, c, 1 + ((r + c) % 2) + (r >= 2 ? 2 : 0));
+    }
+    assert.notOk(t.anyMove(), 'no move exists');
+  });
+});
+
+describe('FLAP flight', () => {
+  function fly(seed) {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng } = env.api();
+    seedRng(seed || 11);
+    const g = gameById('flap');
+    Shell._startGame(g);
+    return { env, g, Shell };
+  }
+
+  it('hovers safely until the first flap', () => {
+    const { env, g } = fly();
+    for (let i = 0; i < 600; i++) env.tick(16.667);
+    assert.ok(g._test.ready(), 'still waiting');
+    assert.notOk(g._test.over(), 'hovering is never fatal');
+  });
+
+  it('gravity ends an unpiloted flight', () => {
+    const { env, g } = fly();
+    env.fireKey('Enter', true); env.tick(16); env.fireKey('Enter', false);
+    let died = false;
+    for (let i = 0; i < 400; i++) {
+      env.tick(16.667);
+      if (g._test.over()) { died = true; break; }
+    }
+    assert.ok(died, 'the floor is part of the course');
+  });
+
+  it('the pilot threads towers and scores', () => {
+    const { env, g } = fly(4242);
+    const { Input } = env.api();
+    for (let i = 0; i < 14000 / 16.667; i++) {
+      Input.setDemo(g.demo());
+      env.tick(16.667);
+      if (g._test.over()) break;
+    }
+    Input.setDemo(null);
+    assert.notOk(g._test.over(), 'pilot survived the attract slot');
+    assert.ok(g._test.score() >= 3, `pilot scored (${g._test.score()})`);
+  });
+});

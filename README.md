@@ -245,6 +245,8 @@ DualSense reads `✕`, a Switch Pro reads `A`, a keyboard reads `ENTER`:
 | **CLIMB** | blue | Endless hopper. The camera only ever goes up |
 | **PULSE** | cyan | Rhythm highway. Four lanes are the four d-pad directions |
 | **DROP** | red | Columns-style match-3, including diagonals, with cascades |
+| **2048** | gold | The sliding merge board — fuse equal tiles, double up |
+| **FLAP** | cyan | One-button flier. Thread the gaps between the towers |
 | **VERSUS** | purple | Head-to-head Tetris with garbage lines. Needs two pads |
 
 ### Per-game controls
@@ -262,6 +264,8 @@ conveniences, never requirements.
 | CLIMB | ◀▶ steer. Bouncing is automatic |
 | PULSE | ◀▼▲▶ hit the four lanes |
 | DROP | ◀▶ move · ▼ soft drop · **A** cycle gems · **X** hard drop |
+| 2048 | ◀▶▲▼ slide the whole board |
+| FLAP | **A** flap |
 | VERSUS | As Tetris, per player |
 
 ### High scores
