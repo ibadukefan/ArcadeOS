@@ -511,7 +511,7 @@ describe('MINES sweeping', () => {
     seedRng(7);
     const g = gameById('mines');
     Shell._startGame(g);
-    return { env, g, t: g._test };
+    return { env, g, t: g._test, Shell };
   }
 
   it('the first dig is always safe', () => {
@@ -547,6 +547,23 @@ describe('MINES sweeping', () => {
     }
     assert.ok(hit, 'the board has a mine to dig');
     assert.ok(t.over(), 'digging it ended the run');
+  });
+
+  it('hitting a mine detonates the board before the score card', () => {
+    const { env, t, Shell } = fresh();
+    const { COLS, ROWS } = t.dims();
+    t.forceMines([[0, 0], [ROWS - 1, COLS - 1]]);
+    t.dig(0, 0);
+    assert.ok(t.over(), 'the dig was fatal');
+    /* The square explodes FIRST: the shell holds an ending beat, so the
+     * frame of death still shows the game — not the high-score screen. */
+    assert.equal(Shell.state(), 'game', 'no instant cut to the score card');
+    assert.notOk(t.isShown(ROWS - 1, COLS - 1),
+      'the far mine has not popped yet — the blast travels');
+    for (let i = 0; i < 60; i++) env.tick(16.667);
+    assert.ok(t.isShown(ROWS - 1, COLS - 1), 'the blast reached the far mine');
+    for (let i = 0; i < 30; i++) env.tick(16.667);
+    assert.notOk(Shell.state() === 'game', 'the beat ends on the score flow');
   });
 
   it('a flag protects a cell from being dug', () => {

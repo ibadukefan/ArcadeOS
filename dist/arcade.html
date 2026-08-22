@@ -49,7 +49,7 @@ html, body {
 </head>
 <body>
 <canvas id="screen"></canvas>
-<script>window.ARCADEOS_BUILD='1897b6e9';
+<script>window.ARCADEOS_BUILD='08bfe1e0';
 (function(){
 'use strict';
 
@@ -7102,7 +7102,13 @@ var FLAP = (function () {
   function update(dt) {
     particles.update(dt, 0.0004);
     if (wobble > 0) wobble = Math.max(0, wobble - dt);
-    if (over) return;
+    if (over) {
+      /* Dead birds fall. The shell's ending beat keeps update running for a
+       * moment after death, so the tumble is actually seen. */
+      vy = Math.min(VMAX, vy + GRAV * dt);
+      y += vy * dt;
+      return;
+    }
 
     if (Input.hit('confirm') || Input.hit('up')) flap();
 
@@ -7754,7 +7760,10 @@ var MINES = (function () {
   var placed = false;         /* mines laid yet? (after the first reveal) */
   var cur = { r: 6, c: 5 };
   var score = 0, board = 1, cleared = 0, mineCount = 0, flags = 0;
-  var over = false, won = false, revealAll = false;
+  var over = false, won = false;
+  /* The detonation: set on a fatal dig, sweeps the board revealing every
+   * mine in expanding rings while the shell holds the ending beat. */
+  var boom = null, boomed = null;
   var winT = 0, buf = 0;
   var particles = makeParticles(56);
 
@@ -7779,7 +7788,7 @@ var MINES = (function () {
     near = new Int8Array(n);
     placed = false;
     cleared = 0; flags = 0;
-    won = false; revealAll = false; winT = 0;
+    won = false; boom = null; boomed = null; winT = 0;
     mineCount = minesForBoard(board);
     cur.r = (ROWS / 2) | 0;
     cur.c = (COLS / 2) | 0;
@@ -7854,12 +7863,21 @@ var MINES = (function () {
     if (flag[i] || shown[i]) return;
     if (!placed) place(r, c);
     if (mine[i]) {
+      /* The square explodes FIRST. The shell holds an ending beat after
+       * gameOver, so the detonation below has the screen to itself: the
+       * hit cell erupts now, and update() walks the blast outward through
+       * every other mine before the score card appears. */
       shown[i] = 1;
-      over = true; revealAll = true;
+      over = true;
+      boom = { r: r, c: c, t: 0 };
+      boomed = new Uint8Array(COLS * ROWS);
+      boomed[i] = 1;
       Audio2.sfx('over');
-      Input.rumble(0.9, 0.7, 360);
-      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 24, COL.bad,
-        { speed: 0.34, life: 620, size: 5 });
+      Input.rumble(1, 0.8, 500);
+      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 30, COL.bad,
+        { speed: 0.5, life: 800, size: 7 });
+      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 14, COL.warn,
+        { speed: 0.28, life: 620, size: 5 });
       Shell.gameOver(score);
       return;
     }
@@ -7890,6 +7908,24 @@ var MINES = (function () {
     if (winT > 0) {
       winT -= dt;
       if (winT <= 0) { board++; newBoard(); }
+      return;
+    }
+    if (boom) {
+      /* Chain reaction: each ring of mines pops one beat after the last,
+       * measured in board distance from the one that got you. */
+      boom.t += dt;
+      var popped = false;
+      for (var bi = 0; bi < COLS * ROWS; bi++) {
+        if (!mine[bi] || boomed[bi]) continue;
+        var br = (bi / COLS) | 0, bc = bi % COLS;
+        var d = Math.max(Math.abs(br - boom.r), Math.abs(bc - boom.c));
+        if (boom.t > d * 55) {
+          boomed[bi] = 1; shown[bi] = 1; popped = true;
+          particles.burst(cellX(bc) + CELL / 2, cellY(br) + CELL / 2, 6, COL.bad,
+            { speed: 0.22, life: 420, size: 4 });
+        }
+      }
+      if (popped) Audio2.sfx('lock');
       return;
     }
     if (over) return;
@@ -7924,7 +7960,7 @@ var MINES = (function () {
         var x = cellX(col), y = cellY(r);
         var isCur = (r === cur.r && col === cur.c && !over);
 
-        if (shown[i] || (revealAll && mine[i])) {
+        if (shown[i]) {
           /* Revealed well. */
           panel(c, x, y, CELL, CELL, {
             fill: mine[i] ? 'rgba(240,100,94,.30)' : 'rgba(10,8,20,.55)',
@@ -8933,6 +8969,8 @@ var Shell = (function () {
 
   function startGame(game, versus, seed) {
     activeGame = game;
+    /* A stale beat from a run abandoned mid-death must not end this one. */
+    ending = null;
     var s = (seed !== undefined && seed !== null) ? seed
       : (forcedSeed !== null ? forcedSeed
         : ((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635));
@@ -8983,6 +9021,26 @@ var Shell = (function () {
   /* ------------------------------------------------------------- game --- */
 
   function gameUpdate(dt) {
+    /*
+     * THE ENDING BEAT. While it runs the game keeps updating and drawing —
+     * its explosion plays, its particles fly, its shake decays — and input
+     * is ignored so a button mashed at death cannot skip the moment.
+     * Without this every death cut straight to the score card on the very
+     * frame it happened; the mine never got to explode.
+     */
+    if (ending) {
+      ending.t -= dt;
+      if (activeGame) {
+        try { activeGame.update(dt); }
+        catch (e) { fault(e, activeGame.id + '.update'); ending.t = 0; }
+      }
+      if (ending.t <= 0) {
+        var sc = ending.score;
+        ending = null;
+        settleGameOver(sc);
+      }
+      return;
+    }
     if (Input.hit('pause')) { pauseCursor = 0; go('pause'); Audio2.sfx('back'); return; }
     if (!activeGame) { go('menu'); return; }
     try { activeGame.update(dt); }
@@ -9013,6 +9071,10 @@ var Shell = (function () {
 
   /* -------------------------------------------------------- game over --- */
 
+  /* The death/win beat: {score, t}. See gameUpdate. */
+  var ending = null;
+  var ENDING_MS = 1100;
+
   /** Called by games. Never call this from inside draw(). */
   function gameOver(score) {
     /*
@@ -9024,6 +9086,19 @@ var Shell = (function () {
       attract.timer = 99999;
       return;
     }
+    /*
+     * From a live game, hold the moment: the score card comes after the
+     * ending beat, not on the frame of death. Anywhere else (a defensive
+     * call outside the game state), settle immediately as before.
+     */
+    if (state === 'game') {
+      if (!ending) ending = { score: Math.max(0, Math.floor(num(score, 0))), t: ENDING_MS };
+      return;
+    }
+    settleGameOver(score);
+  }
+
+  function settleGameOver(score) {
     lastScore = Math.max(0, Math.floor(num(score, 0)));
     var id = activeGame ? activeGame.id : '';
     lastRank = -1;

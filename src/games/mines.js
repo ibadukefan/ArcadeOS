@@ -27,7 +27,10 @@ var MINES = (function () {
   var placed = false;         /* mines laid yet? (after the first reveal) */
   var cur = { r: 6, c: 5 };
   var score = 0, board = 1, cleared = 0, mineCount = 0, flags = 0;
-  var over = false, won = false, revealAll = false;
+  var over = false, won = false;
+  /* The detonation: set on a fatal dig, sweeps the board revealing every
+   * mine in expanding rings while the shell holds the ending beat. */
+  var boom = null, boomed = null;
   var winT = 0, buf = 0;
   var particles = makeParticles(56);
 
@@ -52,7 +55,7 @@ var MINES = (function () {
     near = new Int8Array(n);
     placed = false;
     cleared = 0; flags = 0;
-    won = false; revealAll = false; winT = 0;
+    won = false; boom = null; boomed = null; winT = 0;
     mineCount = minesForBoard(board);
     cur.r = (ROWS / 2) | 0;
     cur.c = (COLS / 2) | 0;
@@ -127,12 +130,21 @@ var MINES = (function () {
     if (flag[i] || shown[i]) return;
     if (!placed) place(r, c);
     if (mine[i]) {
+      /* The square explodes FIRST. The shell holds an ending beat after
+       * gameOver, so the detonation below has the screen to itself: the
+       * hit cell erupts now, and update() walks the blast outward through
+       * every other mine before the score card appears. */
       shown[i] = 1;
-      over = true; revealAll = true;
+      over = true;
+      boom = { r: r, c: c, t: 0 };
+      boomed = new Uint8Array(COLS * ROWS);
+      boomed[i] = 1;
       Audio2.sfx('over');
-      Input.rumble(0.9, 0.7, 360);
-      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 24, COL.bad,
-        { speed: 0.34, life: 620, size: 5 });
+      Input.rumble(1, 0.8, 500);
+      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 30, COL.bad,
+        { speed: 0.5, life: 800, size: 7 });
+      particles.burst(cellX(c) + CELL / 2, cellY(r) + CELL / 2, 14, COL.warn,
+        { speed: 0.28, life: 620, size: 5 });
       Shell.gameOver(score);
       return;
     }
@@ -163,6 +175,24 @@ var MINES = (function () {
     if (winT > 0) {
       winT -= dt;
       if (winT <= 0) { board++; newBoard(); }
+      return;
+    }
+    if (boom) {
+      /* Chain reaction: each ring of mines pops one beat after the last,
+       * measured in board distance from the one that got you. */
+      boom.t += dt;
+      var popped = false;
+      for (var bi = 0; bi < COLS * ROWS; bi++) {
+        if (!mine[bi] || boomed[bi]) continue;
+        var br = (bi / COLS) | 0, bc = bi % COLS;
+        var d = Math.max(Math.abs(br - boom.r), Math.abs(bc - boom.c));
+        if (boom.t > d * 55) {
+          boomed[bi] = 1; shown[bi] = 1; popped = true;
+          particles.burst(cellX(bc) + CELL / 2, cellY(br) + CELL / 2, 6, COL.bad,
+            { speed: 0.22, life: 420, size: 4 });
+        }
+      }
+      if (popped) Audio2.sfx('lock');
       return;
     }
     if (over) return;
@@ -197,7 +227,7 @@ var MINES = (function () {
         var x = cellX(col), y = cellY(r);
         var isCur = (r === cur.r && col === cur.c && !over);
 
-        if (shown[i] || (revealAll && mine[i])) {
+        if (shown[i]) {
           /* Revealed well. */
           panel(c, x, y, CELL, CELL, {
             fill: mine[i] ? 'rgba(240,100,94,.30)' : 'rgba(10,8,20,.55)',

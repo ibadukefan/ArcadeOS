@@ -11,6 +11,11 @@ function bootToMenu(env) {
   for (let i = 0; i < 200; i++) env.tick(16);
 }
 
+/* Deaths hold an ending beat before the score flow — tick through it. */
+function endBeat(env) {
+  for (let i = 0; i < 75; i++) env.tick(16);
+}
+
 /** Snapshot a harness localStorage so a second env can "reboot" onto it. */
 function snapshot(env) {
   const out = {};
@@ -43,6 +48,7 @@ describe('initials entry', () => {
 
     Shell._startGame(env.api().gameById('tetris'));
     Shell.gameOver(4321);
+    endBeat(env);
     assert.equal(Shell.state(), 'initials', 'a qualifying score asks for initials');
 
     /* Wait out the entry lock-out. */
@@ -64,12 +70,30 @@ describe('initials entry', () => {
     assert.equal(table[0].score, 4321);
   });
 
+  it('a death holds an ending beat before the score flow', () => {
+    const env = makeEnv();
+    const { Shell } = env.api();
+    bootToMenu(env);
+    Shell._startGame(env.api().gameById('tetris'));
+    Shell.gameOver(4321);
+    /* The frame of death still shows the game — the explosion needs the
+     * screen. Input (even pause) cannot skip the moment. */
+    assert.equal(Shell.state(), 'game', 'no instant cut to the score card');
+    for (let i = 0; i < 30; i++) env.tick(16);
+    assert.equal(Shell.state(), 'game', 'the beat holds at half a second');
+    tap(env, 'KeyP');
+    assert.equal(Shell.state(), 'game', 'pause cannot interrupt the beat');
+    endBeat(env);
+    assert.equal(Shell.state(), 'initials', 'then the score flow runs');
+  });
+
   it('confirm walks forward through the slots before committing', () => {
     const env = makeEnv();
     const { Shell, Scores } = env.api();
     bootToMenu(env);
     Shell._startGame(env.api().gameById('snake'));
     Shell.gameOver(900);
+    endBeat(env);
     for (let i = 0; i < 30; i++) env.tick(16);
 
     tap(env, 'Enter');
@@ -87,6 +111,7 @@ describe('initials entry', () => {
     bootToMenu(env);
     Shell._startGame(env.api().gameById('stack'));
     Shell.gameOver(150);
+    endBeat(env);
     for (let i = 0; i < 30; i++) env.tick(16);
 
     tap(env, 'Escape');
@@ -101,6 +126,7 @@ describe('initials entry', () => {
     for (let i = 1; i <= 5; i++) Scores.submit('ascent', i * 1000, 'ZZZ', i);
     Shell._startGame(env.api().gameById('ascent'));
     Shell.gameOver(10);
+    endBeat(env);
     assert.equal(Shell.state(), 'over');
     assert.equal(Scores.table('ascent').length, 5, 'table is unchanged');
   });
@@ -111,6 +137,7 @@ describe('initials entry', () => {
     bootToMenu(env);
     Shell._startGame(env.api().gameById('tetris'));
     Shell.gameOver(0);
+    endBeat(env);
     assert.equal(Shell.state(), 'over');
   });
 });

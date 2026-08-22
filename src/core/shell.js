@@ -243,6 +243,8 @@ var Shell = (function () {
 
   function startGame(game, versus, seed) {
     activeGame = game;
+    /* A stale beat from a run abandoned mid-death must not end this one. */
+    ending = null;
     var s = (seed !== undefined && seed !== null) ? seed
       : (forcedSeed !== null ? forcedSeed
         : ((Date.now ? Date.now() : 0) ^ (t | 0) ^ 0x5bf03635));
@@ -293,6 +295,26 @@ var Shell = (function () {
   /* ------------------------------------------------------------- game --- */
 
   function gameUpdate(dt) {
+    /*
+     * THE ENDING BEAT. While it runs the game keeps updating and drawing —
+     * its explosion plays, its particles fly, its shake decays — and input
+     * is ignored so a button mashed at death cannot skip the moment.
+     * Without this every death cut straight to the score card on the very
+     * frame it happened; the mine never got to explode.
+     */
+    if (ending) {
+      ending.t -= dt;
+      if (activeGame) {
+        try { activeGame.update(dt); }
+        catch (e) { fault(e, activeGame.id + '.update'); ending.t = 0; }
+      }
+      if (ending.t <= 0) {
+        var sc = ending.score;
+        ending = null;
+        settleGameOver(sc);
+      }
+      return;
+    }
     if (Input.hit('pause')) { pauseCursor = 0; go('pause'); Audio2.sfx('back'); return; }
     if (!activeGame) { go('menu'); return; }
     try { activeGame.update(dt); }
@@ -323,6 +345,10 @@ var Shell = (function () {
 
   /* -------------------------------------------------------- game over --- */
 
+  /* The death/win beat: {score, t}. See gameUpdate. */
+  var ending = null;
+  var ENDING_MS = 1100;
+
   /** Called by games. Never call this from inside draw(). */
   function gameOver(score) {
     /*
@@ -334,6 +360,19 @@ var Shell = (function () {
       attract.timer = 99999;
       return;
     }
+    /*
+     * From a live game, hold the moment: the score card comes after the
+     * ending beat, not on the frame of death. Anywhere else (a defensive
+     * call outside the game state), settle immediately as before.
+     */
+    if (state === 'game') {
+      if (!ending) ending = { score: Math.max(0, Math.floor(num(score, 0))), t: ENDING_MS };
+      return;
+    }
+    settleGameOver(score);
+  }
+
+  function settleGameOver(score) {
     lastScore = Math.max(0, Math.floor(num(score, 0)));
     var id = activeGame ? activeGame.id : '';
     lastRank = -1;

@@ -85,7 +85,13 @@ var FLAP = (function () {
   function update(dt) {
     particles.update(dt, 0.0004);
     if (wobble > 0) wobble = Math.max(0, wobble - dt);
-    if (over) return;
+    if (over) {
+      /* Dead birds fall. The shell's ending beat keeps update running for a
+       * moment after death, so the tumble is actually seen. */
+      vy = Math.min(VMAX, vy + GRAV * dt);
+      y += vy * dt;
+      return;
+    }
 
     if (Input.hit('confirm') || Input.hit('up')) flap();
 
