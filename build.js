@@ -38,6 +38,7 @@ const GAMES = [
   'games/drop.js',
   'games/merge.js',
   'games/flap.js',
+  'games/words.js',
   'games/versus.js',
 ];
 

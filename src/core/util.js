@@ -57,6 +57,7 @@ var ACCENT = {
   /* New games reuse existing palette stops — no colour is ever invented. */
   merge: '#F0C64E',   /* breakout's gold */
   flap: '#34D3E0',    /* pulse's cyan */
+  words: '#37E1C4',   /* aurora teal */
 };
 
 /**

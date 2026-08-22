@@ -247,6 +247,7 @@ DualSense reads `✕`, a Switch Pro reads `A`, a keyboard reads `ENTER`:
 | **DROP** | red | Columns-style match-3, including diagonals, with cascades |
 | **2048** | gold | The sliding merge board — fuse equal tiles, double up |
 | **FLAP** | cyan | One-button flier. Thread the gaps between the towers |
+| **WORDS** | teal | Six tries to crack a five-letter word, endless — d-pad keyboard |
 | **VERSUS** | purple | Head-to-head Tetris with garbage lines. Needs two pads |
 
 ### Per-game controls
@@ -266,6 +267,7 @@ conveniences, never requirements.
 | DROP | ◀▶ move · ▼ soft drop · **A** cycle gems · **X** hard drop |
 | 2048 | ◀▶▲▼ slide the whole board |
 | FLAP | **A** flap |
+| WORDS | ✚ move · **A** type · **B** delete · **X** enter |
 | VERSUS | As Tetris, per player |
 
 ### High scores

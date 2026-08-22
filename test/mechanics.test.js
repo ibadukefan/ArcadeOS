@@ -387,3 +387,86 @@ describe('FLAP flight', () => {
     assert.ok(g._test.score() >= 3, `pilot scored (${g._test.score()})`);
   });
 });
+
+describe('WORDS guessing', () => {
+  function fresh(answer) {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng } = env.api();
+    seedRng(99);
+    const g = gameById('words');
+    Shell._startGame(g);
+    if (answer) g._test.setAnswer(answer);
+    return { env, g, t: g._test, Shell };
+  }
+
+  it('scores greens, ambers and absents by Wordle rules', () => {
+    const { t } = fresh('crane');
+    /* guess "cheer": c green, h absent, e amber (one e in crane, not here),
+     * e (2nd) absent — only one e available, first non-green e took it,
+     * r amber. */
+    const s = t.evaluate('cheer');
+    assert.equal(s[0], 'good', 'c is in place');
+    assert.equal(s[1], 'gone', 'h not in crane');
+    assert.equal(s[2], 'warn', 'first e is present elsewhere');
+    assert.equal(s[3], 'gone', 'second e has no remaining match');
+    assert.equal(s[4], 'warn', 'r is present elsewhere');
+  });
+
+  it('rejects a guess that is not in the word list', () => {
+    const { t } = fresh('crane');
+    t.type('zzzzz');
+    t.submit();
+    assert.equal(t.guesses().length, 0, 'the non-word was not accepted');
+    assert.ok(/WORD LIST/.test(t.lastMsg()));
+  });
+
+  it('a correct guess scores and loads the next word', () => {
+    /* The answer must also be a legal guess, so it is drawn from the list. */
+    const { env, t } = fresh('stone');
+    t.type('stone');
+    t.submit();
+    assert.ok(t.score() > 0, 'a solve scores');
+    assert.equal(t.solved(), 1);
+    /* Celebration then the next word; the board clears. */
+    for (let i = 0; i < 70; i++) env.tick(16.667);
+    assert.equal(t.guesses().length, 0, 'a fresh board loaded');
+    assert.notOk(t.over(), 'the run continues');
+  });
+
+  it('six wrong guesses ends the run', () => {
+    const { t } = fresh('stone');
+    /* All real listed words, none equal to the answer. */
+    const wrong = ['about', 'bring', 'climb', 'front', 'grape', 'vivid'];
+    for (const w of wrong) { t.type(w); t.submit(); }
+    assert.ok(t.over(), 'the run ended after six misses');
+  });
+
+  it('the keyboard remembers a letter at its best colour', () => {
+    const { t } = fresh('crash');
+    t.type('track'); t.submit();  /* C amber (in word, wrong place) */
+    const mid = t.letterState().C;
+    t.type('crash'); t.submit();  /* now every letter is green */
+    const ks = t.letterState();
+    assert.equal(mid, 'warn', 'C started amber');
+    assert.equal(ks.C, 'good', 'C upgraded to green and stays there');
+    assert.equal(ks.R, 'good');
+  });
+
+  it('the attract pilot solves words and survives the slot', () => {
+    const env = makeEnv();
+    for (let i = 0; i < 200; i++) env.tick(16);
+    const { Shell, gameById, seedRng, Input } = env.api();
+    seedRng(4242);
+    const g = gameById('words');
+    Shell._startGame(g);
+    for (let i = 0; i < 14000 / 16.667; i++) {
+      Input.setDemo(g.demo());
+      env.tick(16.667);
+      if (g._test.over()) break;
+    }
+    Input.setDemo(null);
+    assert.notOk(g._test.over(), 'pilot never fails a word it knows');
+    assert.ok(g._test.solved() >= 1, `pilot solved ${g._test.solved()} words`);
+  });
+});
