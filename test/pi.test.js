@@ -378,13 +378,15 @@ describe('kiosk service unit', () => {
       'legacy switch kept for older Chromium builds');
   });
 
-  it('enables the Wayland frame scheduler that ends the 30fps lock', () => {
-    /* Chromium's default Wayland pacing loses a race against its own
-     * vblank-locked timer on fullscreen direct-scanout surfaces and halves
-     * the frame rate — measured on this cabinet at 2.9ms/frame across
-     * cage, labwc and weston. The replacement scheduler ships in the same
-     * binary behind this disabled-by-default feature. */
-    assert.ok(/WaylandExternalBeginFrameSource/.test(src));
+  it('uncaps the browser so the front end can pace itself', () => {
+    /* Chromium's Wayland scheduler halves a fullscreen kiosk's frame rate
+     * (buffer-release race, measured identically under cage, labwc and
+     * weston at 2.9ms/frame). Rather than tune a broken scheduler, the
+     * browser is uncapped and Loop governs its own 60Hz — code this
+     * project owns and tests. Both flags are required: vsync alone left
+     * the release gate in place (measured: still ~31fps). */
+    assert.ok(/--disable-gpu-vsync/.test(src));
+    assert.ok(/--disable-frame-rate-limit/.test(src));
     /* Chromium honours only the LAST --enable-features switch; a second
      * list anywhere on the line silently discards the first. */
     const launches = src.match(/--enable-features=/g) || [];

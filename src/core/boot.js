@@ -40,9 +40,29 @@ var Loop = (function () {
     return Date.now ? Date.now() : 0;
   }
 
+  /*
+   * Self-governed pacing. The cabinet runs Chromium with its GPU vsync and
+   * frame-rate limit disabled, because Chromium's own Wayland scheduler
+   * paces a fullscreen kiosk at exactly half the refresh rate (its
+   * vblank-locked timer loses a race against the compositor's buffer
+   * release every single frame — verified against the browser source and
+   * measured identically under cage, labwc and weston). Uncapped, rAF
+   * fires at ~125Hz; drawing every callback starved input. So the loop
+   * paces itself: render when TARGET_MS has passed, skip otherwise. On a
+   * browser with a working 60Hz rAF the elapsed time is always ~16.7ms
+   * and the governor never skips — one code path everywhere.
+   */
+  var TARGET_MS = 16.0;
+  var lastDraw = -1e9;
+
   function frame(now) {
     if (!running) return;
     var t = num(now, last + 16);
+    if (t - lastDraw < TARGET_MS) {
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
+    lastDraw = t;
     var dt = last === 0 ? 16 : clamp(t - last, 0, MAX_DT);
     last = t;
     var t0 = nowMs();
@@ -116,6 +136,8 @@ var Loop = (function () {
   return {
     start: start, stop: stop, tick: tick, perf: perf,
     running: function () { return running; },
+    /* Test seam: drive the governed rAF path with explicit timestamps. */
+    _frame: frame,
   };
 })();
 

@@ -584,3 +584,46 @@ describe('frame cost visibility', () => {
       'says which screen was up, so readings are comparable: ' + diag);
   });
 });
+
+describe('self-governed frame pacing', () => {
+  /*
+   * The cabinet uncaps Chromium (its Wayland scheduler halves fullscreen
+   * frame rates) and the loop paces itself: render when ~16ms have passed,
+   * skip the excess callbacks. On a healthy 60Hz rAF the governor never
+   * skips — the elapsed time is always over target.
+   */
+  /* Full-screen ops are exactly 2 per rendered frame (pinned elsewhere),
+   * so ops/2 counts rendered frames regardless of what the screen shows. */
+  function renderedFrames(env, fn) {
+    const { Render } = env.api();
+    const before = Render.fullScreenOps();
+    fn();
+    return (Render.fullScreenOps() - before) / 2;
+  }
+
+  it('renders every callback at a healthy 60Hz cadence', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Loop } = env.api();
+    let t = 100000;
+    const n = renderedFrames(env, () => {
+      for (let i = 0; i < 20; i++) { Loop._frame(t); t += 16.667; }
+    });
+    assert.close(n, 20, 1, `all 20 callbacks rendered, got ${n}`);
+  });
+
+  it('skips the excess when rAF free-runs at 125Hz', () => {
+    const env = makeEnv();
+    bootToMenu(env);
+    const { Loop } = env.api();
+    let t = 200000;
+    Loop._frame(t); /* settle lastDraw */
+    /* 100 callbacks at 8ms spacing = 800ms of wall time. A governed loop
+     * renders ~800/16 = 50 of them; an ungoverned one renders all 100. */
+    const n = renderedFrames(env, () => {
+      for (let i = 0; i < 100; i++) { t += 8; Loop._frame(t); }
+    });
+    assert.ok(n >= 45 && n <= 55,
+      `governed to ~50 of 100 callbacks, rendered ${n}`);
+  });
+});

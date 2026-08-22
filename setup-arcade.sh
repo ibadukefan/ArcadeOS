@@ -486,16 +486,22 @@ mkdir -p "\$PROFILE"
 # 1080p is almost exactly the 22fps the first cabinet measured. The Raspberry
 # Pi OS chromium package picks the right V3D/ANGLE path on its own.
 #
-# WaylandExternalBeginFrameSource: THE 30fps fix. Chromium's default Wayland
-# pacing is a timer phase-locked to vblank that refuses the next frame until
-# the compositor releases the last buffer; on a fullscreen direct-scanout
-# surface that release lands just AFTER each vblank, the unblock loses the
-# race every time, and rAF settles at exactly half refresh — measured here
-# on cage, labwc and weston alike, at 2.9ms/frame. Chromium's replacement
-# scheduler (Bug 477649985) ships inside this very binary behind this
-# disabled-by-default feature; Google enables it via a server-side trial
-# that Debian builds never receive. If a future build misbehaves with it,
-# the agent watchdog restarts the kiosk — the cabinet cannot be lost to it.
+# --disable-gpu-vsync --disable-frame-rate-limit: the 30fps fix, and it is
+# deliberate that the browser's scheduler is bypassed rather than tuned.
+# Chromium's Wayland pacing is a timer phase-locked to vblank that refuses
+# the next frame until the compositor releases the last buffer; on a
+# fullscreen surface that release lands just AFTER each vblank, the unblock
+# loses the race every frame, and rAF settles at exactly half refresh —
+# measured at 2.9ms/frame identically under cage, labwc AND weston, with
+# the kernel proven good (vsynced KMS benchmark: 59fps) and the compositor
+# proven good (fullscreen GL client: 780fps). Chromium's own replacement
+# scheduler (Bug 477649985, present in this binary behind
+# WaylandExternalBeginFrameSource) measured WORSE here (25fps) — the M151
+# snapshot predates its follow-up fixes. So: uncap the browser entirely and
+# let the front end pace itself — Loop in boot.js renders on its own 60Hz
+# clock and skips the excess callbacks, which also keeps input responsive
+# (drawing every uncapped callback starved it). The compositor still
+# vsyncs its own output, so nothing tears on glass.
 # NOTE: Chromium honours only the LAST --enable-features switch, so every
 # feature must live in the single list above.
 exec "\$CHROMIUM" \\
@@ -509,7 +515,9 @@ exec "\$CHROMIUM" \\
   --enable-gpu-rasterization \\
   --enable-accelerated-2d-canvas \\
   --canvas-oop-rasterization \\
-  --enable-features=CanvasOopRasterization,WaylandExternalBeginFrameSource \\
+  --enable-features=CanvasOopRasterization \\
+  --disable-gpu-vsync \\
+  --disable-frame-rate-limit \\
   --enable-zero-copy \\
   --force-device-scale-factor=1 \\
   --autoplay-policy=no-user-gesture-required \\
